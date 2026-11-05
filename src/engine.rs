@@ -69,6 +69,9 @@ pub struct Engine {
     /// the right frame even when a row isn't a whole number of frames long.
     row_clock: f64,
     voices: [Voice; MAX_TRACKS + 1],
+    /// Per track, the sound a voice was making when it was stolen or
+    /// retriggered, fading out under the new note. Only used with declick.
+    tails: [Voice; MAX_TRACKS],
     graph: Box<Graph>,
     /// The audition voice skips the graph and goes straight to the output.
     audition: Vec<[f32; 2]>,
@@ -141,6 +144,7 @@ impl Engine {
             pos: Position { order: 0, row: 0 },
             row_clock: 0.0,
             voices: Default::default(),
+            tails: Default::default(),
             graph,
             audition: vec![[0.0; 2]; BLOCK],
             commands: cmd_rx,
@@ -193,14 +197,14 @@ impl Engine {
                         self.pos = Position { order: 0, row: 0 };
                     }
                     self.row_clock = 0.0;
-                    self.voices.iter_mut().for_each(Voice::stop);
+                    self.stop_voices();
                     self.set_playing(true);
                 }
                 Command::Stop => {
                     self.set_playing(false);
                     self.pos = Position { order: 0, row: 0 };
                     self.row_clock = 0.0;
-                    self.voices.iter_mut().for_each(Voice::stop);
+                    self.stop_voices();
                 }
                 Command::Audition {
                     instrument,
@@ -226,7 +230,8 @@ impl Engine {
                     let old = std::mem::replace(&mut self.song, song);
                     // A voice indexes into its sample's frames, so it can only
                     // keep playing if the new song has the very same sample.
-                    for voice in self.voices.iter_mut().filter(|v| v.is_active()) {
+                    let voices = self.voices.iter_mut().chain(self.tails.iter_mut());
+                    for voice in voices.filter(|v| v.is_active()) {
                         let same = match (
                             old.instruments.get(voice.instrument()),
                             self.song.instruments.get(voice.instrument()),
@@ -259,6 +264,11 @@ impl Engine {
         }
     }
 
+    fn stop_voices(&mut self) {
+        self.voices.iter_mut().for_each(Voice::stop);
+        self.tails.iter_mut().for_each(Voice::stop);
+    }
+
     fn discard(&mut self, garbage: Garbage) {
         // The queue is as deep as the command queue, so this only fails if
         // the controller never collects garbage. Leaking is better than
@@ -279,7 +289,8 @@ impl Engine {
             return;
         };
         let fpr = self.frames_per_row();
-        for (track, voice) in pattern.tracks.iter().zip(self.voices.iter_mut()) {
+        let voices = self.voices.iter_mut().zip(self.tails.iter_mut());
+        for (t, (track, (voice, tail))) in pattern.tracks.iter().zip(voices).enumerate() {
             let Some(cell) = track.cells.get(self.pos.row) else {
                 continue;
             };
@@ -288,6 +299,9 @@ impl Engine {
                 continue;
             };
             if let Some(trigger) = cell.trigger {
+                if self.graph.track_declick(t) {
+                    voice.steal_into(tail);
+                }
                 voice.trigger(
                     track.instrument,
                     sample,
@@ -354,12 +368,32 @@ impl Engine {
                 self.row_clock -= 1.0;
             }
             for (t, voice) in self.voices.iter_mut().enumerate() {
-                let frame = match self.song.instruments.get(voice.instrument()) {
-                    Some(Instrument::Sampler(sample)) if voice.is_active() => {
-                        voice.next_frame(sample)
+                let tail = self.tails.get_mut(t);
+                let declick = tail.is_some() && self.graph.track_declick(t);
+                let instruments = &self.song.instruments;
+                let render = |v: &mut Voice| match instruments.get(v.instrument()) {
+                    Some(Instrument::Sampler(sample)) if v.is_active() => {
+                        v.next_frame(sample, declick)
                     }
                     _ => [0.0; 2],
                 };
+                let mut frame = [0.0; 2];
+                if let Some(tail) = tail {
+                    if declick && voice.retrig_due() {
+                        voice.steal_into(tail);
+                    }
+                    // Only add a sounding tail, so declick off (or nothing
+                    // to fade) leaves the voice's output bit for bit as is.
+                    if tail.is_active() {
+                        frame = render(tail);
+                    }
+                }
+                let v = render(voice);
+                if frame == [0.0; 2] {
+                    frame = v;
+                } else {
+                    frame = [frame[0] + v[0], frame[1] + v[1]];
+                }
                 let hit = voice.take_hit();
                 if t == AUDITION {
                     self.audition[i] = frame;

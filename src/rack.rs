@@ -225,8 +225,11 @@ impl Kind {
             ParamSpec::new("depth", 0.0, 1.0, 1.0, Linear, ""),
         ];
         const MASTER: &[ParamSpec] = &[ParamSpec::new("volume", 0.0, 1.5, 1.0, Linear, "")];
+        // Short fades on cuts, steals and retriggers. Off gives hard edges,
+        // clicks and all.
+        const TRACK: &[ParamSpec] = &[ParamSpec::labelled("declick", 1.0, &["off", "on"])];
         match self {
-            Kind::Track(_) => &[],
+            Kind::Track(_) => TRACK,
             Kind::Crusher => CRUSHER,
             Kind::Filter => FILTER,
             Kind::Delay => DELAY,
@@ -444,7 +447,8 @@ impl Rack {
 
     /// Fix up a rack read from a file: drop cables to devices or jacks that
     /// don't exist, keep inputs to one cable, and make sure new device ids
-    /// can't collide with existing ones.
+    /// can't collide with existing ones. Params missing from older files get
+    /// their defaults.
     pub fn repair(&mut self) {
         let valid = |r: &Rack, c: &Cable| {
             let (Some(a), Some(b)) = (r.device(c.from.device), r.device(c.to.device)) else {
@@ -460,7 +464,9 @@ impl Rack {
         }
         for d in &mut self.devices {
             let specs = d.kind.params();
-            d.params.resize(specs.len(), 0.0);
+            let have = d.params.len().min(specs.len());
+            d.params.truncate(have);
+            d.params.extend(specs[have..].iter().map(|p| p.default));
             for (v, spec) in d.params.iter_mut().zip(specs) {
                 *v = spec.clamp(*v);
             }
@@ -588,6 +594,21 @@ mod tests {
             assert!((p.from_knob(p.to_knob(v)) - v).abs() / v < 1e-4);
         }
         assert_eq!(Kind::Filter.params()[2].format(1.0), "band");
+    }
+
+    #[test]
+    fn repair_fills_missing_params_with_defaults() {
+        let mut rack = Rack::simple(1);
+        let t = rack.track_device(0).unwrap().id;
+        let f = rack.add(Kind::Filter);
+        // As saved before tracks had params, and with a param dropped.
+        rack.devices.iter_mut().find(|d| d.id == t).unwrap().params = vec![];
+        rack.devices.iter_mut().find(|d| d.id == f).unwrap().params = vec![500.0];
+        rack.repair();
+        assert_eq!(rack.device(t).unwrap().params, vec![1.0], "declick on");
+        let defaults: Vec<f32> = Kind::Filter.params().iter().map(|p| p.default).collect();
+        assert_eq!(rack.device(f).unwrap().params[0], 500.0);
+        assert_eq!(rack.device(f).unwrap().params[1..], defaults[1..]);
     }
 
     #[test]

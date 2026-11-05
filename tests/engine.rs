@@ -270,3 +270,191 @@ fn swapped_graph_keeps_notes_ringing() {
     );
     controller.collect_garbage();
 }
+
+// Declick. At 48 kHz a fade is 72 frames; frame k of it has gain
+// (72 - k) / 73, so it ends just above silence and never steps by more than
+// 1/73 of the level.
+
+const FADE: usize = 72;
+
+fn fade_gain(k: usize) -> f32 {
+    (FADE - k) as f32 / (FADE + 1) as f32
+}
+
+fn set_declick(song: &mut Song, on: bool) {
+    let t = song.rack.track_device(0).unwrap().id;
+    song.rack.set_param(t, 0, on as u8 as f32);
+}
+
+fn left(out: &[f32]) -> Vec<f32> {
+    out.as_chunks::<2>().0.iter().map(|f| f[0]).collect()
+}
+
+fn biggest_step(out: &[f32]) -> f32 {
+    left(out)
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(0.0, f32::max)
+}
+
+fn cut_song(declick: bool) -> Song {
+    let sample = Sample::new("dc", RATE, vec![[0.5, 0.5]; 48_000]);
+    let mut song = one_track_song(sample, 120.0, 4, 1);
+    song.patterns[0].tracks[0].cells[0] = Cell::hit(0, 127).with_fx(Fx::Cut(8));
+    set_declick(&mut song, declick);
+    song
+}
+
+#[test]
+fn declick_is_on_by_default() {
+    let song = one_track_song(click(10), 120.0, 4, 1);
+    let t = song.rack.track_device(0).unwrap();
+    assert_eq!(t.params, vec![1.0]);
+}
+
+#[test]
+fn cut_fades_out_and_ends_on_time() {
+    let out = left(&render(cut_song(true), 6000));
+    // Full level up to the fade, which ends exactly where the cut is due.
+    assert!(out[..3000 - FADE].iter().all(|&s| s == 0.5));
+    for k in 0..FADE {
+        assert_eq!(out[3000 - FADE + k], 0.5 * fade_gain(k), "fade frame {k}");
+    }
+    assert!(out[3000..].iter().all(|&s| s == 0.0));
+    assert!(biggest_step(&render(cut_song(true), 6000)) <= 0.5 / 73.0 + 1e-6);
+}
+
+#[test]
+fn cut_without_declick_is_a_hard_stop() {
+    let out = left(&render(cut_song(false), 6000));
+    assert!(out[..3000].iter().all(|&s| s == 0.5));
+    assert!(out[3000..].iter().all(|&s| s == 0.0));
+}
+
+#[test]
+fn cut_of_ringing_note_fades() {
+    // A cut with no trigger, on the next row: the note started long ago.
+    for declick in [false, true] {
+        let mut song = dc_song();
+        song.patterns[0].tracks[0].cells[1] = Cell::default().with_fx(Fx::Cut(0));
+        set_declick(&mut song, declick);
+        let out = left(&render(song, 12_000));
+        assert!(out[..6000].iter().all(|&s| s == 0.5));
+        if declick {
+            // Cut(0) leaves no time to fade before the cut, so it fades from
+            // the cut on.
+            for k in 0..FADE {
+                assert_eq!(out[6000 + k], 0.5 * fade_gain(k));
+            }
+            assert!(out[6000 + FADE..].iter().all(|&s| s == 0.0));
+        } else {
+            assert!(out[6000..].iter().all(|&s| s == 0.0));
+        }
+    }
+}
+
+/// Two slices: +0.5 then -0.5, each a second long.
+fn two_level_song(declick: bool) -> Song {
+    let mut frames = vec![[0.5; 2]; 48_000];
+    frames.extend(vec![[-0.5; 2]; 48_000]);
+    let mut sample = Sample::new("levels", RATE, frames);
+    sample.slices = vec![0, 48_000];
+    let mut song = one_track_song(sample, 120.0, 4, 1);
+    song.patterns[0].tracks[0].cells[0] = Cell::hit(0, 127);
+    song.patterns[0].tracks[0].cells[1] = Cell::hit(1, 127);
+    set_declick(&mut song, declick);
+    song
+}
+
+#[test]
+fn steal_fades_old_note_under_sharp_attack() {
+    let out = left(&render(two_level_song(true), 12_000));
+    assert!(out[..6000].iter().all(|&s| s == 0.5));
+    // The new note is at full level from its first frame; the old one fades
+    // out on top of it.
+    for k in 0..FADE {
+        assert_eq!(out[6000 + k], -0.5 + 0.5 * fade_gain(k), "frame {k}");
+    }
+    assert!(out[6000 + FADE..].iter().all(|&s| s == -0.5));
+}
+
+#[test]
+fn steal_without_declick_is_a_hard_edge() {
+    let out = left(&render(two_level_song(false), 12_000));
+    assert!(out[..6000].iter().all(|&s| s == 0.5));
+    assert!(out[6000..].iter().all(|&s| s == -0.5));
+}
+
+fn ramp_retrig_song(declick: bool) -> Song {
+    let frames = (0..48_000).map(|i| [i as f32 / 48_000.0; 2]).collect();
+    let mut song = one_track_song(Sample::new("ramp", RATE, frames), 120.0, 4, 1);
+    song.patterns[0].tracks[0].cells[0] = Cell::hit(0, 127).with_fx(Fx::Retrig(2));
+    set_declick(&mut song, declick);
+    song
+}
+
+#[test]
+fn retrigger_fades_old_sound() {
+    let ramp = |i: usize| i as f32 / 48_000.0;
+    let out = left(&render(ramp_retrig_song(true), 6000));
+    assert!((0..3000).all(|i| out[i] == ramp(i)));
+    for k in 0..FADE {
+        let want = ramp(k) + ramp(3000 + k) * fade_gain(k);
+        assert_eq!(out[3000 + k], want, "frame {k}");
+    }
+    assert!((3000 + FADE..6000).all(|i| out[i] == ramp(i - 3000)));
+    // The restart is still a hit: one onset per retrigger in the gate.
+}
+
+#[test]
+fn retrigger_without_declick_restarts_dead() {
+    let ramp = |i: usize| i as f32 / 48_000.0;
+    let out = left(&render(ramp_retrig_song(false), 6000));
+    assert!((0..3000).all(|i| out[i] == ramp(i)));
+    assert!((3000..6000).all(|i| out[i] == ramp(i - 3000)));
+}
+
+#[test]
+fn back_to_back_slices_join_exactly_with_declick() {
+    // A fractional row length, with slices cut where the engine starts
+    // rows: each slice has played its last frame when the next one steals
+    // the voice, so there is nothing to fade and the joins are exact.
+    let (bpm, rpb, rows) = (173.0, 7, 14);
+    let fpr = cowbell::engine::frames_per_row(RATE as f64, bpm, rpb);
+    let starts = cowbell::bounce::row_starts(rows, fpr);
+    let len = *starts.last().unwrap();
+    let frames: Vec<[f32; 2]> = (0..len)
+        .map(|i| {
+            let s = (i as f32 * 0.05).sin() * 0.8;
+            [s, -s]
+        })
+        .collect();
+    let mut sample = Sample::new("chops", RATE, frames.clone());
+    sample.slices = starts[..rows].to_vec();
+    let mut song = one_track_song(sample, bpm, rpb, 2);
+    for r in 0..rows {
+        song.patterns[0].tracks[0].cells[r] = Cell::hit(r as u16, 127);
+    }
+    set_declick(&mut song, true);
+    let out = render(song, len);
+    assert!(out.as_chunks::<2>().0.iter().eq(frames.iter()));
+}
+
+#[test]
+fn declick_param_can_be_turned_off_while_playing() {
+    let song = two_level_song(true);
+    let t = song.rack.track_device(0).unwrap().id;
+    let (mut engine, mut controller) = Engine::new(RATE, song);
+    engine.play();
+    let cmd = Command::SetParam {
+        device: t,
+        param: 0,
+        value: 0.0,
+    };
+    assert!(controller.send(cmd).is_ok());
+    let mut out = vec![0.0; 2 * 12_000];
+    engine.process(&mut out);
+    let out = left(&out);
+    assert_eq!(out[5999], 0.5);
+    assert_eq!(out[6000], -0.5, "hard edge");
+}

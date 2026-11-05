@@ -62,6 +62,8 @@ pub struct Graph {
     /// Per track: (audio buffer, gate buffer).
     tracks: [Option<(usize, usize)>; MAX_TRACKS],
     gate_left: [u32; MAX_TRACKS],
+    /// Per track: whether its voice fades instead of clicking.
+    declick: [bool; MAX_TRACKS],
     /// Where the master device writes its output.
     master: usize,
 }
@@ -136,11 +138,13 @@ impl Graph {
         }
 
         let mut tracks = [None; MAX_TRACKS];
+        let mut declick = [true; MAX_TRACKS];
         for n in &nodes {
             if let Kind::Track(t) = n.kind
                 && t < MAX_TRACKS
             {
                 tracks[t] = Some((n.outputs[0], n.outputs[1]));
+                declick[t] = declick_param(&n.params);
             }
         }
         Graph {
@@ -150,6 +154,7 @@ impl Graph {
             zero: vec![[0.0; 2]; BLOCK],
             tracks,
             gate_left: [0; MAX_TRACKS],
+            declick,
             master,
         }
     }
@@ -178,6 +183,18 @@ impl Graph {
         {
             *p = value;
         }
+        if let Some(n) = self.nodes.iter().find(|n| n.id == device)
+            && let Kind::Track(t) = n.kind
+            && t < MAX_TRACKS
+        {
+            self.declick[t] = declick_param(&n.params);
+        }
+    }
+
+    /// Whether the track's voice should fade out on cuts, steals and
+    /// retriggers, rather than stop dead.
+    pub fn track_declick(&self, track: usize) -> bool {
+        self.declick.get(track).copied().unwrap_or(true)
     }
 
     /// Clear the track inputs before the engine writes a new block.
@@ -253,6 +270,11 @@ impl Graph {
             bufs[*master][..frames].fill([0.0; 2]);
         }
     }
+}
+
+/// The track device's `declick` param. On if missing, like its default.
+fn declick_param(params: &[f32]) -> bool {
+    params.first().is_none_or(|&v| v >= 0.5)
 }
 
 fn run<'a>(
@@ -509,6 +531,18 @@ mod tests {
         // and stays put within it.
         assert!(a.iter().all(|o| *o == a[0]) && b.iter().all(|o| *o == b[0]));
         assert_ne!(a[0], b[0]);
+    }
+
+    #[test]
+    fn track_declick_follows_param() {
+        let mut rack = Rack::simple(2);
+        let t1 = rack.track_device(1).unwrap().id;
+        rack.set_param(t1, 0, 0.0);
+        let mut g = Graph::build(&rack, RATE);
+        assert!(g.track_declick(0));
+        assert!(!g.track_declick(1));
+        g.set_param(t1, 0, 1.0);
+        assert!(g.track_declick(1));
     }
 
     #[test]
