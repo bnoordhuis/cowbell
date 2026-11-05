@@ -27,6 +27,8 @@ pub struct Voice {
     retrig_clock: f64,
     /// Output frames until the note is cut.
     cut_in: Option<f64>,
+    /// Set when the note starts or retriggers; drives the track's gate.
+    hit: bool,
 }
 
 impl Voice {
@@ -64,6 +66,7 @@ impl Voice {
             len: end - start,
             rate: sample.sample_rate as f64 / out_rate,
             gain: v * v,
+            hit: true,
             ..Voice::default()
         };
         for fx in fx {
@@ -89,6 +92,11 @@ impl Voice {
         }
     }
 
+    /// Whether the note started or retriggered since the last call.
+    pub fn take_hit(&mut self) -> bool {
+        std::mem::take(&mut self.hit)
+    }
+
     /// Cut a ringing note partway through the row (a `Cut` with no trigger).
     pub fn schedule_cut(&mut self, frames: f64) {
         self.cut_in = Some(frames);
@@ -110,6 +118,7 @@ impl Voice {
         if self.retrigs_left > 0 {
             if self.retrig_clock <= 0.0 {
                 self.pos = 0.0;
+                self.hit = true;
                 self.retrigs_left -= 1;
                 self.retrig_clock += self.retrig_period;
             }

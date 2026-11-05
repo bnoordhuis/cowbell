@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::rack::Rack;
 use crate::sample::Sample;
 
 /// Effect columns per cell.
@@ -110,4 +111,5 @@ pub struct Song {
     pub patterns: Vec<Pattern>,
     /// Indices into `patterns`, played in sequence and looped.
     pub order: Vec<usize>,
+    pub rack: Rack,
 }

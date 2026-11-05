@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use cowbell::engine::{Command, Engine};
 use cowbell::pattern::{Cell, Fx, Instrument, Pattern, Song};
+use cowbell::rack::Rack;
 use cowbell::sample::Sample;
 use cowbell::transform::Roll;
 use cowbell::{demo, synth};
@@ -22,6 +23,7 @@ fn one_track_song(sample: Sample, bpm: f64, rpb: u32, beats: u32) -> Song {
         instruments: vec![Instrument::Sampler(Arc::new(sample))],
         patterns: vec![Pattern::new(rpb, beats, &[("t", 0)])],
         order: vec![0],
+        rack: Rack::simple(1),
     }
 }
 
@@ -221,4 +223,50 @@ fn play_from_starts_at_row() {
     assert_eq!(onsets(&buf), vec![0]);
     assert!(controller.is_playing());
     assert_eq!(controller.position(), pos);
+}
+
+fn master_id(rack: &Rack) -> u32 {
+    rack.devices
+        .iter()
+        .find(|d| d.kind == cowbell::rack::Kind::Master)
+        .unwrap()
+        .id
+}
+
+#[test]
+fn set_param_reaches_the_graph() {
+    let song = dc_song();
+    let master = master_id(&song.rack);
+    let (mut engine, mut controller) = Engine::new(RATE, song);
+    engine.play();
+    let mut buf = vec![0.0; 2 * 100];
+    engine.process(&mut buf);
+    assert!(buf.iter().all(|&s| s != 0.0));
+    let cmd = Command::SetParam {
+        device: master,
+        param: 0,
+        value: 0.0,
+    };
+    assert!(controller.send(cmd).is_ok());
+    engine.process(&mut buf);
+    assert!(buf.iter().all(|&s| s == 0.0));
+}
+
+#[test]
+fn swapped_graph_keeps_notes_ringing() {
+    let song = dc_song();
+    let (mut engine, mut controller) = Engine::new(RATE, song.clone());
+    engine.play();
+    let mut buf = vec![0.0; 2 * 100];
+    engine.process(&mut buf);
+    let mut rack = song.rack.clone();
+    rack.add(cowbell::rack::Kind::Lfo);
+    let graph = Box::new(cowbell::graph::Graph::build(&rack, RATE));
+    assert!(controller.send(Command::SwapGraph(graph)).is_ok());
+    engine.process(&mut buf);
+    assert!(
+        buf.iter().all(|&s| s == 0.5),
+        "note still sounding, at unity gain"
+    );
+    controller.collect_garbage();
 }

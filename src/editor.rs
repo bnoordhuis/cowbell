@@ -534,6 +534,8 @@ impl Editor {
         }
         self.snapshot();
         let instrument = self.instrument();
+        let track = self.pattern().tracks.len();
+        self.song.rack.add_track(track);
         for p in &mut self.song.patterns {
             let name = format!("t{}", p.tracks.len() + 1);
             p.tracks.push(crate::pattern::Track {
@@ -571,6 +573,7 @@ mod tests {
             instruments: vec![Instrument::Sampler(Arc::new(sample))],
             patterns: vec![Pattern::new(4, 4, &[("a", 0), ("b", 0)])],
             order: vec![0],
+            rack: crate::rack::Rack::simple(2),
         })
     }
 

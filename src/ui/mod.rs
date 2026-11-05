@@ -1,9 +1,11 @@
-//! The tracker window: transport bar, slicer, pattern grid and status bar.
+//! The main window: a transport bar, then either the tracker (slicer and
+//! pattern grid, F1) or the rack (F2), and a status bar.
 //!
 //! Everything is drawn with the painter and nothing takes keyboard focus, so
 //! every key goes to the tracker. Editing logic lives in [`crate::editor`];
 //! this module only maps keys to editor actions and draws the result.
 
+mod rack;
 #[cfg(feature = "screenshot")]
 mod screenshot;
 
@@ -16,6 +18,7 @@ use eframe::egui::{
 use crate::audio::{self, Output};
 use crate::editor::{Action, Editor, Field};
 use crate::engine::{Command, Controller, Engine, Position};
+use crate::graph::Graph;
 use crate::pattern::{Cell, Instrument, Song};
 use crate::sample::Sample;
 
@@ -79,6 +82,13 @@ enum Act {
     PlayPattern,
     ToggleFollow,
     Bpm(f64),
+    View(View),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Tracker,
+    Rack,
 }
 
 fn key_act(key: Key, m: Modifiers) -> Option<Act> {
@@ -115,6 +125,8 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
         Key::R if m.command => edit(Roll),
         Key::T if m.command => edit(AddTrack),
         Key::F if m.command => Some(Act::ToggleFollow),
+        Key::F1 => Some(Act::View(View::Tracker)),
+        Key::F2 => Some(Act::View(View::Rack)),
         _ => None,
     }
 }
@@ -162,6 +174,11 @@ struct App {
     char_width: f32,
     /// First row shown in the grid.
     scroll: usize,
+    view: View,
+    rack_view: rack::RackView,
+    sample_rate: u32,
+    /// The rack version the engine's graph was built from.
+    rack_version: u64,
     #[cfg(feature = "screenshot")]
     screenshot: Option<screenshot::Screenshot>,
 }
@@ -178,6 +195,16 @@ impl App {
             // just pile up in the queue until it's full.
             Err(e) => (Err(e), Engine::new(48_000, song).1),
         };
+        let sample_rate = output.as_ref().map_or(48_000, |o| o.sample_rate);
+        let rack_version = editor.song.rack.version;
+        #[cfg(feature = "screenshot")]
+        let view = if std::env::var("COWBELL_VIEW").as_deref() == Ok("rack") {
+            View::Rack
+        } else {
+            View::Tracker
+        };
+        #[cfg(not(feature = "screenshot"))]
+        let view = View::Tracker;
         App {
             editor,
             controller,
@@ -187,6 +214,10 @@ impl App {
             wave: WaveCache::default(),
             char_width: 8.0,
             scroll: 0,
+            view,
+            rack_view: rack::RackView::default(),
+            sample_rate,
+            rack_version,
             #[cfg(feature = "screenshot")]
             screenshot,
         }
@@ -208,7 +239,9 @@ impl App {
                 } => key_act(key, modifiers),
                 // Text arrives alongside its key event; skip it for shortcuts
                 // and for space, which is play/stop.
-                egui::Event::Text(text) if !modifiers.command && !modifiers.alt => {
+                egui::Event::Text(text)
+                    if self.view == View::Tracker && !modifiers.command && !modifiers.alt =>
+                {
                     for c in text.chars().filter(|c| !c.is_whitespace()) {
                         self.editor.apply(Action::Char(c));
                     }
@@ -223,7 +256,11 @@ impl App {
                 _ => None,
             };
             match act {
+                // The rack view is for the mouse; editing keys stay with the
+                // tracker so they can't change a pattern you can't see.
+                Some(Act::Edit(_)) if self.view == View::Rack => {}
                 Some(Act::Edit(a)) => self.editor.apply(a),
+                Some(Act::View(v)) => self.view = v,
                 Some(Act::PlayToggle) => {
                     let c = self.editor.cursor;
                     let cmd = if self.controller.is_playing() {
@@ -254,6 +291,13 @@ impl App {
     }
 
     fn sync_engine(&mut self) {
+        let rack = &self.editor.song.rack;
+        if rack.version != self.rack_version {
+            let graph = Box::new(Graph::build(rack, self.sample_rate));
+            if self.controller.send(Command::SwapGraph(graph)).is_ok() {
+                self.rack_version = rack.version;
+            }
+        }
         if self.editor.dirty {
             let song = Box::new(self.editor.song.clone());
             if self.controller.send(Command::SwapSong(song)).is_ok() {
@@ -289,6 +333,14 @@ impl App {
             x = rect.right() + 18.0;
         };
         put("cowbell".into(), color::ACCENT);
+        for (view, label) in [(View::Tracker, "F1 tracker"), (View::Rack, "F2 rack")] {
+            let c = if self.view == view {
+                color::TEXT
+            } else {
+                color::DIM
+            };
+            put(label.into(), c);
+        }
         put(
             if playing {
                 "▶ playing".into()
@@ -534,6 +586,38 @@ impl App {
         }
     }
 
+    fn rack_status(&self, ui: &mut egui::Ui) {
+        let p = ui.painter();
+        let r = ui.max_rect();
+        let font = Self::font();
+        let (text, c) = match &self.rack_view.message {
+            Some(m) => (m.clone(), color::ERROR),
+            None => (
+                format!(
+                    "{} devices · {} cables",
+                    self.editor.song.rack.devices.len(),
+                    self.editor.song.rack.cables.len()
+                ),
+                color::TEXT,
+            ),
+        };
+        p.text(
+            r.left_top() + vec2(8.0, 4.0),
+            Align2::LEFT_TOP,
+            text,
+            font.clone(),
+            c,
+        );
+        let hints = "drag between jacks to patch · drag a plug out to unplug · drag knobs (shift: fine) · double-click resets";
+        p.text(
+            r.left_top() + vec2(8.0, 24.0),
+            Align2::LEFT_TOP,
+            hints,
+            font,
+            color::MUTED,
+        );
+    }
+
     fn status(&self, ui: &mut egui::Ui) {
         let p = ui.painter();
         let r = ui.max_rect();
@@ -645,17 +729,50 @@ impl eframe::App for App {
             .exact_size(30.0)
             .frame(frame(color::BG))
             .show(ui, |ui| self.transport(ui));
-        egui::Panel::top("slicer")
-            .exact_size(130.0)
-            .frame(frame(color::BG))
-            .show(ui, |ui| self.slicer(ui));
-        egui::Panel::bottom("status")
-            .exact_size(64.0)
-            .frame(frame(color::PANEL))
-            .show(ui, |ui| self.status(ui));
-        egui::CentralPanel::default()
-            .frame(frame(color::BG))
-            .show(ui, |ui| self.grid(ui));
+        match self.view {
+            View::Tracker => {
+                egui::Panel::top("slicer")
+                    .exact_size(130.0)
+                    .frame(frame(color::BG))
+                    .show(ui, |ui| self.slicer(ui));
+                egui::Panel::bottom("status")
+                    .exact_size(64.0)
+                    .frame(frame(color::PANEL))
+                    .show(ui, |ui| self.status(ui));
+                egui::CentralPanel::default()
+                    .frame(frame(color::BG))
+                    .show(ui, |ui| self.grid(ui));
+            }
+            View::Rack => {
+                egui::Panel::bottom("rack-status")
+                    .exact_size(48.0)
+                    .frame(frame(color::PANEL))
+                    .show(ui, |ui| self.rack_status(ui));
+                egui::CentralPanel::default()
+                    .frame(frame(color::BG))
+                    .show(ui, |ui| {
+                        let names: Vec<String> = self
+                            .editor
+                            .pattern()
+                            .tracks
+                            .iter()
+                            .map(|t| t.name.clone())
+                            .collect();
+                        let changes = self.rack_view.show(ui, &mut self.editor.song.rack, &names);
+                        for (device, param, value) in changes {
+                            let _ = self.controller.send(Command::SetParam {
+                                device,
+                                param,
+                                value,
+                            });
+                        }
+                    });
+                // Cables follow the pointer while dragging.
+                if ui.input(|i| i.pointer.any_down()) {
+                    ctx.request_repaint();
+                }
+            }
+        }
 
         if self.controller.is_playing() {
             ctx.request_repaint();
