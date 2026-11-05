@@ -17,7 +17,12 @@ pub struct Sample {
 
 impl Sample {
     pub fn new(name: impl Into<String>, sample_rate: u32, frames: Vec<[f32; 2]>) -> Self {
-        Sample { name: name.into(), sample_rate, frames, slices: vec![0] }
+        Sample {
+            name: name.into(),
+            sample_rate,
+            frames,
+            slices: vec![0],
+        }
     }
 
     pub fn load_wav(path: &Path) -> Result<Self, hound::Error> {
@@ -36,9 +41,17 @@ impl Sample {
         let channels = spec.channels as usize;
         let frames = samples
             .chunks_exact(channels)
-            .map(|c| if channels == 1 { [c[0], c[0]] } else { [c[0], c[1]] })
+            .map(|c| {
+                if channels == 1 {
+                    [c[0], c[0]]
+                } else {
+                    [c[0], c[1]]
+                }
+            })
             .collect();
-        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         Ok(Sample::new(name, spec.sample_rate, frames))
     }
 
@@ -78,9 +91,8 @@ impl Sample {
         let s = sensitivity.clamp(0.0, 1.0);
         let ratio = 10.0 - 8.5 * s;
         let floor_scale = 10f32.powf(-1.0 - 2.0 * s);
-        let floors: [f32; 2] = std::array::from_fn(|b| {
-            floor_scale * bands.iter().map(|e| e[b]).fold(0.0, f32::max)
-        });
+        let floors: [f32; 2] =
+            std::array::from_fn(|b| floor_scale * bands.iter().map(|e| e[b]).fold(0.0, f32::max));
         let min_gap = (min_gap_ms / 1000.0 * self.sample_rate as f32) as usize;
 
         let mut slices = vec![0];

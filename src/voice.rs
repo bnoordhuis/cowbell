@@ -81,7 +81,8 @@ impl Voice {
                     self.crush_levels = Some((1u32 << (bits.clamp(1, 16) - 1)) as f32)
                 }
                 Fx::Stutter(ms) => {
-                    self.loop_len = Some((ms.max(1) as f64 / 1000.0 * sample.sample_rate as f64).max(1.0))
+                    self.loop_len =
+                        Some((ms.max(1) as f64 / 1000.0 * sample.sample_rate as f64).max(1.0))
                 }
                 Fx::Cut(n) => self.cut_in = Some(frames_per_row * n as f64 / 16.0),
             }
@@ -128,7 +129,11 @@ impl Voice {
             return [0.0; 2];
         }
         let p = self.offset + p;
-        let p = if self.reverse { self.len as f64 - 1.0 - p } else { p };
+        let p = if self.reverse {
+            self.len as f64 - 1.0 - p
+        } else {
+            p
+        };
         let i = p as usize;
         let frac = (p - i as f64) as f32;
         let a = sample.frames[self.start + i];

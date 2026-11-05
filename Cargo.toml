@@ -2,18 +2,29 @@
 name = "cowbell"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 description = "A keyboard-driven tracker for drill 'n' bass"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = []
+default = ["ui"]
+# The tracker UI. Implies live audio.
+ui = ["dep:eframe", "live"]
 # Live audio output via cpal. Needs ALSA headers (libasound2-dev) on Linux.
 live = ["dep:cpal"]
+# Dev only: COWBELL_SCREENSHOT=out.ppm saves a screenshot and exits. See
+# src/ui/screenshot.rs.
+screenshot = ["ui"]
 
 [dependencies]
 # Exact pins: every version was checked to be published at least 7 days ago.
 cpal = { version = "=0.18.2", optional = true }
+eframe = { version = "=0.37.0", optional = true, default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 hound = "=3.5.1"
 rtrb = "=0.4.1"
 

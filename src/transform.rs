@@ -23,7 +23,11 @@ impl Roll {
         let rows = rows.start.min(track.cells.len())..rows.end.min(track.cells.len());
         let n = rows.len();
         for (i, row) in rows.enumerate() {
-            let t = if n > 1 { i as f32 / (n - 1) as f32 } else { 0.0 };
+            let t = if n > 1 {
+                i as f32 / (n - 1) as f32
+            } else {
+                0.0
+            };
             let t = t.powf(self.curve.max(0.01));
             let lerp = |(a, b): (f32, f32)| (a + (b - a) * t).round();
             let hits = lerp((self.hits.0 as f32, self.hits.1 as f32)) as u8;

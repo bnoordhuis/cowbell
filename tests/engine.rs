@@ -37,7 +37,13 @@ fn render(song: Song, frames: usize) -> Vec<f32> {
 }
 
 fn onsets(out: &[f32]) -> Vec<usize> {
-    out.chunks_exact(2).enumerate().filter(|(_, f)| f[0] != 0.0).map(|(i, _)| i).collect()
+    out.as_chunks::<2>()
+        .0
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f[0] != 0.0)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 #[test]
@@ -104,11 +110,20 @@ fn slicer_finds_demo_break_hits() {
 #[test]
 fn roll_sweeps_hits_and_pitch() {
     let mut p = Pattern::new(4, 2, &[("snr", 0)]);
-    Roll { slice: 3, hits: (1, 8), pitch: (0, 12), velocity: (60, 120), curve: 1.0 }
-        .apply(&mut p.tracks[0], 0..8);
+    Roll {
+        slice: 3,
+        hits: (1, 8),
+        pitch: (0, 12),
+        velocity: (60, 120),
+        curve: 1.0,
+    }
+    .apply(&mut p.tracks[0], 0..8);
     let cells = &p.tracks[0].cells;
     assert_eq!(cells[0].fx().next(), Some(Fx::Retrig(1)));
-    assert_eq!(cells[7].fx().collect::<Vec<_>>(), vec![Fx::Retrig(8), Fx::Pitch(12)]);
+    assert_eq!(
+        cells[7].fx().collect::<Vec<_>>(),
+        vec![Fx::Retrig(8), Fx::Pitch(12)]
+    );
     assert_eq!(cells[7].trigger.unwrap().velocity, 120);
 }
 
@@ -122,7 +137,11 @@ fn swapped_song_is_handed_back() {
     let before = Arc::strong_count(match &song.instruments[0] {
         Instrument::Sampler(s) => s,
     });
-    assert!(controller.send(Command::SwapSong(Box::new(song.clone()))).is_ok());
+    assert!(
+        controller
+            .send(Command::SwapSong(Box::new(song.clone())))
+            .is_ok()
+    );
     engine.process(&mut buf);
     assert!(buf.iter().all(|s| s.is_finite()));
     controller.collect_garbage();
@@ -134,8 +153,72 @@ fn swapped_song_is_handed_back() {
 
 #[test]
 fn demo_song_renders_without_clipping_or_nans() {
-    let out = render(demo::song(synth::demo_break(RATE, 172.0)), RATE as usize * 4);
+    let out = render(
+        demo::song(synth::demo_break(RATE, 172.0)),
+        RATE as usize * 4,
+    );
     let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     assert!(out.iter().all(|s| s.is_finite()));
     assert!(peak > 0.1 && peak < 2.0, "peak {peak}");
+}
+
+fn dc_song() -> Song {
+    let sample = Sample::new("dc", RATE, vec![[0.5, 0.5]; 48_000]);
+    let mut song = one_track_song(sample, 120.0, 4, 8);
+    song.patterns[0].tracks[0].cells[0] = Cell::hit(0, 127);
+    song
+}
+
+#[test]
+fn edit_keeps_ringing_notes() {
+    let song = dc_song();
+    let (mut engine, mut controller) = Engine::new(RATE, song.clone());
+    engine.play();
+    let mut buf = vec![0.0; 2 * 1000];
+    engine.process(&mut buf);
+    // Same sample, edited pattern: the note keeps sounding.
+    let mut edited = song.clone();
+    edited.patterns[0].tracks[0].cells[3] = Cell::hit(0, 64);
+    assert!(controller.send(Command::SwapSong(Box::new(edited))).is_ok());
+    engine.process(&mut buf);
+    assert!(buf.iter().all(|&s| s != 0.0));
+    // New sample: the note stops, because its frames may be gone.
+    assert!(
+        controller
+            .send(Command::SwapSong(Box::new(dc_song())))
+            .is_ok()
+    );
+    engine.process(&mut buf);
+    assert!(buf.iter().all(|&s| s == 0.0));
+}
+
+#[test]
+fn audition_plays_while_stopped() {
+    let (mut engine, mut controller) = Engine::new(RATE, dc_song());
+    let mut buf = vec![0.0; 2 * 100];
+    engine.process(&mut buf);
+    assert!(buf.iter().all(|&s| s == 0.0));
+    let cmd = Command::Audition {
+        instrument: 0,
+        slice: 0,
+        velocity: 127,
+    };
+    assert!(controller.send(cmd).is_ok());
+    engine.process(&mut buf);
+    assert!(buf.iter().all(|&s| s != 0.0));
+    assert!(!controller.is_playing());
+}
+
+#[test]
+fn play_from_starts_at_row() {
+    let mut song = one_track_song(click(10), 120.0, 4, 1);
+    song.patterns[0].tracks[0].cells[2] = Cell::hit(0, 127);
+    let (mut engine, mut controller) = Engine::new(RATE, song);
+    let pos = cowbell::engine::Position { order: 0, row: 2 };
+    assert!(controller.send(Command::PlayFrom(pos)).is_ok());
+    let mut buf = vec![0.0; 2 * 100];
+    engine.process(&mut buf);
+    assert_eq!(onsets(&buf), vec![0]);
+    assert!(controller.is_playing());
+    assert_eq!(controller.position(), pos);
 }

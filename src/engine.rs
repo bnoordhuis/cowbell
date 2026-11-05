@@ -7,21 +7,32 @@
 //! thread can drop it.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::pattern::{Fx, Instrument, Song};
+use crate::pattern::{Fx, Instrument, Song, Trigger};
 use crate::voice::Voice;
 
 pub const MAX_TRACKS: usize = 16;
+/// One voice per track, plus one for auditioning slices from the UI.
+const AUDITION: usize = MAX_TRACKS;
 
 pub enum Command {
     Play,
+    /// Start playing at this row.
+    PlayFrom(Position),
     Stop,
+    /// Preview a slice, independent of the song.
+    Audition {
+        instrument: usize,
+        slice: u16,
+        velocity: u8,
+    },
     SetBpm(f64),
     /// Replace the song. Playback continues from the same order position and
-    /// row, as far as the new song has them.
+    /// row, as far as the new song has them. Notes keep ringing if their
+    /// sample is the same in the new song.
     SwapSong(Box<Song>),
 }
 
@@ -40,23 +51,27 @@ pub struct Engine {
     /// Output frames until the next row starts. Fractional, so rows land on
     /// the right frame even when a row isn't a whole number of frames long.
     row_clock: f64,
-    voices: [Voice; MAX_TRACKS],
+    voices: [Voice; MAX_TRACKS + 1],
     commands: Consumer<Command>,
     trash: Producer<Box<Song>>,
     shared_pos: Arc<AtomicU64>,
+    shared_playing: Arc<AtomicBool>,
 }
 
 pub struct Controller {
     commands: Producer<Command>,
     trash: Consumer<Box<Song>>,
     shared_pos: Arc<AtomicU64>,
+    shared_playing: Arc<AtomicBool>,
 }
 
 impl Controller {
     /// Send a command to the audio thread. Gives it back if the queue is full.
     pub fn send(&mut self, cmd: Command) -> Result<(), Command> {
         self.collect_garbage();
-        self.commands.push(cmd).map_err(|rtrb::PushError::Full(cmd)| cmd)
+        self.commands
+            .push(cmd)
+            .map_err(|rtrb::PushError::Full(cmd)| cmd)
     }
 
     /// Drop songs the engine has finished with. Call this regularly.
@@ -68,6 +83,10 @@ impl Controller {
     pub fn position(&self) -> Position {
         unpack(self.shared_pos.load(Ordering::Relaxed))
     }
+
+    pub fn is_playing(&self) -> bool {
+        self.shared_playing.load(Ordering::Relaxed)
+    }
 }
 
 fn pack(p: Position) -> u64 {
@@ -75,7 +94,10 @@ fn pack(p: Position) -> u64 {
 }
 
 fn unpack(v: u64) -> Position {
-    Position { order: (v >> 32) as usize, row: (v & 0xffff_ffff) as usize }
+    Position {
+        order: (v >> 32) as usize,
+        row: (v & 0xffff_ffff) as usize,
+    }
 }
 
 impl Engine {
@@ -83,6 +105,7 @@ impl Engine {
         let (cmd_tx, cmd_rx) = RingBuffer::new(64);
         let (trash_tx, trash_rx) = RingBuffer::new(64);
         let shared_pos = Arc::new(AtomicU64::new(0));
+        let shared_playing = Arc::new(AtomicBool::new(false));
         let engine = Engine {
             out_rate: out_rate as f64,
             song: Box::new(song),
@@ -93,13 +116,24 @@ impl Engine {
             commands: cmd_rx,
             trash: trash_tx,
             shared_pos: shared_pos.clone(),
+            shared_playing: shared_playing.clone(),
         };
-        let controller = Controller { commands: cmd_tx, trash: trash_rx, shared_pos };
+        let controller = Controller {
+            commands: cmd_tx,
+            trash: trash_rx,
+            shared_pos,
+            shared_playing,
+        };
         (engine, controller)
     }
 
     pub fn play(&mut self) {
-        self.playing = true;
+        self.set_playing(true);
+    }
+
+    fn set_playing(&mut self, playing: bool) {
+        self.playing = playing;
+        self.shared_playing.store(playing, Ordering::Relaxed);
     }
 
     pub fn position(&self) -> Position {
@@ -107,7 +141,11 @@ impl Engine {
     }
 
     fn frames_per_row(&self) -> f64 {
-        let rpb = self.song.order.get(self.pos.order).and_then(|&p| self.song.patterns.get(p));
+        let rpb = self
+            .song
+            .order
+            .get(self.pos.order)
+            .and_then(|&p| self.song.patterns.get(p));
         let rpb = rpb.map_or(4, |p| p.rows_per_beat.max(1)) as f64;
         self.out_rate * 60.0 / (self.song.bpm.max(1.0) * rpb)
     }
@@ -115,19 +153,60 @@ impl Engine {
     fn handle_commands(&mut self) {
         while let Ok(cmd) = self.commands.pop() {
             match cmd {
-                Command::Play => self.playing = true,
+                Command::Play => self.set_playing(true),
+                Command::PlayFrom(pos) => {
+                    self.pos = pos;
+                    if self.pos.order >= self.song.order.len() {
+                        self.pos = Position { order: 0, row: 0 };
+                    }
+                    self.row_clock = 0.0;
+                    self.voices.iter_mut().for_each(Voice::stop);
+                    self.set_playing(true);
+                }
                 Command::Stop => {
-                    self.playing = false;
+                    self.set_playing(false);
                     self.pos = Position { order: 0, row: 0 };
                     self.row_clock = 0.0;
                     self.voices.iter_mut().for_each(Voice::stop);
                 }
+                Command::Audition {
+                    instrument,
+                    slice,
+                    velocity,
+                } => {
+                    if let Some(Instrument::Sampler(sample)) = self.song.instruments.get(instrument)
+                    {
+                        let trigger = Trigger { slice, velocity };
+                        let fpr = self.frames_per_row();
+                        self.voices[AUDITION].trigger(
+                            instrument,
+                            sample,
+                            trigger,
+                            std::iter::empty(),
+                            self.out_rate,
+                            fpr,
+                        );
+                    }
+                }
                 Command::SetBpm(bpm) => self.song.bpm = bpm,
                 Command::SwapSong(song) => {
                     let old = std::mem::replace(&mut self.song, song);
-                    // Old voices may point at instruments or slices that no
-                    // longer exist.
-                    self.voices.iter_mut().for_each(Voice::stop);
+                    // A voice indexes into its sample's frames, so it can only
+                    // keep playing if the new song has the very same sample.
+                    for voice in self.voices.iter_mut().filter(|v| v.is_active()) {
+                        let same = match (
+                            old.instruments.get(voice.instrument()),
+                            self.song.instruments.get(voice.instrument()),
+                        ) {
+                            (Some(Instrument::Sampler(a)), Some(Instrument::Sampler(b))) => {
+                                Arc::ptr_eq(a, b)
+                            }
+                            _ => false,
+                        };
+                        if !same {
+                            voice.stop();
+                        }
+                    }
                     if self.pos.order >= self.song.order.len() {
                         self.pos = Position { order: 0, row: 0 };
                     }
@@ -144,18 +223,32 @@ impl Engine {
 
     /// Fire the cells of the current row.
     fn fire_row(&mut self) {
-        let Some(pattern) = self.song.order.get(self.pos.order).and_then(|&p| self.song.patterns.get(p))
+        let Some(pattern) = self
+            .song
+            .order
+            .get(self.pos.order)
+            .and_then(|&p| self.song.patterns.get(p))
         else {
             return;
         };
         let fpr = self.frames_per_row();
         for (track, voice) in pattern.tracks.iter().zip(self.voices.iter_mut()) {
-            let Some(cell) = track.cells.get(self.pos.row) else { continue };
-            let Some(Instrument::Sampler(sample)) = self.song.instruments.get(track.instrument) else {
+            let Some(cell) = track.cells.get(self.pos.row) else {
+                continue;
+            };
+            let Some(Instrument::Sampler(sample)) = self.song.instruments.get(track.instrument)
+            else {
                 continue;
             };
             if let Some(trigger) = cell.trigger {
-                voice.trigger(track.instrument, sample, trigger, cell.fx(), self.out_rate, fpr);
+                voice.trigger(
+                    track.instrument,
+                    sample,
+                    trigger,
+                    cell.fx(),
+                    self.out_rate,
+                    fpr,
+                );
             } else if let Some(Fx::Cut(n)) = cell.fx().find(|f| matches!(f, Fx::Cut(_))) {
                 voice.schedule_cut(fpr * n as f64 / 16.0);
             }
@@ -182,7 +275,7 @@ impl Engine {
     /// Render interleaved stereo into `out`.
     pub fn process(&mut self, out: &mut [f32]) {
         self.handle_commands();
-        for frame in out.chunks_exact_mut(2) {
+        for frame in out.as_chunks_mut::<2>().0 {
             if self.playing {
                 while self.row_clock <= 0.0 {
                     self.fire_row();
@@ -194,7 +287,9 @@ impl Engine {
             }
             let mut mix = [0.0f32; 2];
             for voice in self.voices.iter_mut().filter(|v| v.is_active()) {
-                let Some(Instrument::Sampler(sample)) = self.song.instruments.get(voice.instrument()) else {
+                let Some(Instrument::Sampler(sample)) =
+                    self.song.instruments.get(voice.instrument())
+                else {
                     continue;
                 };
                 let [l, r] = voice.next_frame(sample);

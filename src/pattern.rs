@@ -44,7 +44,10 @@ pub struct Cell {
 
 impl Cell {
     pub fn hit(slice: u16, velocity: u8) -> Self {
-        Cell { trigger: Some(Trigger { slice, velocity }), fx: [None; MAX_FX] }
+        Cell {
+            trigger: Some(Trigger { slice, velocity }),
+            fx: [None; MAX_FX],
+        }
     }
 
     pub fn with_fx(mut self, fx: Fx) -> Self {
@@ -92,7 +95,11 @@ impl Pattern {
                 cells: vec![Cell::default(); rows],
             })
             .collect();
-        Pattern { rows_per_beat, rows, tracks }
+        Pattern {
+            rows_per_beat,
+            rows,
+            tracks,
+        }
     }
 }
 
