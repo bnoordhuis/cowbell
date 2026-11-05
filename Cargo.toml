@@ -26,7 +26,9 @@ eframe = { version = "=0.37.0", optional = true, default-features = false, featu
     "x11",
 ] }
 hound = "=3.5.1"
+ron = "=0.12.3"
 rtrb = "=0.4.1"
+serde = { version = "=1.0.229", features = ["derive"] }
 
 [profile.dev]
 opt-level = 1

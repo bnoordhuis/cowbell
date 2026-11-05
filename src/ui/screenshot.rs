@@ -89,6 +89,9 @@ fn parse_keys(script: &str) -> Vec<Action> {
                 "ctrl-right" => Action::NextOrder,
                 "ctrl-left" => Action::PrevOrder,
                 "roll" => Action::Roll,
+                "bounce" => Action::Bounce,
+                "undo" => Action::Undo,
+                "redo" => Action::Redo,
                 "del" => Action::Clear,
                 "pgdn" => Action::PageDown,
                 other => {

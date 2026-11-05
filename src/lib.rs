@@ -2,11 +2,13 @@
 
 #[cfg(feature = "live")]
 pub mod audio;
+pub mod bounce;
 pub mod demo;
 pub mod editor;
 pub mod engine;
 pub mod graph;
 pub mod pattern;
+pub mod project;
 pub mod rack;
 pub mod sample;
 pub mod synth;

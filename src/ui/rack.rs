@@ -53,6 +53,8 @@ enum Drag {
 #[derive(Default)]
 pub struct RackView {
     drag: Option<Drag>,
+    /// The rack as it was when the current mouse gesture started.
+    before: Option<Rack>,
     scroll: f32,
     /// Shown in the status bar: why the last patch didn't work.
     pub message: Option<String>,
@@ -216,20 +218,25 @@ fn draw_cable(p: &egui::Painter, a: Pos2, b: Pos2, color: Color32) {
     }
 }
 
+/// What happened in the rack view this frame.
+#[derive(Default)]
+pub struct Output {
+    /// Knob changes, for the engine. Structural changes bump `rack.version`
+    /// instead, which the caller watches.
+    pub params: Vec<(DeviceId, usize, f32)>,
+    /// Set when a gesture that changed the rack has finished: the rack as it
+    /// was before, for undo. A whole knob drag or cable move is one step.
+    pub undo: Option<Rack>,
+}
+
 impl RackView {
-    /// Show the rack. Returns knob changes for the engine; structural
-    /// changes bump `rack.version`, which the caller watches.
-    pub fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        rack: &mut Rack,
-        track_names: &[String],
-    ) -> Vec<(DeviceId, usize, f32)> {
+    pub fn show(&mut self, ui: &mut egui::Ui, rack: &mut Rack, track_names: &[String]) -> Output {
         let area = ui.max_rect();
         let font = FontId::monospace(13.0);
         let small = FontId::monospace(11.0);
         let response = ui.allocate_rect(area, Sense::click_and_drag());
         let mut changes = Vec::new();
+        let mut undo = None;
 
         // Scrolling.
         let content = ADD_BAR + rack.devices.len() as f32 * (PANEL_HEIGHT + PANEL_GAP) + MARGIN;
@@ -246,6 +253,7 @@ impl RackView {
         if response.drag_started()
             && let Some(p) = ui.input(|i| i.pointer.press_origin())
         {
+            self.before = Some(rack.clone());
             if let Some((jack, is_input)) = l.jack_at(p) {
                 self.drag = Some(if is_input {
                     match rack.disconnect(jack) {
@@ -320,24 +328,31 @@ impl RackView {
                 self.message = result.err().map(str::to_owned);
             }
             self.drag = None;
+            undo = self.before.take().filter(|b| !b.same_patch(rack));
         }
         if response.double_clicked()
             && let Some(p) = pointer
             && let Some((device, param)) = l.knob_at(p)
         {
             let default = rack.device(device).unwrap().kind.params()[param].default;
+            let before = rack.clone();
             if let Some(v) = rack.set_param(device, param, default) {
                 changes.push((device, param, v));
             }
+            undo = Some(before).filter(|b| !b.same_patch(rack));
         }
         if response.clicked()
             && let Some(p) = pointer
         {
+            let before = rack.clone();
             if let Some(&(kind, _)) = l.adds.iter().find(|(_, r)| r.contains(p)) {
                 rack.add(kind);
                 self.scroll = f32::MAX; // show the new device at the bottom
             } else if let Some(&(id, _)) = l.removes.iter().find(|(_, r)| r.contains(p)) {
                 rack.remove(id);
+            }
+            if !before.same_patch(rack) {
+                undo = Some(before);
             }
         }
 
@@ -498,7 +513,10 @@ impl RackView {
         {
             draw_cable(p, a, ptr, color::TEXT);
         }
-        changes
+        Output {
+            params: changes,
+            undo,
+        }
     }
 }
 
@@ -512,6 +530,7 @@ mod tests {
         view: RackView,
         rack: Rack,
         changes: Vec<(DeviceId, usize, f32)>,
+        undos: usize,
     }
 
     impl Harness {
@@ -521,6 +540,7 @@ mod tests {
                 view: RackView::default(),
                 rack,
                 changes: vec![],
+                undos: 0,
             };
             h.frame(vec![]);
             h
@@ -533,9 +553,13 @@ mod tests {
                 ..Default::default()
             };
             let (view, rack, changes) = (&mut self.view, &mut self.rack, &mut self.changes);
-            let mut full = self
-                .ctx
-                .run_ui(input, |ui| changes.extend(view.show(ui, rack, &[])));
+            let mut undos = 0;
+            let mut full = self.ctx.run_ui(input, |ui| {
+                let out = view.show(ui, rack, &[]);
+                changes.extend(out.params);
+                undos += out.undo.is_some() as usize;
+            });
+            self.undos += undos;
             // No renderer here to apply the font textures.
             full.textures_delta.clear();
         }
@@ -561,6 +585,10 @@ mod tests {
         }
 
         fn drag(&mut self, from: Pos2, to: Pos2) {
+            self.drag_via(from, from + (to - from) * 0.5, to);
+        }
+
+        fn drag_via(&mut self, from: Pos2, via: Pos2, to: Pos2) {
             let button = |pos, pressed| Event::PointerButton {
                 pos,
                 button: PointerButton::Primary,
@@ -569,10 +597,10 @@ mod tests {
             };
             self.frame(vec![Event::PointerMoved(from)]);
             self.frame(vec![button(from, true)]);
-            for i in 1..=4 {
-                self.frame(vec![Event::PointerMoved(
-                    from + (to - from) * (i as f32 / 4.0),
-                )]);
+            for (a, b) in [(from, via), (via, to)] {
+                for i in 1..=3 {
+                    self.frame(vec![Event::PointerMoved(a + (b - a) * (i as f32 / 3.0))]);
+                }
             }
             self.frame(vec![button(to, false)]);
             self.frame(vec![]);
@@ -585,59 +613,57 @@ mod tests {
         (rack, f)
     }
 
+    fn jack(device: DeviceId, port: usize) -> Jack {
+        Jack { device, port }
+    }
+
+    fn mixer(rack: &Rack) -> DeviceId {
+        rack.devices
+            .iter()
+            .find(|d| d.kind == Kind::Mixer)
+            .unwrap()
+            .id
+    }
+
     #[test]
     fn drag_output_to_input_patches() {
         let (rack, f) = rack_with_filter();
         let mut h = Harness::new(rack);
         let track = h.rack.track_device(0).unwrap().id;
         let l = h.layout();
-        let a = l
-            .jack_pos(
-                Jack {
-                    device: track,
-                    port: 0,
-                },
-                false,
-            )
-            .unwrap();
-        let b = l.jack_pos(Jack { device: f, port: 0 }, true).unwrap();
+        let a = l.jack_pos(jack(track, 0), false).unwrap();
+        let b = l.jack_pos(jack(f, 0), true).unwrap();
         h.drag(a, b);
-        let c = h
-            .rack
-            .cable_into(Jack { device: f, port: 0 })
-            .expect("patched");
-        assert_eq!(
-            c.from,
-            Jack {
-                device: track,
-                port: 0
-            }
-        );
+        let c = h.rack.cable_into(jack(f, 0)).expect("patched");
+        assert_eq!(c.from, jack(track, 0));
         assert_eq!(
             h.rack.cables.len(),
             3,
             "the track still feeds the mixer too"
         );
+        assert_eq!(h.undos, 1);
     }
 
     #[test]
     fn dragging_a_plug_away_unplugs_it() {
         let mut h = Harness::new(Rack::simple(1));
-        let mixer = h
-            .rack
-            .devices
-            .iter()
-            .find(|d| d.kind == Kind::Mixer)
-            .unwrap()
-            .id;
-        let into = Jack {
-            device: mixer,
-            port: 0,
-        };
+        let into = jack(mixer(&h.rack), 0);
         assert!(h.rack.cable_into(into).is_some());
         let a = h.layout().jack_pos(into, true).unwrap();
         h.drag(a, a + vec2(0.0, 300.0));
         assert!(h.rack.cable_into(into).is_none());
+        assert_eq!(h.undos, 1);
+    }
+
+    #[test]
+    fn replugging_the_same_jack_is_not_an_undo_step() {
+        let mut h = Harness::new(Rack::simple(1));
+        let into = jack(mixer(&h.rack), 0);
+        let a = h.layout().jack_pos(into, true).unwrap();
+        // Pull the plug out and push it back into the same jack.
+        h.drag_via(a, a + vec2(0.0, 80.0), a);
+        assert!(h.rack.cable_into(into).is_some());
+        assert_eq!(h.undos, 0);
     }
 
     #[test]
@@ -646,20 +672,13 @@ mod tests {
         let mut h = Harness::new(rack);
         let track = h.rack.track_device(0).unwrap().id;
         let l = h.layout();
-        let a = l
-            .jack_pos(
-                Jack {
-                    device: track,
-                    port: 0,
-                },
-                false,
-            )
-            .unwrap();
-        let b = l.jack_pos(Jack { device: f, port: 0 }, false).unwrap();
+        let a = l.jack_pos(jack(track, 0), false).unwrap();
+        let b = l.jack_pos(jack(f, 0), false).unwrap();
         let before = h.rack.cables.clone();
         h.drag(a, b);
         assert_eq!(h.rack.cables, before);
         assert!(h.view.message.is_some());
+        assert_eq!(h.undos, 0);
     }
 
     #[test]
@@ -677,9 +696,7 @@ mod tests {
         h.drag(c, c - vec2(0.0, 60.0));
         let after = h.rack.device(f).unwrap().params[0];
         assert!(after > before * 1.5, "{before} -> {after}");
-        assert_eq!(
-            h.changes.last().map(|c| (c.0, c.1, c.2)),
-            Some((f, 0, after))
-        );
+        assert_eq!(h.changes.last().copied(), Some((f, 0, after)));
+        assert_eq!(h.undos, 1, "a whole drag is one undo step");
     }
 }

@@ -5,6 +5,8 @@
 //! number of inputs; an input takes one cable. Cables that would make a loop
 //! are refused, so the rack always has a processing order.
 
+use serde::{Deserialize, Serialize};
+
 use crate::engine::MAX_TRACKS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,7 +115,7 @@ impl ParamSpec {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     /// A pattern track's voice. Only created and removed with the track.
     Track(usize),
@@ -237,32 +239,33 @@ impl Kind {
 
 pub type DeviceId = u32;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Device {
     pub id: DeviceId,
     pub kind: Kind,
     pub params: Vec<f32>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Jack {
     pub device: DeviceId,
     pub port: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cable {
     pub from: Jack,
     pub to: Jack,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Rack {
     pub devices: Vec<Device>,
     pub cables: Vec<Cable>,
     next_id: DeviceId,
     /// Bumped on every change to devices or cables (not to param values), so
-    /// the UI knows when the engine needs a new graph.
+    /// the UI knows when the engine needs a new graph. Not saved.
+    #[serde(skip)]
     pub version: u64,
 }
 
@@ -355,6 +358,20 @@ impl Rack {
         Some(v)
     }
 
+    /// Same devices, params and cables, ignoring `version` and cable order.
+    pub fn same_patch(&self, other: &Rack) -> bool {
+        let sorted = |r: &Rack| {
+            let mut c: Vec<_> = r
+                .cables
+                .iter()
+                .map(|c| (c.to.device, c.to.port, c.from.device, c.from.port))
+                .collect();
+            c.sort();
+            c
+        };
+        self.devices == other.devices && sorted(self) == sorted(other)
+    }
+
     pub fn cable_into(&self, to: Jack) -> Option<&Cable> {
         self.cables.iter().find(|c| c.to == to)
     }
@@ -423,6 +440,39 @@ impl Rack {
             }
         }
         done
+    }
+
+    /// Fix up a rack read from a file: drop cables to devices or jacks that
+    /// don't exist, keep inputs to one cable, and make sure new device ids
+    /// can't collide with existing ones.
+    pub fn repair(&mut self) {
+        let valid = |r: &Rack, c: &Cable| {
+            let (Some(a), Some(b)) = (r.device(c.from.device), r.device(c.to.device)) else {
+                return false;
+            };
+            c.from.port < a.kind.outputs().len() && c.to.port < b.kind.inputs().len()
+        };
+        let cables = std::mem::take(&mut self.cables);
+        for c in cables {
+            if valid(self, &c) && self.cable_into(c.to).is_none() {
+                self.cables.push(c);
+            }
+        }
+        for d in &mut self.devices {
+            let specs = d.kind.params();
+            d.params.resize(specs.len(), 0.0);
+            for (v, spec) in d.params.iter_mut().zip(specs) {
+                *v = spec.clamp(*v);
+            }
+        }
+        self.next_id = self
+            .devices
+            .iter()
+            .map(|d| d.id + 1)
+            .max()
+            .unwrap_or(0)
+            .max(self.next_id);
+        self.version += 1;
     }
 
     /// Track devices whose track no longer exists are removed.

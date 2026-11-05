@@ -7,7 +7,8 @@
 
 use std::ops::Range;
 
-use crate::pattern::{Cell, Fx, MAX_FX, Pattern, Song, Trigger};
+use crate::pattern::{Cell, Fx, Instrument, MAX_FX, Pattern, Song, Trigger};
+use crate::rack::Rack;
 use crate::transform::Roll;
 
 const UNDO_DEPTH: usize = 500;
@@ -76,6 +77,9 @@ pub enum Action {
     Copy,
     Paste,
     AddTrack,
+    /// Render the selected rows (or the whole pattern) to a new sample on a
+    /// new track, replacing what was there. See [`crate::bounce`].
+    Bounce,
     EditStep(isize),
 }
 
@@ -127,6 +131,15 @@ impl Fx {
     }
 }
 
+/// Everything undo puts back: patterns, the rack, and instruments (a bounce
+/// adds one). Instruments are `Arc`s, so this doesn't copy sample data.
+#[derive(Clone)]
+pub struct Snapshot {
+    patterns: Vec<Pattern>,
+    rack: Rack,
+    instruments: Vec<Instrument>,
+}
+
 pub struct Editor {
     pub song: Song,
     pub cursor: Cursor,
@@ -137,11 +150,15 @@ pub struct Editor {
     pub last_velocity: u8,
     /// Set when the song changed and the engine needs the new version.
     pub dirty: bool,
+    /// Counts changes, so the UI can tell whether there are unsaved ones.
+    pub revision: u64,
     /// Set when a slice should be previewed: `(instrument, slice)`.
     pub audition: Option<(usize, u16)>,
+    /// A note for the status bar about the last action, e.g. why it failed.
+    pub message: Option<String>,
     clipboard: Vec<Cell>,
-    undo: Vec<Vec<Pattern>>,
-    redo: Vec<Vec<Pattern>>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
     /// The field being typed into. Typing into the same field again is part
     /// of the same undo step.
     typing_in: Option<(usize, usize, usize, Field)>,
@@ -179,7 +196,9 @@ impl Editor {
             last_slice: 0,
             last_velocity: 0x7f,
             dirty: false,
+            revision: 0,
             audition: None,
+            message: None,
             clipboard: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -225,13 +244,50 @@ impl Editor {
         self.anchor = self.anchor.map(|a| a.min(rows - 1));
     }
 
-    fn snapshot(&mut self) {
-        self.undo.push(self.song.patterns.clone());
+    /// The current state, for undo.
+    pub fn capture(&self) -> Snapshot {
+        Snapshot {
+            patterns: self.song.patterns.clone(),
+            rack: self.song.rack.clone(),
+            instruments: self.song.instruments.clone(),
+        }
+    }
+
+    /// Record `before` as an undo step, for changes made outside the editor
+    /// (the rack view edits the rack directly).
+    pub fn record(&mut self, before: Snapshot) {
+        self.undo.push(before);
         if self.undo.len() > UNDO_DEPTH {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.changed();
+    }
+
+    /// Record a rack change made outside the editor, given the rack as it
+    /// was before.
+    pub fn record_rack(&mut self, before: Rack) {
+        let mut snap = self.capture();
+        snap.rack = before;
+        self.record(snap);
+    }
+
+    /// Mark the song as changed: the engine needs it, and it's unsaved.
+    pub fn changed(&mut self) {
         self.dirty = true;
+        self.revision += 1;
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    fn snapshot(&mut self) {
+        self.record(self.capture());
     }
 
     fn cell_mut(&mut self, row: usize) -> Option<&mut Cell> {
@@ -345,6 +401,7 @@ impl Editor {
             Action::Copy => self.copy(),
             Action::Paste => self.paste(),
             Action::AddTrack => self.add_track(),
+            Action::Bounce => self.bounce(),
             Action::EditStep(d) => {
                 self.edit_step = (self.edit_step as isize + d).clamp(0, 16) as usize
             }
@@ -423,7 +480,7 @@ impl Editor {
         if self.typing_in != typing_in {
             self.snapshot();
         }
-        self.dirty = true;
+        self.changed();
         *self.cell_mut(row).unwrap() = new;
         if let Some(t) = new.trigger {
             self.last_slice = t.slice;
@@ -546,16 +603,76 @@ impl Editor {
         }
     }
 
+    fn bounce(&mut self) {
+        let tracks = self.pattern().tracks.len();
+        if tracks >= crate::engine::MAX_TRACKS {
+            self.message = Some(format!("can't bounce: already {tracks} tracks"));
+            return;
+        }
+        let rows = self.selection().unwrap_or(0..self.pattern().rows);
+        let n = self.song.instruments.len();
+        let name = format!("bounce{n}");
+        let b = crate::bounce::bounce(&self.song, self.cursor.order, rows.clone(), &name);
+        let slices = b.sample.slices.len();
+
+        self.snapshot();
+        self.song
+            .instruments
+            .push(Instrument::Sampler(std::sync::Arc::new(b.sample)));
+        for p in &mut self.song.patterns {
+            let cells = vec![Cell::default(); p.rows];
+            p.tracks.push(crate::pattern::Track {
+                name: format!("b{n}"),
+                instrument: n,
+                cells,
+            });
+        }
+        self.song.rack.add_track(tracks);
+        let p = self.pattern_index();
+        for track in &mut self.song.patterns[p].tracks[..tracks] {
+            track.cells[rows.clone()].fill(Cell::default());
+        }
+        let cells = &mut self.song.patterns[p].tracks[tracks].cells;
+        for (slice, &r) in b.slice_rows.iter().enumerate() {
+            cells[rows.start + r] = Cell::hit(slice as u16, 0x7f);
+        }
+        let patched = self
+            .song
+            .rack
+            .track_device(tracks)
+            .is_some_and(|d| self.song.rack.cables.iter().any(|c| c.from.device == d.id));
+        self.cursor.track = tracks;
+        self.cursor.row = rows.start;
+        self.anchor = None;
+        self.message = Some(if patched {
+            format!(
+                "bounced rows {:02X}-{:02X} to b{n}: {slices} slices",
+                rows.start,
+                rows.end - 1
+            )
+        } else {
+            format!("bounced to b{n}, but no free mixer channel: patch it in the rack")
+        });
+    }
+
     fn undo_redo(&mut self, undo: bool) {
         let (from, to) = if undo {
             (&mut self.undo, &mut self.redo)
         } else {
             (&mut self.redo, &mut self.undo)
         };
-        if let Some(patterns) = from.pop() {
-            to.push(std::mem::replace(&mut self.song.patterns, patterns));
-            self.dirty = true;
-        }
+        let Some(snap) = from.pop() else { return };
+        let version = self.song.rack.version.max(snap.rack.version) + 1;
+        to.push(Snapshot {
+            patterns: std::mem::replace(&mut self.song.patterns, snap.patterns),
+            rack: std::mem::replace(&mut self.song.rack, snap.rack),
+            instruments: std::mem::replace(&mut self.song.instruments, snap.instruments),
+        });
+        // A version the engine hasn't seen, so it rebuilds the graph even if
+        // the restored rack had been sent before.
+        self.song.rack.version = version;
+        self.changed();
+        self.clamp_cursor();
     }
 }
 
@@ -689,6 +806,52 @@ mod tests {
             .map(|c| c.trigger.unwrap().slice)
             .collect();
         assert_eq!(slices, vec![1, 2]);
+    }
+
+    #[test]
+    fn undo_add_track_removes_its_rack_device() {
+        let mut e = editor();
+        e.apply(Action::AddTrack);
+        assert_eq!(e.pattern().tracks.len(), 3);
+        assert!(e.song.rack.track_device(2).is_some());
+        e.cursor.track = 2;
+        e.apply(Action::Undo);
+        assert_eq!(e.pattern().tracks.len(), 2);
+        assert!(e.song.rack.track_device(2).is_none());
+        assert_eq!(e.cursor.track, 1, "cursor clamped to a track that exists");
+        e.apply(Action::Redo);
+        assert!(e.song.rack.track_device(2).is_some());
+    }
+
+    #[test]
+    fn undo_rack_change_bumps_version() {
+        let mut e = editor();
+        let before = e.song.rack.clone();
+        let mixer = before
+            .devices
+            .iter()
+            .find(|d| d.kind == crate::rack::Kind::Mixer)
+            .unwrap()
+            .id;
+        e.song.rack.remove(mixer);
+        let removed_version = e.song.rack.version;
+        e.record_rack(before.clone());
+        e.apply(Action::Undo);
+        assert!(e.song.rack.device(mixer).is_some());
+        assert_eq!(e.song.rack.cables, before.cables);
+        assert!(e.song.rack.version > removed_version.max(before.version));
+        e.apply(Action::Redo);
+        assert!(e.song.rack.device(mixer).is_none());
+    }
+
+    #[test]
+    fn revision_counts_changes() {
+        let mut e = editor();
+        let r = e.revision;
+        e.apply(Action::Down);
+        assert_eq!(e.revision, r, "moving isn't a change");
+        type_str(&mut e, "0");
+        assert!(e.revision > r);
     }
 
     #[test]

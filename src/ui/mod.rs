@@ -9,6 +9,7 @@ mod rack;
 #[cfg(feature = "screenshot")]
 mod screenshot;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui::{
@@ -20,6 +21,7 @@ use crate::editor::{Action, Editor, Field};
 use crate::engine::{Command, Controller, Engine, Position};
 use crate::graph::Graph;
 use crate::pattern::{Cell, Instrument, Song};
+use crate::project;
 use crate::sample::Sample;
 
 mod color {
@@ -60,17 +62,21 @@ fn field_offset(field: Field) -> usize {
     }
 }
 
-pub fn run(song: Song) -> Result<(), String> {
+/// Open the window. `path` is where the project is saved; it needn't exist
+/// yet.
+pub fn run(song: Song, path: Option<PathBuf>) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            // The size to restore to when un-maximized.
             .with_inner_size([1100.0, 720.0])
+            .with_maximized(true)
             .with_title("cowbell"),
         ..Default::default()
     };
     eframe::run_native(
         "cowbell",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new(song)))),
+        Box::new(|_cc| Ok(Box::new(App::new(song, path)))),
     )
     .map_err(|e| e.to_string())
 }
@@ -83,6 +89,21 @@ enum Act {
     ToggleFollow,
     Bpm(f64),
     View(View),
+    Save,
+    SaveAs,
+    Open,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptKind {
+    SaveAs,
+    Open,
+}
+
+/// A one-line text prompt in the status bar, for file names.
+struct Prompt {
+    kind: PromptKind,
+    text: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,10 +146,32 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
         Key::R if m.command => edit(Roll),
         Key::T if m.command => edit(AddTrack),
         Key::F if m.command => Some(Act::ToggleFollow),
+        Key::S if m.command && m.shift => Some(Act::SaveAs),
+        Key::S if m.command => Some(Act::Save),
+        Key::O if m.command => Some(Act::Open),
+        Key::B if m.command => edit(Bounce),
         Key::F1 => Some(Act::View(View::Tracker)),
         Key::F2 => Some(Act::View(View::Rack)),
         _ => None,
     }
+}
+
+/// Turn typed text into a project path: `~/` is the home folder, relative
+/// paths are from the current folder, and the extension is added if missing.
+fn project_path(text: &str) -> PathBuf {
+    let text = text.trim();
+    let mut path = match text.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME")
+            .map_or_else(|| PathBuf::from(text), |h| Path::new(&h).join(rest)),
+        None => PathBuf::from(text),
+    };
+    if path.extension().is_none_or(|e| e != project::EXTENSION) {
+        let mut name = path.into_os_string();
+        name.push(".");
+        name.push(project::EXTENSION);
+        path = name.into();
+    }
+    path
 }
 
 /// Min/max per pixel column, recomputed only when the sample or width changes.
@@ -179,12 +222,21 @@ struct App {
     sample_rate: u32,
     /// The rack version the engine's graph was built from.
     rack_version: u64,
+    /// Where the project is saved, once it has been.
+    path: Option<PathBuf>,
+    /// `editor.revision` when last saved or opened.
+    saved_revision: u64,
+    prompt: Option<Prompt>,
+    /// Set after a close was cancelled because of unsaved changes; a second
+    /// close goes through.
+    close_armed: bool,
+    title: String,
     #[cfg(feature = "screenshot")]
     screenshot: Option<screenshot::Screenshot>,
 }
 
 impl App {
-    fn new(song: Song) -> Self {
+    fn new(song: Song, path: Option<PathBuf>) -> Self {
         #[allow(unused_mut)]
         let mut editor = Editor::new(song.clone());
         #[cfg(feature = "screenshot")]
@@ -218,6 +270,11 @@ impl App {
             rack_view: rack::RackView::default(),
             sample_rate,
             rack_version,
+            path,
+            saved_revision: 0,
+            prompt: None,
+            close_armed: false,
+            title: String::new(),
             #[cfg(feature = "screenshot")]
             screenshot,
         }
@@ -227,9 +284,107 @@ impl App {
         FontId::monospace(FONT_SIZE)
     }
 
+    /// The project's file name, with a star when there are unsaved changes.
+    fn project_name(&self) -> String {
+        let name = self.path.as_ref().and_then(|p| p.file_name()).map_or_else(
+            || "untitled".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        if self.unsaved() {
+            format!("{name} *")
+        } else {
+            name
+        }
+    }
+
+    fn unsaved(&self) -> bool {
+        self.editor.revision != self.saved_revision
+    }
+
+    fn save(&mut self, path: PathBuf) {
+        match project::save(&self.editor.song, &path) {
+            Ok(()) => {
+                self.saved_revision = self.editor.revision;
+                self.close_armed = false;
+                self.editor.message = Some(format!("saved {}", path.display()));
+                self.path = Some(path);
+            }
+            Err(e) => self.editor.message = Some(format!("couldn't save: {e}")),
+        }
+    }
+
+    fn open(&mut self, path: PathBuf) {
+        match project::load(&path) {
+            Ok(song) => {
+                let _ = self.controller.send(Command::Stop);
+                self.editor = Editor::new(song.clone());
+                let _ = self.controller.send(Command::SwapSong(Box::new(song)));
+                // Force a new graph, whatever version the loaded rack has.
+                self.rack_version = self.editor.song.rack.version.wrapping_add(1);
+                self.saved_revision = self.editor.revision;
+                self.close_armed = false;
+                self.scroll = 0;
+                self.editor.message = Some(format!("opened {}", path.display()));
+                self.path = Some(path);
+            }
+            Err(e) => self.editor.message = Some(format!("couldn't open: {e}")),
+        }
+    }
+
+    /// Keys while a prompt is open.
+    fn prompt_input(&mut self, event: &egui::Event) {
+        let Some(prompt) = &mut self.prompt else {
+            return;
+        };
+        match event {
+            egui::Event::Text(t) => prompt.text.extend(t.chars().filter(|c| !c.is_control())),
+            egui::Event::Key {
+                key: Key::Backspace,
+                pressed: true,
+                ..
+            } => {
+                prompt.text.pop();
+            }
+            egui::Event::Key {
+                key: Key::Escape,
+                pressed: true,
+                ..
+            } => self.prompt = None,
+            egui::Event::Key {
+                key: Key::Enter,
+                pressed: true,
+                ..
+            } => {
+                let prompt = self.prompt.take().unwrap();
+                let path = project_path(&prompt.text);
+                match prompt.kind {
+                    PromptKind::SaveAs => self.save(path),
+                    PromptKind::Open => self.open(path),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn ask(&mut self, kind: PromptKind) {
+        let text = match (&self.path, kind) {
+            (Some(p), _) => p.display().to_string(),
+            (None, PromptKind::SaveAs) => format!("untitled.{}", project::EXTENSION),
+            (None, PromptKind::Open) => String::new(),
+        };
+        self.prompt = Some(Prompt { kind, text });
+    }
+
     fn handle_input(&mut self, ctx: &egui::Context) {
         let (events, modifiers) = ctx.input(|i| (i.events.clone(), i.modifiers));
         for event in events {
+            if self.prompt.is_some() {
+                self.prompt_input(&event);
+                continue;
+            }
+            if matches!(event, egui::Event::Key { pressed: true, .. }) {
+                self.editor.message = None;
+            }
             let act = match event {
                 egui::Event::Key {
                     key,
@@ -257,8 +412,10 @@ impl App {
             };
             match act {
                 // The rack view is for the mouse; editing keys stay with the
-                // tracker so they can't change a pattern you can't see.
-                Some(Act::Edit(_)) if self.view == View::Rack => {}
+                // tracker so they can't change a pattern you can't see. Undo
+                // and redo work in both, over one shared history.
+                Some(Act::Edit(a))
+                    if self.view == View::Rack && !matches!(a, Action::Undo | Action::Redo) => {}
                 Some(Act::Edit(a)) => self.editor.apply(a),
                 Some(Act::View(v)) => self.view = v,
                 Some(Act::PlayToggle) => {
@@ -283,8 +440,15 @@ impl App {
                 Some(Act::Bpm(d)) => {
                     let bpm = (self.editor.song.bpm + d).clamp(20.0, 400.0);
                     self.editor.song.bpm = bpm;
+                    self.editor.changed();
                     let _ = self.controller.send(Command::SetBpm(bpm));
                 }
+                Some(Act::Save) => match self.path.clone() {
+                    Some(path) => self.save(path),
+                    None => self.ask(PromptKind::SaveAs),
+                },
+                Some(Act::SaveAs) => self.ask(PromptKind::SaveAs),
+                Some(Act::Open) => self.ask(PromptKind::Open),
                 None => {}
             }
         }
@@ -349,6 +513,7 @@ impl App {
             },
             color::TEXT,
         );
+        put(self.project_name(), color::TEXT);
         put(format!("{:.1} bpm", e.song.bpm), color::TEXT);
         put(
             format!(
@@ -586,13 +751,31 @@ impl App {
         }
     }
 
+    /// A prompt or message that takes over the first status line.
+    fn notice(&self) -> Option<(String, Color32)> {
+        if let Some(prompt) = &self.prompt {
+            let what = match prompt.kind {
+                PromptKind::SaveAs => "save as",
+                PromptKind::Open => "open",
+            };
+            return Some((
+                format!("{what}: {}▏   enter to confirm, esc to cancel", prompt.text),
+                color::ACCENT,
+            ));
+        }
+        let m = self.editor.message.as_ref()?;
+        let failed = m.starts_with("couldn't") || m.starts_with("can't") || m.contains("no free");
+        Some((m.clone(), if failed { color::ERROR } else { color::ACCENT }))
+    }
+
     fn rack_status(&self, ui: &mut egui::Ui) {
         let p = ui.painter();
         let r = ui.max_rect();
         let font = Self::font();
-        let (text, c) = match &self.rack_view.message {
-            Some(m) => (m.clone(), color::ERROR),
-            None => (
+        let (text, c) = match (self.notice(), &self.rack_view.message) {
+            (Some(n), _) => n,
+            (None, Some(m)) => (m.clone(), color::ERROR),
+            (None, None) => (
                 format!(
                     "{} devices · {} cables",
                     self.editor.song.rack.devices.len(),
@@ -608,7 +791,7 @@ impl App {
             font.clone(),
             c,
         );
-        let hints = "drag between jacks to patch · drag a plug out to unplug · drag knobs (shift: fine) · double-click resets";
+        let hints = "drag between jacks to patch · drag a plug out to unplug · drag knobs (shift: fine) · double-click resets · ctrl+z/y undo/redo";
         p.text(
             r.left_top() + vec2(8.0, 24.0),
             Align2::LEFT_TOP,
@@ -638,12 +821,13 @@ impl App {
             None => words.push("empty".into()),
         }
         words.extend(cell.fx().map(|fx| fx.describe()));
+        let (text, c) = self.notice().unwrap_or((words.join(" · "), color::TEXT));
         p.text(
             r.left_top() + vec2(8.0, 4.0),
             Align2::LEFT_TOP,
-            words.join(" · "),
+            text,
             font.clone(),
-            color::TEXT,
+            c,
         );
 
         let hints = [
@@ -652,12 +836,15 @@ impl App {
             ("space", "play/stop"),
             ("shift+↕", "select"),
             ("ctrl+r", "roll"),
-            ("ctrl+z", "undo"),
+            ("ctrl+z/y", "undo/redo"),
+            ("ctrl+b", "bounce"),
             ("ctrl+c/v", "copy/paste"),
             ("ctrl+←→", "order"),
             ("ctrl+↕", "step"),
             ("alt+↕", "bpm"),
             ("ctrl+t", "add track"),
+            ("ctrl+s", "save"),
+            ("ctrl+o", "open"),
         ];
         let mut x = r.left() + 8.0;
         let mut y = r.top() + 24.0;
@@ -724,6 +911,20 @@ impl eframe::App for App {
         self.handle_input(&ctx);
         self.sync_engine();
 
+        let title = format!("{} - cowbell", self.project_name());
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.unsaved() && !self.close_armed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_armed = true;
+            self.editor.message = Some(
+                "couldn't close: unsaved changes. ctrl+s to save, or close again to discard them"
+                    .into(),
+            );
+        }
+
         let frame = |fill| egui::Frame::new().fill(fill);
         egui::Panel::top("transport")
             .exact_size(30.0)
@@ -758,13 +959,16 @@ impl eframe::App for App {
                             .iter()
                             .map(|t| t.name.clone())
                             .collect();
-                        let changes = self.rack_view.show(ui, &mut self.editor.song.rack, &names);
-                        for (device, param, value) in changes {
+                        let out = self.rack_view.show(ui, &mut self.editor.song.rack, &names);
+                        for (device, param, value) in out.params {
                             let _ = self.controller.send(Command::SetParam {
                                 device,
                                 param,
                                 value,
                             });
+                        }
+                        if let Some(before) = out.undo {
+                            self.editor.record_rack(before);
                         }
                     });
                 // Cables follow the pointer while dragging.
@@ -780,6 +984,24 @@ impl eframe::App for App {
         #[cfg(feature = "screenshot")]
         if let Some(s) = &mut self.screenshot {
             s.update(&ctx);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_paths_get_the_extension() {
+        assert_eq!(project_path("song"), PathBuf::from("song.cowbell"));
+        assert_eq!(
+            project_path(" song.cowbell "),
+            PathBuf::from("song.cowbell")
+        );
+        assert_eq!(project_path("a.b"), PathBuf::from("a.b.cowbell"));
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(project_path("~/x"), Path::new(&home).join("x.cowbell"));
         }
     }
 }

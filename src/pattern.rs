@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::rack::Rack;
 use crate::sample::Sample;
 
@@ -11,7 +13,7 @@ pub const MAX_FX: usize = 2;
 
 /// Per-cell effect commands. These are what the tracker shows as `O3C`,
 /// `R18`, `Rv1` and so on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Fx {
     /// Start `n/256` of the way into the slice.
     Offset(u8),
@@ -30,14 +32,14 @@ pub enum Fx {
     Cut(u8),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trigger {
     pub slice: u16,
     /// 0..=127
     pub velocity: u8,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cell {
     pub trigger: Option<Trigger>,
     pub fx: [Option<Fx>; MAX_FX],

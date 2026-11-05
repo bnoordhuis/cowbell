@@ -130,7 +130,9 @@ impl Voice {
         if let Some(l) = self.loop_len {
             p %= l.min(avail);
         }
-        if p >= avail - 1.0 {
+        // The last frame of the slice is at `avail - 1`; it plays too, so
+        // slices played back to back don't drop a frame at each join.
+        if p > avail - 1.0 {
             // Past the end. Keep the voice alive if a retrigger is pending.
             if self.retrigs_left == 0 {
                 self.active = false;

@@ -1,6 +1,6 @@
 //! Sample buffers and the break slicer.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const ONSET_HOP: usize = 128;
 const ONSET_LOOKBACK: usize = 8;
@@ -13,6 +13,9 @@ pub struct Sample {
     pub frames: Vec<[f32; 2]>,
     /// Sorted slice start frames. Always starts with 0.
     pub slices: Vec<usize>,
+    /// The file this was loaded from. `None` for generated audio (the demo
+    /// break, bounces), which a project saves next to itself.
+    pub path: Option<PathBuf>,
 }
 
 impl Sample {
@@ -22,6 +25,7 @@ impl Sample {
             sample_rate,
             frames,
             slices: vec![0],
+            path: None,
         }
     }
 
@@ -52,7 +56,25 @@ impl Sample {
         let name = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        Ok(Sample::new(name, spec.sample_rate, frames))
+        let mut sample = Sample::new(name, spec.sample_rate, frames);
+        sample.path = Some(std::path::absolute(path).unwrap_or_else(|_| path.to_owned()));
+        Ok(sample)
+    }
+
+    /// Write as a 32-bit float stereo WAV, which is lossless.
+    pub fn save_wav(&self, path: &Path) -> Result<(), hound::Error> {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: self.sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(path, spec)?;
+        for [l, r] in &self.frames {
+            w.write_sample(*l)?;
+            w.write_sample(*r)?;
+        }
+        w.finalize()
     }
 
     /// Frame range of slice `i`, or `None` if there's no such slice.

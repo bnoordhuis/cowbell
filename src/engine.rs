@@ -110,6 +110,12 @@ impl Controller {
     }
 }
 
+/// Output frames per row. Shared with [`crate::bounce`], which must agree
+/// with the engine to the last bit.
+pub fn frames_per_row(out_rate: f64, bpm: f64, rows_per_beat: u32) -> f64 {
+    out_rate * 60.0 / (bpm.max(1.0) * rows_per_beat.max(1) as f64)
+}
+
 fn pack(p: Position) -> u64 {
     (p.order as u64) << 32 | p.row as u64 & 0xffff_ffff
 }
@@ -165,13 +171,16 @@ impl Engine {
     }
 
     fn frames_per_row(&self) -> f64 {
-        let rpb = self
+        let pattern = self
             .song
             .order
             .get(self.pos.order)
             .and_then(|&p| self.song.patterns.get(p));
-        let rpb = rpb.map_or(4, |p| p.rows_per_beat.max(1)) as f64;
-        self.out_rate * 60.0 / (self.song.bpm.max(1.0) * rpb)
+        frames_per_row(
+            self.out_rate,
+            self.song.bpm,
+            pattern.map_or(4, |p| p.rows_per_beat),
+        )
     }
 
     fn handle_commands(&mut self) {

@@ -7,7 +7,9 @@ use cowbell::{demo, synth};
 
 const USAGE: &str = "\
 usage:
-  cowbell        [--break FILE.wav]        open the tracker
+  cowbell [PROJECT.cowbell] [--break FILE.wav]
+                                           open the tracker, and the project
+                                           if it exists
   cowbell render [--break FILE.wav] [--seconds N] OUT.wav
   cowbell play   [--break FILE.wav]        (needs --features live)
 
@@ -130,7 +132,13 @@ fn play(_: &Args) -> Result<(), String> {
 
 #[cfg(feature = "ui")]
 fn ui(args: &Args) -> Result<(), String> {
-    cowbell::ui::run(demo::song(load_break(args.brk.as_ref())?))
+    // An existing project opens; a new path is where the demo song will be
+    // saved.
+    let song = match &args.out {
+        Some(path) if path.exists() => cowbell::project::load(path)?,
+        _ => demo::song(load_break(args.brk.as_ref())?),
+    };
+    cowbell::ui::run(song, args.out.clone())
 }
 
 #[cfg(not(feature = "ui"))]
