@@ -1,0 +1,21 @@
+[package]
+name = "cowbell"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A keyboard-driven tracker for drill 'n' bass"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+# Live audio output via cpal. Needs ALSA headers (libasound2-dev) on Linux.
+live = ["dep:cpal"]
+
+[dependencies]
+# Exact pins: every version was checked to be published at least 7 days ago.
+cpal = { version = "=0.18.2", optional = true }
+hound = "=3.5.1"
+rtrb = "=0.4.1"
+
+[profile.dev]
+opt-level = 1
