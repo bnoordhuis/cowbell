@@ -23,7 +23,7 @@ fn plain_song() -> cowbell::pattern::Song {
 
 fn frames(song: &cowbell::pattern::Song, i: usize) -> Vec<[f32; 2]> {
     let Instrument::Sampler(s) = &song.instruments[i];
-    s.frames.clone()
+    s.frames.to_vec()
 }
 
 #[test]
@@ -50,7 +50,7 @@ fn bounced_rows_play_back_identically() {
         .filter(|c| c.trigger.is_some())
         .count();
     assert!(triggers > 3, "{triggers} slices");
-    assert_eq!(frames(&e.song, 1), before.sample.frames);
+    assert_eq!(frames(&e.song, 1), *before.sample.frames);
 
     // Playing the pattern now gives the same audio as before the bounce.
     let after = bounce::bounce(&e.song, 1, rows, "after");
@@ -58,7 +58,7 @@ fn bounced_rows_play_back_identically() {
         .sample
         .frames
         .iter()
-        .zip(&after.sample.frames)
+        .zip(after.sample.frames.iter())
         .map(|(a, b)| (a[0] - b[0]).abs().max((a[1] - b[1]).abs()))
         .fold(0.0, f32::max);
     assert!(worst < 1e-6, "differs by up to {worst}");

@@ -24,6 +24,11 @@ use crate::pattern::{Cell, Instrument, Song};
 use crate::project;
 use crate::sample::Sample;
 
+/// Default slice detection sensitivity for loaded samples.
+const SENSITIVITY: f32 = 0.6;
+/// How close, in points, the pointer must be to grab a slice marker.
+const MARKER_HIT: f32 = 6.0;
+
 mod color {
     use eframe::egui::Color32;
     pub const BG: Color32 = Color32::from_rgb(0x16, 0x17, 0x1a);
@@ -92,12 +97,17 @@ enum Act {
     Save,
     SaveAs,
     Open,
+    LoadSample,
+    Sensitivity(f32),
+    /// Change the pattern length by whole beats.
+    LengthBeats(isize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PromptKind {
     SaveAs,
     Open,
+    LoadSample,
 }
 
 /// A one-line text prompt in the status bar, for file names.
@@ -119,12 +129,20 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
     match key {
         Key::ArrowUp if m.alt => Some(Act::Bpm(bpm_step)),
         Key::ArrowDown if m.alt => Some(Act::Bpm(-bpm_step)),
+        Key::ArrowUp if m.command && m.shift => edit(Resolution(1)),
+        Key::ArrowDown if m.command && m.shift => edit(Resolution(-1)),
         Key::ArrowUp if m.command => edit(EditStep(1)),
         Key::ArrowDown if m.command => edit(EditStep(-1)),
         Key::ArrowUp if m.shift => edit(SelectUp),
         Key::ArrowDown if m.shift => edit(SelectDown),
         Key::ArrowUp => edit(Up),
         Key::ArrowDown => edit(Down),
+        Key::ArrowLeft if m.alt && m.shift => edit(Length(-1)),
+        Key::ArrowRight if m.alt && m.shift => edit(Length(1)),
+        Key::ArrowLeft if m.alt => Some(Act::LengthBeats(-1)),
+        Key::ArrowRight if m.alt => Some(Act::LengthBeats(1)),
+        Key::ArrowLeft if m.command && m.shift => edit(SlotPattern(-1)),
+        Key::ArrowRight if m.command && m.shift => edit(SlotPattern(1)),
         Key::ArrowLeft if m.command => edit(PrevOrder),
         Key::ArrowRight if m.command => edit(NextOrder),
         Key::ArrowLeft => edit(Left),
@@ -135,7 +153,11 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
         Key::End => edit(Bottom),
         Key::Tab if m.shift => edit(PrevTrack),
         Key::Tab => edit(NextTrack),
+        Key::Delete if m.command => edit(DeleteSlot),
         Key::Delete | Key::Backspace => edit(Clear),
+        Key::N if m.command => edit(NewPattern),
+        Key::D if m.command && m.shift => edit(RepeatSlot),
+        Key::D if m.command => edit(DuplicatePattern),
         Key::Space => Some(Act::PlayToggle),
         Key::Enter => Some(Act::PlayPattern),
         Key::Z if m.command && m.shift => edit(Redo),
@@ -150,6 +172,11 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
         Key::S if m.command => Some(Act::Save),
         Key::O if m.command => Some(Act::Open),
         Key::B if m.command => edit(Bounce),
+        Key::L if m.command => Some(Act::LoadSample),
+        Key::I if m.command && m.shift => edit(PrevInstrument),
+        Key::I if m.command => edit(NextInstrument),
+        Key::OpenBracket => Some(Act::Sensitivity(-0.1)),
+        Key::CloseBracket => Some(Act::Sensitivity(0.1)),
         Key::F1 => Some(Act::View(View::Tracker)),
         Key::F2 => Some(Act::View(View::Rack)),
         _ => None,
@@ -159,12 +186,7 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
 /// Turn typed text into a project path: `~/` is the home folder, relative
 /// paths are from the current folder, and the extension is added if missing.
 fn project_path(text: &str) -> PathBuf {
-    let text = text.trim();
-    let mut path = match text.strip_prefix("~/") {
-        Some(rest) => std::env::var_os("HOME")
-            .map_or_else(|| PathBuf::from(text), |h| Path::new(&h).join(rest)),
-        None => PathBuf::from(text),
-    };
+    let mut path = typed_path(text);
     if path.extension().is_none_or(|e| e != project::EXTENSION) {
         let mut name = path.into_os_string();
         name.push(".");
@@ -172,6 +194,16 @@ fn project_path(text: &str) -> PathBuf {
         path = name.into();
     }
     path
+}
+
+/// Typed text as a path: trimmed, and `~/` is the home folder.
+fn typed_path(text: &str) -> PathBuf {
+    let text = text.trim();
+    match text.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME")
+            .map_or_else(|| PathBuf::from(text), |h| Path::new(&h).join(rest)),
+        None => PathBuf::from(text),
+    }
 }
 
 /// Min/max per pixel column, recomputed only when the sample or width changes.
@@ -184,8 +216,13 @@ struct WaveCache {
 
 impl WaveCache {
     fn get(&mut self, sample: &Arc<Sample>, width: usize) -> &[(f32, f32)] {
-        let fresh =
-            self.sample.as_ref().is_some_and(|s| Arc::ptr_eq(s, sample)) && self.width == width;
+        // Keyed on the audio, not the sample: editing markers makes a new
+        // sample that shares the same frames.
+        let fresh = self
+            .sample
+            .as_ref()
+            .is_some_and(|s| Arc::ptr_eq(&s.frames, &sample.frames))
+            && self.width == width;
         if !fresh {
             let n = sample.frames.len();
             self.peaks = (0..width)
@@ -231,6 +268,10 @@ struct App {
     /// close goes through.
     close_armed: bool,
     title: String,
+    /// Slice detection sensitivity, for loading and re-detecting.
+    sensitivity: f32,
+    /// A slice marker being dragged: (instrument, marker, moved yet).
+    marker_drag: Option<(usize, usize, bool)>,
     #[cfg(feature = "screenshot")]
     screenshot: Option<screenshot::Screenshot>,
 }
@@ -275,6 +316,8 @@ impl App {
             prompt: None,
             close_armed: false,
             title: String::new(),
+            sensitivity: SENSITIVITY,
+            marker_drag: None,
             #[cfg(feature = "screenshot")]
             screenshot,
         }
@@ -360,14 +403,26 @@ impl App {
                 match prompt.kind {
                     PromptKind::SaveAs => self.save(path),
                     PromptKind::Open => self.open(path),
+                    PromptKind::LoadSample => self.load_sample(typed_path(&prompt.text)),
                 }
             }
             _ => {}
         }
     }
 
+    fn load_sample(&mut self, path: PathBuf) {
+        match Sample::load_wav(&path) {
+            Ok(mut sample) => {
+                sample.detect_slices(self.sensitivity, 40.0);
+                self.editor.add_sample(sample);
+            }
+            Err(e) => self.editor.message = Some(format!("couldn't load {}: {e}", path.display())),
+        }
+    }
+
     fn ask(&mut self, kind: PromptKind) {
         let text = match (&self.path, kind) {
+            (_, PromptKind::LoadSample) => String::new(),
             (Some(p), _) => p.display().to_string(),
             (None, PromptKind::SaveAs) => format!("untitled.{}", project::EXTENSION),
             (None, PromptKind::Open) => String::new(),
@@ -449,6 +504,18 @@ impl App {
                 },
                 Some(Act::SaveAs) => self.ask(PromptKind::SaveAs),
                 Some(Act::Open) => self.ask(PromptKind::Open),
+                Some(Act::LoadSample) => self.ask(PromptKind::LoadSample),
+                Some(Act::LengthBeats(_)) if self.view == View::Rack => {}
+                Some(Act::LengthBeats(d)) => {
+                    let rpb = self.editor.pattern().rows_per_beat as isize;
+                    self.editor.apply(Action::Length(d * rpb));
+                }
+                Some(Act::Sensitivity(_)) if self.view == View::Rack => {}
+                Some(Act::Sensitivity(d)) => {
+                    self.sensitivity = (self.sensitivity + d).clamp(0.0, 1.0);
+                    let (instrument, _) = self.editor.track_sample();
+                    self.editor.redetect(instrument, self.sensitivity);
+                }
                 None => {}
             }
         }
@@ -492,18 +559,19 @@ impl App {
         let playing = self.controller.is_playing();
         let mut x = r.left() + 8.0;
         let y = r.center().y;
-        let mut put = |text: String, color: Color32| {
+        // Draw left to right; `gap` is the space after.
+        let mut put = |text: String, color: Color32, gap: f32| {
             let rect = p.text(pos2(x, y), Align2::LEFT_CENTER, text, font.clone(), color);
-            x = rect.right() + 18.0;
+            x = rect.right() + gap;
         };
-        put("cowbell".into(), color::ACCENT);
+        put("cowbell".into(), color::ACCENT, 18.0);
         for (view, label) in [(View::Tracker, "F1 tracker"), (View::Rack, "F2 rack")] {
             let c = if self.view == view {
                 color::TEXT
             } else {
                 color::DIM
             };
-            put(label.into(), c);
+            put(label.into(), c, 18.0);
         }
         put(
             if playing {
@@ -512,23 +580,41 @@ impl App {
                 "■ stopped".into()
             },
             color::TEXT,
+            18.0,
         );
-        put(self.project_name(), color::TEXT);
-        put(format!("{:.1} bpm", e.song.bpm), color::TEXT);
+        put(self.project_name(), color::TEXT, 18.0);
+        put(format!("{:.1} bpm", e.song.bpm), color::TEXT, 18.0);
+        // The order list, current slot highlighted. Long lists show the
+        // slots around the cursor.
+        put("order".into(), color::MUTED, 8.0);
+        let first = e.cursor.order.saturating_sub(6);
+        let last = (first + 13).min(e.song.order.len());
+        if first > 0 {
+            put("…".into(), color::DIM, 6.0);
+        }
+        for (i, &pat) in e.song.order.iter().enumerate().take(last).skip(first) {
+            let (text, c) = if i == e.cursor.order {
+                (format!("[{pat:02X}]"), color::ACCENT)
+            } else {
+                (format!("{pat:02X}"), color::TEXT)
+            };
+            let more = last < e.song.order.len();
+            put(text, c, if i + 1 == last && !more { 18.0 } else { 6.0 });
+        }
+        if last < e.song.order.len() {
+            put("…".into(), color::DIM, 18.0);
+        }
+        let pat = e.pattern();
         put(
-            format!(
-                "order {}/{} · pat {:02X} · {} rows/beat",
-                e.cursor.order + 1,
-                e.song.order.len(),
-                e.pattern_index(),
-                e.pattern().rows_per_beat
-            ),
+            format!("{} rows · {} rows/beat", pat.rows, pat.rows_per_beat),
             color::TEXT,
+            18.0,
         );
-        put(format!("step {}", e.edit_step), color::MUTED);
+        put(format!("step {}", e.edit_step), color::MUTED, 18.0);
         put(
             format!("follow {}", if self.follow { "on" } else { "off" }),
             color::MUTED,
+            18.0,
         );
         let (text, c) = match &self.output {
             Ok(o) => (format!("{} · {} Hz", o.device, o.sample_rate), color::DIM),
@@ -544,13 +630,10 @@ impl App {
     }
 
     fn slicer(&mut self, ui: &mut egui::Ui) {
-        let track = self.editor.pattern().tracks.get(self.editor.cursor.track);
-        let instrument = track.map_or(0, |t| t.instrument);
-        let Some(Instrument::Sampler(sample)) = self.editor.song.instruments.get(instrument) else {
-            return;
-        };
+        let (instrument, sample) = self.editor.track_sample();
         let sample = sample.clone();
         let font = Self::font();
+        let small = FontId::monospace(11.0);
 
         let header = ui.max_rect().with_max_y(ui.max_rect().top() + 18.0);
         let current = self
@@ -558,29 +641,86 @@ impl App {
             .cell()
             .trigger
             .map_or(self.editor.last_slice, |t| t.slice) as usize;
-        ui.painter().text(
+        let p = ui.painter();
+        p.text(
             header.left_center() + vec2(8.0, 0.0),
             Align2::LEFT_CENTER,
             format!(
-                "slicer: {} · {} slices · slice {:02X} · click to audition, ctrl+click to enter",
+                "slicer: {} · {} slices · slice {:02X} · sensitivity {:.1}",
                 sample.name,
                 sample.slices.len(),
-                current
+                current,
+                self.sensitivity
             ),
             font.clone(),
             color::MUTED,
+        );
+        p.text(
+            header.right_center() - vec2(8.0, 0.0),
+            Align2::RIGHT_CENTER,
+            "click hear · ctrl+click enter · shift+click add · drag move · right-click remove · [ ] sensitivity",
+            small.clone(),
+            color::DIM,
         );
 
         let rect = Rect::from_min_max(
             header.left_bottom() + vec2(8.0, 2.0),
             ui.max_rect().right_bottom() - vec2(8.0, 6.0),
         );
-        let response = ui.allocate_rect(rect, Sense::click());
+        let response = ui.allocate_rect(rect, Sense::click_and_drag());
+        let n = sample.frames.len().max(1);
+        let x_of = |frame: usize| rect.left() + rect.width() * frame as f32 / n as f32;
+        let frame_at =
+            |x: f32| (((x - rect.left()) / rect.width()).clamp(0.0, 1.0) * n as f32) as usize;
+        let within = (MARKER_HIT / rect.width() * n as f32) as usize;
+        let modifiers = ui.input(|i| i.modifiers);
+
+        // Marker editing. Marker 0 is the start of the sample and stays put.
+        if response.drag_started()
+            && let Some(p) = ui.input(|i| i.pointer.press_origin())
+            && let Some(m) = sample.marker_near(frame_at(p.x), within).filter(|&m| m > 0)
+        {
+            self.marker_drag = Some((instrument, m, false));
+        }
+        if response.dragged()
+            && let Some((inst, m, moved)) = &mut self.marker_drag
+            && let Some(p) = response.interact_pointer_pos()
+        {
+            self.editor.move_marker(*inst, *m, frame_at(p.x), !*moved);
+            *moved = true;
+        }
+        if response.drag_stopped() {
+            self.marker_drag = None;
+        }
+        if let Some(pos) = response.interact_pointer_pos() {
+            let frame = frame_at(pos.x);
+            if response.secondary_clicked() {
+                if let Some(m) = sample.marker_near(frame, within) {
+                    self.editor.delete_marker(instrument, m);
+                }
+            } else if response.clicked() && modifiers.shift {
+                if let Some(k) = self.editor.insert_marker(instrument, frame) {
+                    self.editor.last_slice = k as u16;
+                    self.editor.audition = Some((instrument, k as u16));
+                }
+            } else if response.clicked() {
+                let slice = sample
+                    .slices
+                    .partition_point(|&s| s <= frame)
+                    .saturating_sub(1) as u16;
+                if modifiers.command {
+                    self.editor.apply(Action::EnterSlice(slice));
+                } else {
+                    self.editor.last_slice = slice;
+                    self.editor.audition = Some((instrument, slice));
+                }
+            }
+        }
+
+        // Draw the sample as it is now, after any edit above.
+        let sample = self.editor.track_sample().1.clone();
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 4.0, color::PANEL);
-        let n = sample.frames.len().max(1) as f32;
-        let x_of = |frame: usize| rect.left() + rect.width() * frame as f32 / n;
-
         if let Some((start, end)) = sample.slice_bounds(current) {
             let hl = Rect::from_x_y_ranges(x_of(start)..=x_of(end), rect.y_range());
             p.rect_filled(hl, 0.0, color::ACCENT.gamma_multiply(0.18));
@@ -599,12 +739,18 @@ impl App {
                 Stroke::new(1.0, color::WAVE),
             );
         }
-        let small = FontId::monospace(11.0);
+        // Markers you can grab get thicker under the pointer.
+        let hover = response
+            .hover_pos()
+            .and_then(|h| sample.marker_near(frame_at(h.x), within));
         for (i, &start) in sample.slices.iter().enumerate() {
             let x = x_of(start);
+            let active =
+                self.marker_drag.is_some_and(|(_, m, _)| m == i) || (hover == Some(i) && i > 0);
+            let width = if active { 3.0 } else { 1.0 };
             p.line_segment(
                 [pos2(x, rect.top()), pos2(x, rect.bottom())],
-                Stroke::new(1.0, color::ACCENT),
+                Stroke::new(width, color::ACCENT),
             );
             p.text(
                 pos2(x + 3.0, rect.top() + 2.0),
@@ -613,22 +759,6 @@ impl App {
                 small.clone(),
                 color::ACCENT,
             );
-        }
-
-        if response.clicked()
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            let frame = ((pos.x - rect.left()) / rect.width() * n) as usize;
-            let slice = sample
-                .slices
-                .partition_point(|&s| s <= frame)
-                .saturating_sub(1) as u16;
-            if ui.input(|i| i.modifiers.command) {
-                self.editor.apply(Action::EnterSlice(slice));
-            } else {
-                self.editor.last_slice = slice;
-                self.editor.audition = Some((instrument, slice));
-            }
         }
     }
 
@@ -644,16 +774,27 @@ impl App {
             rect.left() + 8.0 + cw * (ROW_NUMBER_CHARS + t * (TRACK_CHARS + TRACK_GAP)) as f32
         };
 
-        // Track names.
+        // Track names, and the sample each plays.
         for (t, track) in pattern.tracks.iter().enumerate() {
             let c = color::TRACKS[t % color::TRACKS.len()];
-            p.text(
+            let r = p.text(
                 pos2(track_x(t), rect.top() + 2.0),
                 Align2::LEFT_TOP,
                 &track.name,
                 font.clone(),
                 c,
             );
+            if let Some(Instrument::Sampler(s)) = e.song.instruments.get(track.instrument) {
+                let room = (TRACK_CHARS + TRACK_GAP - 2).saturating_sub(track.name.chars().count());
+                let name: String = s.name.chars().take(room).collect();
+                p.text(
+                    r.right_top() + vec2(cw, 0.0),
+                    Align2::LEFT_TOP,
+                    name,
+                    font.clone(),
+                    color::DIM,
+                );
+            }
         }
 
         let top = rect.top() + ROW_HEIGHT + 6.0;
@@ -757,6 +898,7 @@ impl App {
             let what = match prompt.kind {
                 PromptKind::SaveAs => "save as",
                 PromptKind::Open => "open",
+                PromptKind::LoadSample => "load sample (WAV) onto this track",
             };
             return Some((
                 format!("{what}: {}▏   enter to confirm, esc to cancel", prompt.text),
@@ -845,6 +987,12 @@ impl App {
             ("ctrl+t", "add track"),
             ("ctrl+s", "save"),
             ("ctrl+o", "open"),
+            ("ctrl+l", "load sample"),
+            ("ctrl+i", "next sample"),
+            ("ctrl+n/d", "new/copy pattern"),
+            ("ctrl+shift+←→", "slot plays"),
+            ("ctrl+shift+↕", "rows/beat"),
+            ("alt+←→", "length"),
         ];
         let mut x = r.left() + 8.0;
         let mut y = r.top() + 24.0;
@@ -908,6 +1056,15 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         ctx.set_visuals(egui::Visuals::dark());
         self.char_width = ctx.fonts_mut(|f| f.glyph_width(&Self::font(), '0'));
+        // A scripted screenshot mustn't pick up whatever the person at the
+        // computer happens to type or click while the window is up.
+        #[cfg(feature = "screenshot")]
+        if self.screenshot.is_some() {
+            ctx.input_mut(|i| {
+                i.events.clear();
+                i.pointer = Default::default();
+            });
+        }
         self.handle_input(&ctx);
         self.sync_engine();
 

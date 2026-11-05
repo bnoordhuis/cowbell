@@ -1,6 +1,7 @@
 //! Sample buffers and the break slicer.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const ONSET_HOP: usize = 128;
 const ONSET_LOOKBACK: usize = 8;
@@ -10,7 +11,8 @@ const ONSET_LOOKBACK: usize = 8;
 pub struct Sample {
     pub name: String,
     pub sample_rate: u32,
-    pub frames: Vec<[f32; 2]>,
+    /// Shared, so editing slice markers doesn't copy the audio.
+    pub frames: Arc<Vec<[f32; 2]>>,
     /// Sorted slice start frames. Always starts with 0.
     pub slices: Vec<usize>,
     /// The file this was loaded from. `None` for generated audio (the demo
@@ -23,7 +25,7 @@ impl Sample {
         Sample {
             name: name.into(),
             sample_rate,
-            frames,
+            frames: Arc::new(frames),
             slices: vec![0],
             path: None,
         }
@@ -70,11 +72,35 @@ impl Sample {
             sample_format: hound::SampleFormat::Float,
         };
         let mut w = hound::WavWriter::create(path, spec)?;
-        for [l, r] in &self.frames {
+        for [l, r] in self.frames.iter() {
             w.write_sample(*l)?;
             w.write_sample(*r)?;
         }
         w.finalize()
+    }
+
+    /// A copy with other slice markers, sharing the audio. The markers are
+    /// sorted, deduplicated, kept inside the sample, and start with 0.
+    pub fn with_slices(&self, mut slices: Vec<usize>) -> Sample {
+        slices.retain(|&s| s < self.frames.len().max(1));
+        slices.push(0);
+        slices.sort_unstable();
+        slices.dedup();
+        Sample {
+            slices,
+            ..self.clone()
+        }
+    }
+
+    /// The marker nearest to `frame`, if any is within `within` frames.
+    pub fn marker_near(&self, frame: usize, within: usize) -> Option<usize> {
+        self.slices
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (i, s.abs_diff(frame)))
+            .filter(|&(_, d)| d <= within)
+            .min_by_key(|&(_, d)| d)
+            .map(|(i, _)| i)
     }
 
     /// Frame range of slice `i`, or `None` if there's no such slice.

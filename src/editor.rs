@@ -6,12 +6,20 @@
 //! after the last digit of a field the cursor drops down by the edit step.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::pattern::{Cell, Fx, Instrument, MAX_FX, Pattern, Song, Trigger};
 use crate::rack::Rack;
+use crate::sample::Sample;
 use crate::transform::Roll;
 
 const UNDO_DEPTH: usize = 500;
+
+/// Rows per beat to choose from: straight and triplet grids, down to 256th
+/// notes.
+pub const RESOLUTIONS: [u32; 12] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
+/// Longest pattern, in rows.
+pub const MAX_ROWS: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {
@@ -80,6 +88,24 @@ pub enum Action {
     /// Render the selected rows (or the whole pattern) to a new sample on a
     /// new track, replacing what was there. See [`crate::bounce`].
     Bounce,
+    /// Cycle the instrument of the cursor's track.
+    NextInstrument,
+    PrevInstrument,
+    /// Insert a new empty pattern after the current order slot.
+    NewPattern,
+    /// Insert a copy of the current pattern after the current order slot.
+    DuplicatePattern,
+    /// Play the current pattern again in the next order slot.
+    RepeatSlot,
+    /// Remove the current order slot.
+    DeleteSlot,
+    /// Make the current order slot play another pattern.
+    SlotPattern(isize),
+    /// Step the rows per beat through [`RESOLUTIONS`], keeping the timing
+    /// of what's in the pattern.
+    Resolution(isize),
+    /// Lengthen or shorten the pattern by this many rows.
+    Length(isize),
     EditStep(isize),
 }
 
@@ -131,11 +157,13 @@ impl Fx {
     }
 }
 
-/// Everything undo puts back: patterns, the rack, and instruments (a bounce
-/// adds one). Instruments are `Arc`s, so this doesn't copy sample data.
+/// Everything undo puts back: patterns, the order list, the rack, and
+/// instruments (a bounce adds one). Instruments are `Arc`s, so this doesn't
+/// copy sample data.
 #[derive(Clone)]
 pub struct Snapshot {
     patterns: Vec<Pattern>,
+    order: Vec<usize>,
     rack: Rack,
     instruments: Vec<Instrument>,
 }
@@ -237,6 +265,7 @@ impl Editor {
     }
 
     fn clamp_cursor(&mut self) {
+        self.cursor.order = self.cursor.order.min(self.song.order.len() - 1);
         let p = self.pattern();
         let (rows, tracks) = (p.rows.max(1), p.tracks.len().max(1));
         self.cursor.row = self.cursor.row.min(rows - 1);
@@ -248,6 +277,7 @@ impl Editor {
     pub fn capture(&self) -> Snapshot {
         Snapshot {
             patterns: self.song.patterns.clone(),
+            order: self.song.order.clone(),
             rack: self.song.rack.clone(),
             instruments: self.song.instruments.clone(),
         }
@@ -402,6 +432,15 @@ impl Editor {
             Action::Paste => self.paste(),
             Action::AddTrack => self.add_track(),
             Action::Bounce => self.bounce(),
+            Action::NewPattern => self.new_pattern(false),
+            Action::DuplicatePattern => self.new_pattern(true),
+            Action::RepeatSlot => self.repeat_slot(),
+            Action::DeleteSlot => self.delete_slot(),
+            Action::SlotPattern(d) => self.slot_pattern(d),
+            Action::Resolution(d) => self.step_resolution(d),
+            Action::Length(d) => self.change_length(d),
+            Action::NextInstrument => self.cycle_instrument(1),
+            Action::PrevInstrument => self.cycle_instrument(-1),
             Action::EditStep(d) => {
                 self.edit_step = (self.edit_step as isize + d).clamp(0, 16) as usize
             }
@@ -603,6 +642,278 @@ impl Editor {
         }
     }
 
+    fn new_pattern(&mut self, copy: bool) {
+        let current = self.pattern();
+        let pattern = if copy {
+            current.clone()
+        } else {
+            let mut p = current.clone();
+            for t in &mut p.tracks {
+                t.cells.fill(Cell::default());
+            }
+            p
+        };
+        self.snapshot();
+        self.song.patterns.push(pattern);
+        let index = self.song.patterns.len() - 1;
+        self.song.order.insert(self.cursor.order + 1, index);
+        self.go_to(self.cursor.order + 1, 0);
+        let what = if copy {
+            "copy of the pattern"
+        } else {
+            "new pattern"
+        };
+        self.message = Some(format!("{what}: {index:02X}"));
+    }
+
+    fn repeat_slot(&mut self) {
+        self.snapshot();
+        let p = self.pattern_index();
+        self.song.order.insert(self.cursor.order + 1, p);
+        self.go_to(self.cursor.order + 1, self.cursor.row);
+    }
+
+    fn delete_slot(&mut self) {
+        if self.song.order.len() < 2 {
+            self.message = Some("can't remove the only order slot".into());
+            return;
+        }
+        self.snapshot();
+        self.song.order.remove(self.cursor.order);
+        self.go_to(
+            self.cursor.order.min(self.song.order.len() - 1),
+            self.cursor.row,
+        );
+    }
+
+    fn slot_pattern(&mut self, delta: isize) {
+        let n = self.song.patterns.len() as isize;
+        if n < 2 {
+            return;
+        }
+        self.snapshot();
+        let p = (self.pattern_index() as isize + delta).rem_euclid(n) as usize;
+        self.song.order[self.cursor.order] = p;
+        self.clamp_cursor();
+    }
+
+    fn step_resolution(&mut self, delta: isize) {
+        let rpb = self.pattern().rows_per_beat;
+        let i = RESOLUTIONS
+            .iter()
+            .position(|&r| r >= rpb)
+            .unwrap_or(RESOLUTIONS.len() - 1);
+        let j = (i as isize + delta).clamp(0, RESOLUTIONS.len() as isize - 1) as usize;
+        if RESOLUTIONS[j] != rpb {
+            self.set_resolution(RESOLUTIONS[j]);
+        }
+    }
+
+    /// Change rows per beat. Cells move to the row nearest their old time;
+    /// if two land on the same row, the first one stays.
+    pub fn set_resolution(&mut self, rows_per_beat: u32) {
+        let old = self.pattern().rows_per_beat.max(1);
+        let scale = rows_per_beat as f64 / old as f64;
+        let rows = ((self.pattern().rows as f64 * scale).round() as usize).clamp(1, MAX_ROWS);
+        self.snapshot();
+        let p = self.pattern_index();
+        let pattern = &mut self.song.patterns[p];
+        let mut dropped = 0;
+        for t in &mut pattern.tracks {
+            let mut cells = vec![Cell::default(); rows];
+            for (r, c) in t
+                .cells
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c != Cell::default())
+            {
+                let to = ((r as f64 * scale).round() as usize).min(rows - 1);
+                if cells[to] == Cell::default() {
+                    cells[to] = *c;
+                } else {
+                    dropped += 1;
+                }
+            }
+            t.cells = cells;
+        }
+        pattern.rows_per_beat = rows_per_beat;
+        pattern.rows = rows;
+        self.cursor.row = ((self.cursor.row as f64 * scale) as usize).min(rows - 1);
+        self.anchor = None;
+        self.message = Some(match dropped {
+            0 => format!("{rows_per_beat} rows per beat"),
+            n => format!(
+                "{rows_per_beat} rows per beat: {n} cells shared a row and were dropped (ctrl+z to undo)"
+            ),
+        });
+    }
+
+    fn change_length(&mut self, delta: isize) {
+        let p = self.pattern();
+        let rows = (p.rows as isize + delta).clamp(1, MAX_ROWS as isize) as usize;
+        if rows == p.rows {
+            return;
+        }
+        self.snapshot();
+        let p = self.pattern_index();
+        let pattern = &mut self.song.patterns[p];
+        for t in &mut pattern.tracks {
+            t.cells.resize(rows, Cell::default());
+        }
+        pattern.rows = rows;
+        let rpb = pattern.rows_per_beat as usize;
+        let beats = if rows.is_multiple_of(rpb) {
+            format!("{}", rows / rpb)
+        } else {
+            format!("{:.2}", rows as f64 / rpb as f64)
+        };
+        self.message = Some(format!("{rows} rows, {beats} beats"));
+        self.clamp_cursor();
+    }
+
+    /// The sample the cursor's track plays.
+    pub fn track_sample(&self) -> (usize, &Arc<Sample>) {
+        let i = self.instrument();
+        let Instrument::Sampler(s) = &self.song.instruments[i];
+        (i, s)
+    }
+
+    /// Add a sample as a new instrument and put it on the cursor's track.
+    pub fn add_sample(&mut self, sample: Sample) {
+        self.snapshot();
+        let (name, slices) = (sample.name.clone(), sample.slices.len());
+        self.song
+            .instruments
+            .push(Instrument::Sampler(Arc::new(sample)));
+        self.set_track_instrument(self.song.instruments.len() - 1);
+        self.message = Some(format!("loaded {name}: {slices} slices"));
+    }
+
+    /// A track is the same column in every pattern, so it keeps its
+    /// instrument across all of them.
+    fn set_track_instrument(&mut self, instrument: usize) {
+        let t = self.cursor.track;
+        for p in &mut self.song.patterns {
+            if let Some(track) = p.tracks.get_mut(t) {
+                track.instrument = instrument;
+            }
+        }
+    }
+
+    fn cycle_instrument(&mut self, delta: isize) {
+        let n = self.song.instruments.len() as isize;
+        if n < 2 {
+            return;
+        }
+        self.snapshot();
+        let i = (self.instrument() as isize + delta).rem_euclid(n) as usize;
+        self.set_track_instrument(i);
+        let Instrument::Sampler(s) = &self.song.instruments[i];
+        self.message = Some(format!("track plays {}", s.name));
+    }
+
+    fn sample_at(&self, instrument: usize) -> Option<&Arc<Sample>> {
+        match self.song.instruments.get(instrument)? {
+            Instrument::Sampler(s) => Some(s),
+        }
+    }
+
+    /// Change which slice numbers cells point at, for every track playing
+    /// `instrument`, so they keep playing the same audio after markers are
+    /// added or removed.
+    fn renumber(&mut self, instrument: usize, f: impl Fn(u16) -> u16) {
+        for p in &mut self.song.patterns {
+            for t in p.tracks.iter_mut().filter(|t| t.instrument == instrument) {
+                for c in &mut t.cells {
+                    if let Some(tr) = &mut c.trigger {
+                        tr.slice = f(tr.slice);
+                    }
+                }
+            }
+        }
+    }
+
+    fn replace_sample(&mut self, instrument: usize, sample: Sample) {
+        self.song.instruments[instrument] = Instrument::Sampler(Arc::new(sample));
+    }
+
+    /// Add a slice marker at `frame`. Returns its index. Later slices move
+    /// up one, and cells follow them.
+    pub fn insert_marker(&mut self, instrument: usize, frame: usize) -> Option<usize> {
+        let s = self.sample_at(instrument)?;
+        if frame == 0 || frame >= s.frames.len() || s.slices.contains(&frame) {
+            return None;
+        }
+        let k = s.slices.partition_point(|&m| m < frame);
+        let mut slices = s.slices.clone();
+        slices.insert(k, frame);
+        let new = s.with_slices(slices);
+        self.snapshot();
+        self.replace_sample(instrument, new);
+        let k16 = k as u16;
+        self.renumber(instrument, |sl| if sl >= k16 { sl + 1 } else { sl });
+        Some(k)
+    }
+
+    /// Remove slice marker `index`; that slice joins the one before it, and
+    /// cells follow. The first marker can't be removed.
+    pub fn delete_marker(&mut self, instrument: usize, index: usize) {
+        let Some(s) = self.sample_at(instrument) else {
+            return;
+        };
+        if index == 0 || index >= s.slices.len() {
+            return;
+        }
+        let mut slices = s.slices.clone();
+        slices.remove(index);
+        let new = s.with_slices(slices);
+        self.snapshot();
+        self.replace_sample(instrument, new);
+        let k = index as u16;
+        self.renumber(instrument, |sl| if sl >= k { sl - 1 } else { sl });
+    }
+
+    /// Move marker `index` to `frame`, kept between its neighbours so slice
+    /// numbers don't change. `new_step` starts an undo step; a drag passes
+    /// it only on its first move, so the whole drag undoes at once.
+    pub fn move_marker(&mut self, instrument: usize, index: usize, frame: usize, new_step: bool) {
+        let Some(s) = self.sample_at(instrument) else {
+            return;
+        };
+        if index == 0 || index >= s.slices.len() {
+            return;
+        }
+        let lo = s.slices[index - 1] + 1;
+        let hi = s.slices.get(index + 1).map_or(s.frames.len(), |&n| n) - 1;
+        let frame = frame.clamp(lo, hi.max(lo));
+        if frame == s.slices[index] {
+            return;
+        }
+        let mut slices = s.slices.clone();
+        slices[index] = frame;
+        let new = s.with_slices(slices);
+        if new_step {
+            self.snapshot();
+        } else {
+            self.changed();
+        }
+        self.replace_sample(instrument, new);
+    }
+
+    /// Find slices again with another sensitivity (0..=1). Slice numbers
+    /// can't be mapped across, so cells keep their numbers.
+    pub fn redetect(&mut self, instrument: usize, sensitivity: f32) {
+        let Some(s) = self.sample_at(instrument) else {
+            return;
+        };
+        let mut new = s.with_slices(vec![0]);
+        new.detect_slices(sensitivity, 40.0);
+        let n = new.slices.len();
+        self.snapshot();
+        self.replace_sample(instrument, new);
+        self.message = Some(format!("sensitivity {sensitivity:.1}: {n} slices"));
+    }
+
     fn bounce(&mut self) {
         let tracks = self.pattern().tracks.len();
         if tracks >= crate::engine::MAX_TRACKS {
@@ -665,6 +976,7 @@ impl Editor {
         let version = self.song.rack.version.max(snap.rack.version) + 1;
         to.push(Snapshot {
             patterns: std::mem::replace(&mut self.song.patterns, snap.patterns),
+            order: std::mem::replace(&mut self.song.order, snap.order),
             rack: std::mem::replace(&mut self.song.rack, snap.rack),
             instruments: std::mem::replace(&mut self.song.instruments, snap.instruments),
         });
@@ -852,6 +1164,173 @@ mod tests {
         assert_eq!(e.revision, r, "moving isn't a change");
         type_str(&mut e, "0");
         assert!(e.revision > r);
+    }
+
+    fn editor_with(slices: Vec<usize>) -> Editor {
+        let mut e = editor();
+        let s = Sample::new("s", 48_000, vec![[0.0; 2]; 1000]).with_slices(slices);
+        e.song.instruments[0] = Instrument::Sampler(Arc::new(s));
+        e
+    }
+
+    fn slices(e: &Editor) -> Vec<usize> {
+        e.track_sample().1.slices.clone()
+    }
+
+    fn cell_slices(e: &Editor) -> Vec<u16> {
+        e.pattern().tracks[0]
+            .cells
+            .iter()
+            .filter_map(|c| c.trigger.map(|t| t.slice))
+            .collect()
+    }
+
+    #[test]
+    fn inserting_a_marker_renumbers_later_cells() {
+        let mut e = editor_with(vec![0, 200, 400]);
+        type_str(&mut e, "000102");
+        assert_eq!(e.insert_marker(0, 300), Some(2));
+        assert_eq!(slices(&e), vec![0, 200, 300, 400]);
+        assert_eq!(cell_slices(&e), vec![0, 1, 3], "old slice 2 is now 3");
+        e.apply(Action::Undo);
+        assert_eq!(slices(&e), vec![0, 200, 400]);
+        assert_eq!(cell_slices(&e), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn deleting_a_marker_merges_into_the_previous_slice() {
+        let mut e = editor_with(vec![0, 200, 400]);
+        type_str(&mut e, "000102");
+        e.delete_marker(0, 1);
+        assert_eq!(slices(&e), vec![0, 400]);
+        assert_eq!(cell_slices(&e), vec![0, 0, 1]);
+        e.delete_marker(0, 0);
+        assert_eq!(slices(&e), vec![0, 400], "the first marker stays");
+    }
+
+    #[test]
+    fn moving_a_marker_stays_between_neighbours_and_undoes_at_once() {
+        let mut e = editor_with(vec![0, 200, 400]);
+        e.move_marker(0, 1, 250, true);
+        e.move_marker(0, 1, 300, false);
+        e.move_marker(0, 1, 900, false);
+        assert_eq!(slices(&e), vec![0, 399, 400]);
+        e.apply(Action::Undo);
+        assert_eq!(slices(&e), vec![0, 200, 400]);
+    }
+
+    #[test]
+    fn added_sample_goes_on_the_cursor_track() {
+        let mut e = editor();
+        e.cursor.track = 1;
+        e.add_sample(Sample::new("new", 48_000, vec![[0.0; 2]; 10]));
+        assert_eq!(e.pattern().tracks[1].instrument, 1);
+        assert_eq!(e.pattern().tracks[0].instrument, 0);
+        e.apply(Action::NextInstrument);
+        assert_eq!(e.pattern().tracks[1].instrument, 0);
+        e.apply(Action::Undo);
+        e.apply(Action::Undo);
+        assert_eq!(e.song.instruments.len(), 1);
+    }
+
+    #[test]
+    fn new_and_duplicate_patterns_go_after_the_current_slot() {
+        let mut e = editor();
+        type_str(&mut e, "05");
+        e.apply(Action::DuplicatePattern);
+        assert_eq!(e.song.order, vec![0, 1]);
+        assert_eq!(e.cursor.order, 1);
+        assert_eq!(e.pattern().tracks[0].cells[0].trigger.unwrap().slice, 5);
+        e.apply(Action::NewPattern);
+        assert_eq!(e.song.order, vec![0, 1, 2]);
+        assert!(
+            e.pattern()
+                .tracks
+                .iter()
+                .all(|t| t.cells.iter().all(|c| *c == Cell::default()))
+        );
+        assert_eq!(e.pattern().tracks.len(), 2, "same tracks");
+        e.apply(Action::Undo);
+        e.apply(Action::Undo);
+        assert_eq!(e.song.order, vec![0]);
+    }
+
+    #[test]
+    fn order_slots() {
+        let mut e = editor();
+        e.apply(Action::RepeatSlot);
+        assert_eq!(e.song.order, vec![0, 0]);
+        e.apply(Action::NewPattern);
+        e.go_to(0, 0);
+        e.apply(Action::SlotPattern(1));
+        assert_eq!(e.song.order, vec![1, 0, 1]);
+        e.apply(Action::DeleteSlot);
+        assert_eq!(e.song.order, vec![0, 1]);
+        e.apply(Action::DeleteSlot);
+        e.apply(Action::DeleteSlot);
+        assert_eq!(e.song.order.len(), 1, "the last slot stays");
+    }
+
+    #[test]
+    fn doubling_resolution_keeps_timing() {
+        let mut e = editor();
+        type_str(&mut e, "01");
+        e.go_to(0, 3);
+        type_str(&mut e, "02");
+        e.apply(Action::Resolution(1));
+        let p = e.pattern();
+        assert_eq!((p.rows_per_beat, p.rows), (6, 24));
+        let at: Vec<_> = p.tracks[0]
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(r, c)| c.trigger.map(|t| (r, t.slice)))
+            .collect();
+        assert_eq!(
+            at,
+            vec![(0, 1), (5, 2)],
+            "row 3 of 4 per beat is row 4.5 of 6: rounds to 5"
+        );
+        e.apply(Action::Undo);
+        assert_eq!((e.pattern().rows_per_beat, e.pattern().rows), (4, 16));
+    }
+
+    #[test]
+    fn halving_resolution_drops_collisions() {
+        let mut e = editor();
+        // Rows 1 and 2 become rows 0.5 and 1: both round to row 1.
+        e.go_to(0, 1);
+        type_str(&mut e, "0102");
+        e.apply(Action::Resolution(-2));
+        let p = e.pattern();
+        assert_eq!((p.rows_per_beat, p.rows), (2, 8));
+        assert_eq!(
+            p.tracks[0].cells[1].trigger.unwrap().slice,
+            1,
+            "the first one stays"
+        );
+        assert!(e.message.as_deref().unwrap().contains("1 cells"));
+    }
+
+    #[test]
+    fn length_changes_by_rows() {
+        let mut e = editor();
+        e.go_to(0, 15);
+        type_str(&mut e, "07");
+        // Typing on the last row wrapped the cursor to the top.
+        e.go_to(0, 15);
+        e.apply(Action::Length(-2));
+        assert_eq!(e.pattern().rows, 14);
+        assert_eq!(e.cursor.row, 13);
+        e.apply(Action::Length(4));
+        assert_eq!(e.pattern().rows, 18);
+        assert!(
+            e.pattern().tracks[0].cells[15].trigger.is_none(),
+            "cut off rows don't come back"
+        );
+        e.apply(Action::Undo);
+        e.apply(Action::Undo);
+        assert_eq!(e.pattern().tracks[0].cells[15].trigger.unwrap().slice, 7);
     }
 
     #[test]
