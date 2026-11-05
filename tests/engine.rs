@@ -24,6 +24,7 @@ fn one_track_song(sample: Sample, bpm: f64, rpb: u32, beats: u32) -> Song {
         patterns: vec![Pattern::new(rpb, beats, &[("t", 0)])],
         order: vec![0],
         rack: Rack::simple(1),
+        tuning: Default::default(),
     }
 }
 
@@ -138,6 +139,7 @@ fn swapped_song_is_handed_back() {
     engine.process(&mut buf);
     let before = Arc::strong_count(match &song.instruments[0] {
         Instrument::Sampler(s) => s,
+        Instrument::Synth(_) => panic!("not a sample"),
     });
     assert!(
         controller
@@ -149,6 +151,7 @@ fn swapped_song_is_handed_back() {
     controller.collect_garbage();
     let after = Arc::strong_count(match &song.instruments[0] {
         Instrument::Sampler(s) => s,
+        Instrument::Synth(_) => panic!("not a sample"),
     });
     assert_eq!(after, before, "old song dropped by the controller");
 }

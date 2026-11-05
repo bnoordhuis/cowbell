@@ -22,7 +22,9 @@ fn plain_song() -> cowbell::pattern::Song {
 }
 
 fn frames(song: &cowbell::pattern::Song, i: usize) -> Vec<[f32; 2]> {
-    let Instrument::Sampler(s) = &song.instruments[i];
+    let Instrument::Sampler(s) = &song.instruments[i] else {
+        panic!("not a sample")
+    };
     s.frames.to_vec()
 }
 

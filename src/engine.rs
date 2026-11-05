@@ -14,6 +14,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use crate::graph::{BLOCK, Graph};
 use crate::pattern::{Fx, Instrument, Song, Trigger};
 use crate::rack::DeviceId;
+use crate::synthvoice::SynthVoice;
 use crate::voice::Voice;
 
 pub const MAX_TRACKS: usize = 16;
@@ -72,6 +73,8 @@ pub struct Engine {
     /// Per track, the sound a voice was making when it was stolen or
     /// retriggered, fading out under the new note. Only used with declick.
     tails: [Voice; MAX_TRACKS],
+    /// One synth voice per track, plus one for auditioning.
+    synths: [SynthVoice; MAX_TRACKS + 1],
     graph: Box<Graph>,
     /// The audition voice skips the graph and goes straight to the output.
     audition: Vec<[f32; 2]>,
@@ -145,6 +148,7 @@ impl Engine {
             row_clock: 0.0,
             voices: Default::default(),
             tails: Default::default(),
+            synths: Default::default(),
             graph,
             audition: vec![[0.0; 2]; BLOCK],
             commands: cmd_rx,
@@ -210,9 +214,8 @@ impl Engine {
                     instrument,
                     slice,
                     velocity,
-                } => {
-                    if let Some(Instrument::Sampler(sample)) = self.song.instruments.get(instrument)
-                    {
+                } => match self.song.instruments.get(instrument) {
+                    Some(Instrument::Sampler(sample)) => {
                         let trigger = Trigger { slice, velocity };
                         let fpr = self.frames_per_row();
                         self.voices[AUDITION].trigger(
@@ -224,12 +227,31 @@ impl Engine {
                             fpr,
                         );
                     }
-                }
+                    Some(Instrument::Synth(_)) => {
+                        let freq = self.song.tuning.freq(slice.min(127) as u8);
+                        let synth = &mut self.synths[AUDITION];
+                        synth.note_on(instrument, freq, velocity, 0.0, self.out_rate);
+                        synth.note_off_in(0.3 * self.out_rate);
+                    }
+                    None => {}
+                },
                 Command::SetBpm(bpm) => self.song.bpm = bpm,
                 Command::SwapSong(song) => {
                     let old = std::mem::replace(&mut self.song, song);
                     // A voice indexes into its sample's frames, so it can only
                     // keep playing if the new song has the very same sample.
+                    // Synths read their patch fresh every frame, so they only
+                    // need their instrument to still be a synth.
+                    for synth in self.synths.iter_mut().filter(|v| v.is_active()) {
+                        if !self
+                            .song
+                            .instruments
+                            .get(synth.instrument())
+                            .is_some_and(|i| i.is_synth())
+                        {
+                            synth.stop();
+                        }
+                    }
                     let voices = self.voices.iter_mut().chain(self.tails.iter_mut());
                     for voice in voices.filter(|v| v.is_active()) {
                         let same = match (
@@ -267,6 +289,7 @@ impl Engine {
     fn stop_voices(&mut self) {
         self.voices.iter_mut().for_each(Voice::stop);
         self.tails.iter_mut().for_each(Voice::stop);
+        self.synths.iter_mut().for_each(SynthVoice::stop);
     }
 
     fn discard(&mut self, garbage: Garbage) {
@@ -289,15 +312,49 @@ impl Engine {
             return;
         };
         let fpr = self.frames_per_row();
-        let voices = self.voices.iter_mut().zip(self.tails.iter_mut());
-        for (t, (track, (voice, tail))) in pattern.tracks.iter().zip(voices).enumerate() {
+        let voices = self
+            .voices
+            .iter_mut()
+            .zip(self.tails.iter_mut())
+            .zip(self.synths.iter_mut());
+        for (t, (track, ((voice, tail), synth))) in pattern.tracks.iter().zip(voices).enumerate() {
             let Some(cell) = track.cells.get(self.pos.row) else {
                 continue;
             };
-            let Some(Instrument::Sampler(sample)) = self.song.instruments.get(track.instrument)
-            else {
-                continue;
+            let cut = cell.fx().find_map(|f| match f {
+                Fx::Cut(n) => Some(fpr * n as f64 / 16.0),
+                _ => None,
+            });
+            let sample = match self.song.instruments.get(track.instrument) {
+                Some(Instrument::Sampler(sample)) => sample,
+                Some(Instrument::Synth(_)) => {
+                    if let Some(trigger) = cell.trigger {
+                        // The track switched from a sample: that stops.
+                        voice.stop();
+                        let glide = cell.fx().find_map(|f| match f {
+                            Fx::Glide(n) => Some(n as f32 * 4.0),
+                            _ => None,
+                        });
+                        let freq = self.song.tuning.freq(trigger.slice.min(127) as u8);
+                        synth.note_on(
+                            track.instrument,
+                            freq,
+                            trigger.velocity,
+                            glide.unwrap_or(0.0),
+                            self.out_rate,
+                        );
+                    }
+                    if let Some(frames) = cut {
+                        synth.note_off_in(frames);
+                    }
+                    continue;
+                }
+                None => continue,
             };
+            if cell.trigger.is_some() && synth.is_active() {
+                // The track switched from a synth: let it ring out.
+                synth.note_off_in(0.0);
+            }
             if let Some(trigger) = cell.trigger {
                 if self.graph.track_declick(t) {
                     voice.steal_into(tail);
@@ -310,8 +367,8 @@ impl Engine {
                     self.out_rate,
                     fpr,
                 );
-            } else if let Some(Fx::Cut(n)) = cell.fx().find(|f| matches!(f, Fx::Cut(_))) {
-                voice.schedule_cut(fpr * n as f64 / 16.0);
+            } else if let Some(frames) = cut {
+                voice.schedule_cut(frames);
             }
         }
     }
@@ -394,7 +451,14 @@ impl Engine {
                 } else {
                     frame = [frame[0] + v[0], frame[1] + v[1]];
                 }
-                let hit = voice.take_hit();
+                let synth = &mut self.synths[t];
+                if synth.is_active()
+                    && let Some(Instrument::Synth(patch)) = instruments.get(synth.instrument())
+                {
+                    let s = synth.next_frame(patch, self.out_rate);
+                    frame = [frame[0] + s[0], frame[1] + s[1]];
+                }
+                let hit = voice.take_hit() | synth.take_hit();
                 if t == AUDITION {
                     self.audition[i] = frame;
                 } else {

@@ -42,7 +42,7 @@ pub struct ParamSpec {
 }
 
 impl ParamSpec {
-    const fn new(
+    pub const fn new(
         name: &'static str,
         min: f32,
         max: f32,
@@ -61,7 +61,11 @@ impl ParamSpec {
         }
     }
 
-    const fn labelled(name: &'static str, default: f32, labels: &'static [&'static str]) -> Self {
+    pub const fn labelled(
+        name: &'static str,
+        default: f32,
+        labels: &'static [&'static str],
+    ) -> Self {
         let max = (labels.len() - 1) as f32;
         ParamSpec {
             name,

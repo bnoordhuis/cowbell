@@ -162,6 +162,8 @@ impl Voice {
                         Some((ms.max(1) as f64 / 1000.0 * sample.sample_rate as f64).max(1.0))
                 }
                 Fx::Cut(n) => self.cut_in = Some(frames_per_row * n as f64 / 16.0),
+                // Only synths glide.
+                Fx::Glide(_) => {}
             }
         }
         if let Some(cut) = self.cut_in {

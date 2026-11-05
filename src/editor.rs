@@ -11,7 +11,9 @@ use std::sync::Arc;
 use crate::pattern::{Cell, Fx, Instrument, MAX_FX, Pattern, Song, Trigger};
 use crate::rack::Rack;
 use crate::sample::Sample;
+use crate::synthvoice::{SynthKind, SynthPatch};
 use crate::transform::Roll;
+use crate::tuning::{HIGHEST_NOTE, LOWEST_NOTE};
 
 const UNDO_DEPTH: usize = 500;
 
@@ -88,6 +90,10 @@ pub enum Action {
     /// Render the selected rows (or the whole pattern) to a new sample on a
     /// new track, replacing what was there. See [`crate::bounce`].
     Bounce,
+    /// Move the octave that note keys enter, for synth tracks.
+    Octave(isize),
+    /// Put a new synth on the cursor's track.
+    AddSynth(SynthKind),
     /// Cycle the instrument of the cursor's track.
     NextInstrument,
     PrevInstrument,
@@ -119,12 +125,18 @@ impl Fx {
             Fx::Crush(_) => 'B',
             Fx::Stutter(_) => 'S',
             Fx::Cut(_) => 'C',
+            Fx::Glide(_) => 'G',
         }
     }
 
     pub fn param(self) -> u8 {
         match self {
-            Fx::Offset(n) | Fx::Retrig(n) | Fx::Crush(n) | Fx::Stutter(n) | Fx::Cut(n) => n,
+            Fx::Offset(n)
+            | Fx::Retrig(n)
+            | Fx::Crush(n)
+            | Fx::Stutter(n)
+            | Fx::Cut(n)
+            | Fx::Glide(n) => n,
             Fx::Pitch(n) => n as u8,
             Fx::Reverse => 1,
         }
@@ -139,6 +151,7 @@ impl Fx {
             'B' => Fx::Crush(param),
             'S' => Fx::Stutter(param),
             'C' => Fx::Cut(param),
+            'G' => Fx::Glide(param),
             _ => return None,
         })
     }
@@ -153,6 +166,7 @@ impl Fx {
             Fx::Crush(n) => format!("crush to {} bits", n.clamp(1, 16)),
             Fx::Stutter(n) => format!("loop the first {n} ms"),
             Fx::Cut(n) => format!("cut after {n}/16 of the row"),
+            Fx::Glide(n) => format!("glide over {} ms", n as u32 * 4),
         }
     }
 }
@@ -176,6 +190,10 @@ pub struct Editor {
     pub edit_step: usize,
     pub last_slice: u16,
     pub last_velocity: u8,
+    /// The last note entered on a synth track.
+    pub last_note: u8,
+    /// The octave note keys enter on synth tracks; 4 is middle C.
+    pub octave: u8,
     /// Set when the song changed and the engine needs the new version.
     pub dirty: bool,
     /// Counts changes, so the UI can tell whether there are unsaved ones.
@@ -190,6 +208,19 @@ pub struct Editor {
     /// The field being typed into. Typing into the same field again is part
     /// of the same undo step.
     typing_in: Option<(usize, usize, usize, Field)>,
+}
+
+/// Semitone above the octave's C for a note key, tracker style: the bottom
+/// letter row is one octave, the top row (with the number row for sharps)
+/// the next.
+fn piano_key(c: char) -> Option<u8> {
+    const LOWER: &str = "zsxdcvgbhnjm,";
+    const UPPER: &str = "q2w3er5t6y7ui";
+    let c = c.to_ascii_lowercase();
+    LOWER
+        .find(c)
+        .or_else(|| UPPER.find(c).map(|i| i + 12))
+        .map(|i| i as u8)
 }
 
 fn hex(c: char) -> Option<u8> {
@@ -223,6 +254,8 @@ impl Editor {
             edit_step: 1,
             last_slice: 0,
             last_velocity: 0x7f,
+            last_note: 60,
+            octave: 4,
             dirty: false,
             revision: 0,
             audition: None,
@@ -271,6 +304,7 @@ impl Editor {
         self.cursor.row = self.cursor.row.min(rows - 1);
         self.cursor.track = self.cursor.track.min(tracks - 1);
         self.anchor = self.anchor.map(|a| a.min(rows - 1));
+        self.cursor.digit = self.cursor.digit.min(self.digits(self.cursor.field) - 1);
     }
 
     /// The current state, for undo.
@@ -348,11 +382,37 @@ impl Editor {
         }
     }
 
+    /// Cursor positions in `field` on the cursor's track. A synth track's
+    /// note is one position: a key enters the whole note.
+    pub fn digits(&self, field: Field) -> usize {
+        if field == Field::Slice && self.on_synth() {
+            1
+        } else {
+            field.digits()
+        }
+    }
+
+    /// Whether the cursor's track plays a synth.
+    pub fn on_synth(&self) -> bool {
+        self.song
+            .instruments
+            .get(self.instrument())
+            .is_some_and(Instrument::is_synth)
+    }
+
     fn move_horizontal(&mut self, right: bool) {
         let tracks = self.pattern().tracks.len();
+        let slice_digits = self.digits(Field::Slice);
+        let digits = |f: Field| {
+            if f == Field::Slice {
+                slice_digits
+            } else {
+                f.digits()
+            }
+        };
         let c = &mut self.cursor;
         if right {
-            if c.digit + 1 < c.field.digits() {
+            if c.digit + 1 < digits(c.field) {
                 c.digit += 1;
             } else if c.field.index() + 1 < Field::ALL.len() {
                 c.field = Field::ALL[c.field.index() + 1];
@@ -366,7 +426,7 @@ impl Editor {
             c.digit -= 1;
         } else if c.field.index() > 0 {
             c.field = Field::ALL[c.field.index() - 1];
-            c.digit = c.field.digits() - 1;
+            c.digit = digits(c.field) - 1;
         } else if c.track > 0 {
             c.track -= 1;
             c.field = Field::Fx(MAX_FX - 1);
@@ -439,6 +499,11 @@ impl Editor {
             Action::SlotPattern(d) => self.slot_pattern(d),
             Action::Resolution(d) => self.step_resolution(d),
             Action::Length(d) => self.change_length(d),
+            Action::AddSynth(kind) => self.add_synth(kind),
+            Action::Octave(d) => {
+                self.octave = (self.octave as isize + d).clamp(0, 8) as u8;
+                self.message = Some(format!("octave {}", self.octave));
+            }
             Action::NextInstrument => self.cycle_instrument(1),
             Action::PrevInstrument => self.cycle_instrument(-1),
             Action::EditStep(d) => {
@@ -472,9 +537,35 @@ impl Editor {
         let Cursor {
             row, field, digit, ..
         } = self.cursor;
-        let (last_slice, last_velocity) = (self.last_slice, self.last_velocity);
+        let synth = self.on_synth();
+        let last = if synth {
+            self.last_note as u16
+        } else {
+            self.last_slice
+        };
+        let (last_slice, last_velocity) = (last, self.last_velocity);
         let current = self.cell();
         let new = match field {
+            Field::Slice if synth && c == '.' => {
+                // Note off: release whatever the track is holding.
+                Cell {
+                    trigger: None,
+                    fx: [Some(Fx::Cut(0)), current.fx[1]],
+                }
+            }
+            Field::Slice if synth => {
+                let Some(key) = piano_key(c) else { return };
+                let note = ((self.octave as u16 + 1) * 12 + key as u16)
+                    .clamp(LOWEST_NOTE as u16, HIGHEST_NOTE as u16);
+                let velocity = current.trigger.map_or(last_velocity, |t| t.velocity);
+                Cell {
+                    trigger: Some(Trigger {
+                        slice: note,
+                        velocity,
+                    }),
+                    ..current
+                }
+            }
             Field::Slice | Field::Velocity => {
                 let Some(d) = hex(c) else { return };
                 let mut t = current.trigger.unwrap_or(Trigger {
@@ -522,7 +613,11 @@ impl Editor {
         self.changed();
         *self.cell_mut(row).unwrap() = new;
         if let Some(t) = new.trigger {
-            self.last_slice = t.slice;
+            if synth {
+                self.last_note = t.slice as u8;
+            } else {
+                self.last_slice = t.slice;
+            }
             self.last_velocity = t.velocity;
             if field == Field::Slice {
                 self.audition = Some((self.instrument(), t.slice));
@@ -546,7 +641,7 @@ impl Editor {
     }
 
     fn advance_after_entry(&mut self) {
-        if self.cursor.digit + 1 < self.cursor.field.digits() {
+        if self.cursor.digit + 1 < self.digits(self.cursor.field) {
             self.cursor.digit += 1;
         } else {
             self.step_down();
@@ -771,11 +866,73 @@ impl Editor {
         self.clamp_cursor();
     }
 
-    /// The sample the cursor's track plays.
-    pub fn track_sample(&self) -> (usize, &Arc<Sample>) {
+    /// The sample the cursor's track plays, if it plays one.
+    pub fn track_sample(&self) -> Option<(usize, &Arc<Sample>)> {
         let i = self.instrument();
-        let Instrument::Sampler(s) = &self.song.instruments[i];
-        (i, s)
+        match self.song.instruments.get(i)? {
+            Instrument::Sampler(s) => Some((i, s)),
+            Instrument::Synth(_) => None,
+        }
+    }
+
+    /// The synth the cursor's track plays, if it plays one.
+    pub fn track_synth(&self) -> Option<(usize, &Arc<SynthPatch>)> {
+        let i = self.instrument();
+        match self.song.instruments.get(i)? {
+            Instrument::Synth(p) => Some((i, p)),
+            Instrument::Sampler(_) => None,
+        }
+    }
+
+    /// Add a new synth and put it on the cursor's track.
+    pub fn add_synth(&mut self, kind: SynthKind) {
+        let n = self
+            .song
+            .instruments
+            .iter()
+            .filter(|i| i.is_synth())
+            .count()
+            + 1;
+        let patch = SynthPatch::new(kind, format!("{}{n}", kind.name()));
+        let name = patch.name.clone();
+        self.snapshot();
+        self.song
+            .instruments
+            .push(Instrument::Synth(Arc::new(patch)));
+        self.set_track_instrument(self.song.instruments.len() - 1);
+        self.clamp_cursor();
+        self.message = Some(format!(
+            "track plays {name}: type notes with z-m and q-u, . for note off"
+        ));
+    }
+
+    /// Turn a synth knob. `new_step` starts an undo step; a drag passes it
+    /// only on its first move, so the whole drag undoes at once.
+    pub fn set_synth_param(&mut self, instrument: usize, param: usize, value: f32, new_step: bool) {
+        let Some(Instrument::Synth(p)) = self.song.instruments.get(instrument) else {
+            return;
+        };
+        let Some(spec) = p.kind.params().get(param) else {
+            return;
+        };
+        let value = spec.clamp(value);
+        if p.params.get(param) == Some(&value) {
+            return;
+        }
+        let mut patch = SynthPatch::clone(p);
+        patch.params[param] = value;
+        if new_step {
+            self.snapshot();
+        } else {
+            self.changed();
+        }
+        self.song.instruments[instrument] = Instrument::Synth(Arc::new(patch));
+    }
+
+    /// Use another tuning for synths.
+    pub fn set_tuning(&mut self, tuning: crate::tuning::Tuning) {
+        self.song.tuning = tuning;
+        self.changed();
     }
 
     /// Add a sample as a new instrument and put it on the cursor's track.
@@ -808,13 +965,14 @@ impl Editor {
         self.snapshot();
         let i = (self.instrument() as isize + delta).rem_euclid(n) as usize;
         self.set_track_instrument(i);
-        let Instrument::Sampler(s) = &self.song.instruments[i];
-        self.message = Some(format!("track plays {}", s.name));
+        self.clamp_cursor();
+        self.message = Some(format!("track plays {}", self.song.instruments[i].name()));
     }
 
     fn sample_at(&self, instrument: usize) -> Option<&Arc<Sample>> {
         match self.song.instruments.get(instrument)? {
             Instrument::Sampler(s) => Some(s),
+            Instrument::Synth(_) => None,
         }
     }
 
@@ -1003,6 +1161,7 @@ mod tests {
             patterns: vec![Pattern::new(4, 4, &[("a", 0), ("b", 0)])],
             order: vec![0],
             rack: crate::rack::Rack::simple(2),
+            tuning: Default::default(),
         })
     }
 
@@ -1174,7 +1333,7 @@ mod tests {
     }
 
     fn slices(e: &Editor) -> Vec<usize> {
-        e.track_sample().1.slices.clone()
+        e.track_sample().unwrap().1.slices.clone()
     }
 
     fn cell_slices(e: &Editor) -> Vec<u16> {

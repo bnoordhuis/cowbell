@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::rack::Rack;
 use crate::sample::Sample;
+use crate::synthvoice::SynthPatch;
+use crate::tuning::Tuning;
 
 /// Effect columns per cell.
 pub const MAX_FX: usize = 2;
@@ -28,8 +30,11 @@ pub enum Fx {
     /// Loop the first `n` milliseconds of the slice.
     Stutter(u8),
     /// Cut the note `n/16` of the way through the row. Also cuts a note that
-    /// is still ringing when the cell has no trigger.
+    /// is still ringing when the cell has no trigger. Synths release.
     Cut(u8),
+    /// Synths: slide from the held note to this one over `n` × 4 ms,
+    /// without restarting the envelopes.
+    Glide(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +73,21 @@ impl Cell {
 #[derive(Clone, Debug)]
 pub enum Instrument {
     Sampler(Arc<Sample>),
+    /// A synth voice. Its trigger's `slice` is the note number.
+    Synth(Arc<SynthPatch>),
+}
+
+impl Instrument {
+    pub fn name(&self) -> &str {
+        match self {
+            Instrument::Sampler(s) => &s.name,
+            Instrument::Synth(p) => &p.name,
+        }
+    }
+
+    pub fn is_synth(&self) -> bool {
+        matches!(self, Instrument::Synth(_))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -114,4 +134,6 @@ pub struct Song {
     /// Indices into `patterns`, played in sequence and looped.
     pub order: Vec<usize>,
     pub rack: Rack,
+    /// Which frequency each note plays, for synths.
+    pub tuning: Tuning,
 }

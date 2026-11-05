@@ -79,6 +79,7 @@ pub fn song(brk: Sample) -> Song {
         patterns: vec![p0, p1],
         order: vec![0, 1, 0, 1],
         rack: rack(),
+        tuning: Default::default(),
     }
 }
 

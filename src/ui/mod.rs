@@ -5,6 +5,7 @@
 //! every key goes to the tracker. Editing logic lives in [`crate::editor`];
 //! this module only maps keys to editor actions and draws the result.
 
+mod knob;
 mod rack;
 #[cfg(feature = "screenshot")]
 mod screenshot;
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui::{
-    self, Align2, Color32, FontId, Key, Modifiers, Rect, Sense, Stroke, pos2, vec2,
+    self, Align2, Color32, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, pos2, vec2,
 };
 
 use crate::audio::{self, Output};
@@ -23,11 +24,15 @@ use crate::graph::Graph;
 use crate::pattern::{Cell, Instrument, Song};
 use crate::project;
 use crate::sample::Sample;
+use crate::synthvoice::SynthKind;
+use crate::tuning::{Tuning, note_name};
 
 /// Default slice detection sensitivity for loaded samples.
 const SENSITIVITY: f32 = 0.6;
 /// How close, in points, the pointer must be to grab a slice marker.
 const MARKER_HIT: f32 = 6.0;
+/// Width of each knob in the synth panel.
+const SYNTH_KNOB_CELL: f32 = 76.0;
 
 mod color {
     use eframe::egui::Color32;
@@ -54,7 +59,9 @@ mod color {
 const FONT_SIZE: f32 = 13.0;
 const ROW_HEIGHT: f32 = 17.0;
 /// Characters per track column: "SS VV FFF FFF".
-const TRACK_CHARS: usize = 13;
+/// Characters per track column: "NNN VV FFF FFF". The first field is a note
+/// name on synth tracks, so it's three wide.
+const TRACK_CHARS: usize = 14;
 const TRACK_GAP: usize = 3;
 const ROW_NUMBER_CHARS: usize = 4;
 
@@ -62,8 +69,8 @@ const ROW_NUMBER_CHARS: usize = 4;
 fn field_offset(field: Field) -> usize {
     match field {
         Field::Slice => 0,
-        Field::Velocity => 3,
-        Field::Fx(i) => 6 + 4 * i,
+        Field::Velocity => 4,
+        Field::Fx(i) => 7 + 4 * i,
     }
 }
 
@@ -98,6 +105,8 @@ enum Act {
     SaveAs,
     Open,
     LoadSample,
+    LoadTuning,
+    AddSynth(SynthKind),
     Sensitivity(f32),
     /// Change the pattern length by whole beats.
     LengthBeats(isize),
@@ -108,6 +117,7 @@ enum PromptKind {
     SaveAs,
     Open,
     LoadSample,
+    LoadTuning,
 }
 
 /// A one-line text prompt in the status bar, for file names.
@@ -172,7 +182,10 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
         Key::S if m.command => Some(Act::Save),
         Key::O if m.command => Some(Act::Open),
         Key::B if m.command => edit(Bounce),
+        Key::L if m.command && m.shift => Some(Act::LoadTuning),
         Key::L if m.command => Some(Act::LoadSample),
+        Key::F5 => Some(Act::AddSynth(SynthKind::Acid)),
+        Key::F6 => Some(Act::AddSynth(SynthKind::Fm)),
         Key::I if m.command && m.shift => edit(PrevInstrument),
         Key::I if m.command => edit(NextInstrument),
         Key::OpenBracket => Some(Act::Sensitivity(-0.1)),
@@ -272,6 +285,9 @@ struct App {
     sensitivity: f32,
     /// A slice marker being dragged: (instrument, marker, moved yet).
     marker_drag: Option<(usize, usize, bool)>,
+    /// A synth knob being dragged: (instrument, param, start y, start knob
+    /// position, moved yet).
+    synth_drag: Option<(usize, usize, f32, f32, bool)>,
     #[cfg(feature = "screenshot")]
     screenshot: Option<screenshot::Screenshot>,
 }
@@ -318,6 +334,7 @@ impl App {
             title: String::new(),
             sensitivity: SENSITIVITY,
             marker_drag: None,
+            synth_drag: None,
             #[cfg(feature = "screenshot")]
             screenshot,
         }
@@ -404,6 +421,7 @@ impl App {
                     PromptKind::SaveAs => self.save(path),
                     PromptKind::Open => self.open(path),
                     PromptKind::LoadSample => self.load_sample(typed_path(&prompt.text)),
+                    PromptKind::LoadTuning => self.load_tuning(typed_path(&prompt.text)),
                 }
             }
             _ => {}
@@ -420,9 +438,23 @@ impl App {
         }
     }
 
+    fn load_tuning(&mut self, path: PathBuf) {
+        let tuning = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| Tuning::from_scala(&t));
+        match tuning {
+            Ok(t) => {
+                let name = t.name.clone();
+                self.editor.set_tuning(t);
+                self.editor.message = Some(format!("tuning: {name}"));
+            }
+            Err(e) => self.editor.message = Some(format!("couldn't load {}: {e}", path.display())),
+        }
+    }
+
     fn ask(&mut self, kind: PromptKind) {
         let text = match (&self.path, kind) {
-            (_, PromptKind::LoadSample) => String::new(),
+            (_, PromptKind::LoadSample | PromptKind::LoadTuning) => String::new(),
             (Some(p), _) => p.display().to_string(),
             (None, PromptKind::SaveAs) => format!("untitled.{}", project::EXTENSION),
             (None, PromptKind::Open) => String::new(),
@@ -510,11 +542,18 @@ impl App {
                     let rpb = self.editor.pattern().rows_per_beat as isize;
                     self.editor.apply(Action::Length(d * rpb));
                 }
-                Some(Act::Sensitivity(_)) if self.view == View::Rack => {}
+                Some(Act::Sensitivity(_) | Act::AddSynth(_)) if self.view == View::Rack => {}
+                Some(Act::LoadTuning) => self.ask(PromptKind::LoadTuning),
+                Some(Act::AddSynth(kind)) => self.editor.apply(Action::AddSynth(kind)),
+                // On synth tracks the same keys move the octave.
+                Some(Act::Sensitivity(d)) if self.editor.on_synth() => {
+                    self.editor.apply(Action::Octave(d.signum() as isize))
+                }
                 Some(Act::Sensitivity(d)) => {
                     self.sensitivity = (self.sensitivity + d).clamp(0.0, 1.0);
-                    let (instrument, _) = self.editor.track_sample();
-                    self.editor.redetect(instrument, self.sensitivity);
+                    if let Some((instrument, _)) = self.editor.track_sample() {
+                        self.editor.redetect(instrument, self.sensitivity);
+                    }
                 }
                 None => {}
             }
@@ -611,6 +650,13 @@ impl App {
             18.0,
         );
         put(format!("step {}", e.edit_step), color::MUTED, 18.0);
+        if !e.song.tuning.is_equal_temperament() {
+            put(
+                format!("tuning: {}", e.song.tuning.name),
+                color::MUTED,
+                18.0,
+            );
+        }
         put(
             format!("follow {}", if self.follow { "on" } else { "off" }),
             color::MUTED,
@@ -629,8 +675,111 @@ impl App {
         );
     }
 
+    /// The slicer for sample tracks, the synth's knobs for synth tracks.
+    fn instrument_panel(&mut self, ui: &mut egui::Ui) {
+        if self.editor.on_synth() {
+            self.synth_panel(ui);
+        } else {
+            self.slicer(ui);
+        }
+    }
+
+    fn synth_panel(&mut self, ui: &mut egui::Ui) {
+        let Some((instrument, patch)) = self.editor.track_synth() else {
+            return;
+        };
+        let patch = patch.clone();
+        let font = Self::font();
+        let small = FontId::monospace(11.0);
+        let area = ui.max_rect();
+        let header = area.with_max_y(area.top() + 18.0);
+        let p = ui.painter();
+        let tuning = &self.editor.song.tuning;
+        p.text(
+            header.left_center() + vec2(8.0, 0.0),
+            Align2::LEFT_CENTER,
+            format!(
+                "synth: {} · {} · octave {} · tuning: {}",
+                patch.name,
+                patch.kind.name(),
+                self.editor.octave,
+                tuning.name
+            ),
+            font,
+            color::MUTED,
+        );
+        p.text(
+            header.right_center() - vec2(8.0, 0.0),
+            Align2::RIGHT_CENTER,
+            "notes: z-m and q-u · . note off · [ ] octave · drag knobs (shift: fine) · double-click resets",
+            small.clone(),
+            color::DIM,
+        );
+
+        let rect = Rect::from_min_max(
+            header.left_bottom() + vec2(8.0, 2.0),
+            area.right_bottom() - vec2(8.0, 6.0),
+        );
+        let response = ui.allocate_rect(rect, Sense::click_and_drag());
+        let specs = patch.kind.params();
+        let center = |i: usize| {
+            pos2(
+                rect.left() + 16.0 + (i as f32 + 0.5) * SYNTH_KNOB_CELL,
+                rect.top() + 34.0,
+            )
+        };
+        let knob_at = |pos: Pos2| (0..specs.len()).find(|&i| center(i).distance(pos) <= knob::HIT);
+        let shift = ui.input(|i| i.modifiers.shift);
+
+        if response.drag_started()
+            && let Some(pos) = ui.input(|i| i.pointer.press_origin())
+            && let Some(i) = knob_at(pos)
+        {
+            let start = specs[i].to_knob(patch.params[i]);
+            self.synth_drag = Some((instrument, i, pos.y, start, false));
+        }
+        if response.dragged()
+            && let Some((inst, param, start_y, start_knob, moved)) = &mut self.synth_drag
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let spec = &specs[*param];
+            let range = if shift {
+                knob::FINE_DRAG_RANGE
+            } else {
+                knob::DRAG_RANGE
+            };
+            let value = spec.from_knob(*start_knob + (*start_y - pos.y) / range);
+            self.editor.set_synth_param(*inst, *param, value, !*moved);
+            *moved = true;
+            if shift {
+                // Re-anchor so switching to fine control doesn't jump.
+                *start_y = pos.y;
+                *start_knob = spec.to_knob(value);
+            }
+        }
+        if response.drag_stopped() {
+            self.synth_drag = None;
+        }
+        if response.double_clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(i) = knob_at(pos)
+        {
+            self.editor
+                .set_synth_param(instrument, i, specs[i].default, true);
+        }
+
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 4.0, color::PANEL);
+        let patch = self.editor.track_synth().map_or(patch, |(_, p)| p.clone());
+        for (i, spec) in specs.iter().enumerate() {
+            knob::draw(&p, center(i), spec, patch.params[i], &small);
+        }
+    }
+
     fn slicer(&mut self, ui: &mut egui::Ui) {
-        let (instrument, sample) = self.editor.track_sample();
+        let Some((instrument, sample)) = self.editor.track_sample() else {
+            return;
+        };
         let sample = sample.clone();
         let font = Self::font();
         let small = FontId::monospace(11.0);
@@ -718,7 +867,10 @@ impl App {
         }
 
         // Draw the sample as it is now, after any edit above.
-        let sample = self.editor.track_sample().1.clone();
+        let sample = self
+            .editor
+            .track_sample()
+            .map_or(sample, |(_, s)| s.clone());
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 4.0, color::PANEL);
         if let Some((start, end)) = sample.slice_bounds(current) {
@@ -784,9 +936,9 @@ impl App {
                 font.clone(),
                 c,
             );
-            if let Some(Instrument::Sampler(s)) = e.song.instruments.get(track.instrument) {
+            if let Some(inst) = e.song.instruments.get(track.instrument) {
                 let room = (TRACK_CHARS + TRACK_GAP - 2).saturating_sub(track.name.chars().count());
-                let name: String = s.name.chars().take(room).collect();
+                let name: String = inst.name().chars().take(room).collect();
                 p.text(
                     r.right_top() + vec2(cw, 0.0),
                     Align2::LEFT_TOP,
@@ -868,7 +1020,12 @@ impl App {
                     p.rect_filled(sel, 0.0, color::SELECTION);
                 }
                 let track_color = color::TRACKS[t % color::TRACKS.len()];
-                for (field, text, c) in cell_fields(&track.cells[row], track_color) {
+                let synth = e
+                    .song
+                    .instruments
+                    .get(track.instrument)
+                    .is_some_and(Instrument::is_synth);
+                for (field, text, c) in cell_fields(&track.cells[row], track_color, synth) {
                     let pos = pos2(x + cw * field_offset(field) as f32, y + 1.0);
                     p.text(pos, Align2::LEFT_TOP, text, font.clone(), c);
                 }
@@ -881,14 +1038,23 @@ impl App {
         if (0..visible).contains(&i) && c.track < pattern.tracks.len() {
             let x = track_x(c.track) + cw * (field_offset(c.field) + c.digit) as f32;
             let y = top + i as f32 * ROW_HEIGHT;
-            let cell = Rect::from_min_size(pos2(x, y), vec2(cw, ROW_HEIGHT));
+            // A synth's note is one cursor position, three characters wide.
+            let synth = e.on_synth();
+            let whole = synth && c.field == Field::Slice;
+            let width = if whole { 3.0 } else { 1.0 };
+            let cell = Rect::from_min_size(pos2(x, y), vec2(cw * width, ROW_HEIGHT));
             p.rect_filled(cell, 1.0, color::ACCENT);
-            let ch = cell_fields(&pattern.tracks[c.track].cells[c.row], color::BG)
+            let text = cell_fields(&pattern.tracks[c.track].cells[c.row], color::BG, synth)
                 .into_iter()
                 .find(|(f, ..)| *f == c.field)
-                .and_then(|(_, text, _)| text.chars().nth(c.digit))
-                .unwrap_or(' ');
-            p.text(pos2(x, y + 1.0), Align2::LEFT_TOP, ch, font, color::BG);
+                .map(|(_, text, _)| text)
+                .unwrap_or_default();
+            let text: String = if whole {
+                text
+            } else {
+                text.chars().nth(c.digit).into_iter().collect()
+            };
+            p.text(pos2(x, y + 1.0), Align2::LEFT_TOP, text, font, color::BG);
         }
     }
 
@@ -899,6 +1065,7 @@ impl App {
                 PromptKind::SaveAs => "save as",
                 PromptKind::Open => "open",
                 PromptKind::LoadSample => "load sample (WAV) onto this track",
+                PromptKind::LoadTuning => "load tuning (Scala .scl) for synths",
             };
             return Some((
                 format!("{what}: {}▏   enter to confirm, esc to cancel", prompt.text),
@@ -988,6 +1155,8 @@ impl App {
             ("ctrl+s", "save"),
             ("ctrl+o", "open"),
             ("ctrl+l", "load sample"),
+            ("F5/F6", "acid/fm synth"),
+            ("ctrl+shift+l", "tuning"),
             ("ctrl+i", "next sample"),
             ("ctrl+n/d", "new/copy pattern"),
             ("ctrl+shift+←→", "slot plays"),
@@ -1022,9 +1191,15 @@ impl App {
 }
 
 /// The text of each field of a cell, with its color.
-fn cell_fields(cell: &Cell, track_color: Color32) -> Vec<(Field, String, Color32)> {
+/// On synth tracks the first field is a note name, and a note-off (a cut
+/// with no note) shows as `===`.
+fn cell_fields(cell: &Cell, track_color: Color32, synth: bool) -> Vec<(Field, String, Color32)> {
     let mut out = Vec::with_capacity(4);
     match cell.trigger {
+        Some(t) if synth => {
+            out.push((Field::Slice, note_name(t.slice.min(127) as u8), track_color));
+            out.push((Field::Velocity, format!("{:02X}", t.velocity), color::TEXT));
+        }
         Some(t) => {
             out.push((
                 Field::Slice,
@@ -1034,7 +1209,15 @@ fn cell_fields(cell: &Cell, track_color: Color32) -> Vec<(Field, String, Color32
             out.push((Field::Velocity, format!("{:02X}", t.velocity), color::TEXT));
         }
         None => {
-            out.push((Field::Slice, "··".into(), color::DIM));
+            let note_off = synth && cell.fx[0] == Some(crate::pattern::Fx::Cut(0));
+            let first = if note_off {
+                ("===", color::MUTED)
+            } else if synth {
+                ("···", color::DIM)
+            } else {
+                ("··", color::DIM)
+            };
+            out.push((Field::Slice, first.0.into(), first.1));
             out.push((Field::Velocity, "··".into(), color::DIM));
         }
     }
@@ -1092,7 +1275,7 @@ impl eframe::App for App {
                 egui::Panel::top("slicer")
                     .exact_size(130.0)
                     .frame(frame(color::BG))
-                    .show(ui, |ui| self.slicer(ui));
+                    .show(ui, |ui| self.instrument_panel(ui));
                 egui::Panel::bottom("status")
                     .exact_size(64.0)
                     .frame(frame(color::PANEL))

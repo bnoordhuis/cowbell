@@ -20,7 +20,6 @@ const JACK_Y: f32 = 44.0;
 const PANEL_GAP: f32 = 6.0;
 const MARGIN: f32 = 8.0;
 const ADD_BAR: f32 = 30.0;
-const KNOB_RADIUS: f32 = 15.0;
 const KNOB_CELL: f32 = 66.0;
 const JACK_RADIUS: f32 = 7.0;
 const JACK_CELL: f32 = 46.0;
@@ -88,7 +87,7 @@ impl Layout {
     fn knob_at(&self, p: Pos2) -> Option<(DeviceId, usize)> {
         self.knobs
             .iter()
-            .find(|(.., c)| c.distance(p) <= KNOB_RADIUS + 3.0)
+            .find(|(.., c)| c.distance(p) <= super::knob::HIT)
             .map(|&(d, i, _)| (d, i))
     }
 }
@@ -295,7 +294,11 @@ impl RackView {
                 Some(p),
             ) = (&mut self.drag, pointer)
         {
-            let scale = if shift { 600.0 } else { 150.0 };
+            let scale = if shift {
+                super::knob::FINE_DRAG_RANGE
+            } else {
+                super::knob::DRAG_RANGE
+            };
             let d = rack.device(*device).unwrap();
             let spec = &d.kind.params()[*param];
             let v = spec.from_knob(*start_knob + (*start_y - p.y) / scale);
@@ -423,42 +426,7 @@ impl RackView {
         }
         for &(id, param, c) in &l.knobs {
             let d = rack.device(id).unwrap();
-            let spec = &d.kind.params()[param];
-            let k = spec.to_knob(d.params[param]);
-            p.circle_filled(c, KNOB_RADIUS, color::BG);
-            p.circle_stroke(c, KNOB_RADIUS, Stroke::new(1.0, DEVICE_EDGE));
-            // 270 degree sweep, from bottom-left to bottom-right.
-            let angle = |k: f32| (135.0 + 270.0 * k).to_radians();
-            let arc: Vec<Pos2> = (0..=24)
-                .map(|s| {
-                    c + vec2(
-                        angle(k * s as f32 / 24.0).cos(),
-                        angle(k * s as f32 / 24.0).sin(),
-                    ) * (KNOB_RADIUS - 3.0)
-                })
-                .collect();
-            if arc.len() > 1 && k > 0.0 {
-                p.add(egui::Shape::line(arc, Stroke::new(2.5, color::ACCENT)));
-            }
-            let a = angle(k);
-            p.line_segment(
-                [c, c + vec2(a.cos(), a.sin()) * (KNOB_RADIUS - 2.0)],
-                Stroke::new(2.0, color::TEXT),
-            );
-            p.text(
-                c + vec2(0.0, KNOB_RADIUS + 3.0),
-                Align2::CENTER_TOP,
-                spec.name,
-                small.clone(),
-                color::MUTED,
-            );
-            p.text(
-                c + vec2(0.0, KNOB_RADIUS + 16.0),
-                Align2::CENTER_TOP,
-                spec.format(d.params[param]),
-                small.clone(),
-                color::TEXT,
-            );
+            super::knob::draw(p, c, &d.kind.params()[param], d.params[param], &small);
         }
         for &(jack, is_input, signal, c) in &l.jacks {
             let d = rack.device(jack.device).unwrap();

@@ -19,6 +19,8 @@ use crate::engine::MAX_TRACKS;
 use crate::pattern::{Cell, Instrument, Pattern, Song, Track};
 use crate::rack::Rack;
 use crate::sample::Sample;
+use crate::synthvoice::{SynthKind, SynthPatch};
+use crate::tuning::Tuning;
 
 pub const EXTENSION: &str = "cowbell";
 const FORMAT: u32 = 1;
@@ -31,13 +33,27 @@ struct ProjectFile {
     patterns: Vec<PatternFile>,
     order: Vec<usize>,
     rack: Rack,
+    #[serde(default)]
+    tuning: Tuning,
 }
 
 #[derive(Serialize, Deserialize)]
 struct InstrumentFile {
     name: String,
+    /// Samplers: the WAV file.
+    #[serde(default)]
     file: PathBuf,
+    #[serde(default)]
     slices: Vec<usize>,
+    /// Synths: which kind, and its knobs.
+    #[serde(default)]
+    synth: Option<SynthFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SynthFile {
+    kind: SynthKind,
+    params: Vec<f32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -87,7 +103,22 @@ pub fn save(song: &Song, path: &Path) -> Result<(), String> {
 
     let mut instruments = Vec::new();
     for (i, inst) in song.instruments.iter().enumerate() {
-        let Instrument::Sampler(sample) = inst;
+        let sample = match inst {
+            Instrument::Sampler(s) => s,
+            Instrument::Synth(p) => {
+                let synth = Some(SynthFile {
+                    kind: p.kind,
+                    params: p.params.clone(),
+                });
+                instruments.push(InstrumentFile {
+                    name: p.name.clone(),
+                    file: PathBuf::new(),
+                    slices: vec![],
+                    synth,
+                });
+                continue;
+            }
+        };
         let file = match &sample.path {
             Some(p) if p.exists() => relative_to(p, dir),
             _ => {
@@ -105,6 +136,7 @@ pub fn save(song: &Song, path: &Path) -> Result<(), String> {
             name: sample.name.clone(),
             file,
             slices: sample.slices.clone(),
+            synth: None,
         });
     }
 
@@ -139,6 +171,7 @@ pub fn save(song: &Song, path: &Path) -> Result<(), String> {
         patterns,
         order: song.order.clone(),
         rack: song.rack.clone(),
+        tuning: song.tuning.clone(),
     };
     // One cell per line, arrays on one line: compact, and diffs show which
     // cells changed.
@@ -170,6 +203,16 @@ pub fn load(path: &Path) -> Result<Song, String> {
 
     let mut instruments = Vec::new();
     for inst in &file.instruments {
+        if let Some(synth) = &inst.synth {
+            let mut patch = SynthPatch {
+                name: inst.name.clone(),
+                kind: synth.kind,
+                params: synth.params.clone(),
+            };
+            patch.repair();
+            instruments.push(Instrument::Synth(Arc::new(patch)));
+            continue;
+        }
         let wav = dir.join(&inst.file);
         let mut sample = Sample::load_wav(&wav).map_err(|e| format!("{}: {e}", wav.display()))?;
         sample.name = inst.name.clone();
@@ -234,6 +277,7 @@ pub fn load(path: &Path) -> Result<Song, String> {
         patterns,
         order,
         rack,
+        tuning: file.tuning,
     })
 }
 
@@ -250,7 +294,9 @@ mod tests {
     }
 
     fn frames(song: &Song, i: usize) -> &[[f32; 2]] {
-        let Instrument::Sampler(s) = &song.instruments[i];
+        let Instrument::Sampler(s) = &song.instruments[i] else {
+            panic!("not a sample")
+        };
         &s.frames
     }
 
@@ -280,7 +326,9 @@ mod tests {
             frames(&song, 0),
             "32-bit float WAV is lossless"
         );
-        let Instrument::Sampler(s) = &loaded.instruments[0];
+        let Instrument::Sampler(s) = &loaded.instruments[0] else {
+            panic!("not a sample")
+        };
         assert_eq!(s.slices, synth::demo_break(48_000, 172.0).slices);
         std::fs::remove_dir_all(dir).unwrap();
     }

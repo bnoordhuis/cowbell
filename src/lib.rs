@@ -12,7 +12,9 @@ pub mod project;
 pub mod rack;
 pub mod sample;
 pub mod synth;
+pub mod synthvoice;
 pub mod transform;
+pub mod tuning;
 #[cfg(feature = "ui")]
 pub mod ui;
 pub mod voice;
