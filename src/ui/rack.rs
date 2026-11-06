@@ -58,6 +58,7 @@ pub struct RackView {
     /// The rack as it was when the current mouse gesture started.
     before: Option<Rack>,
     scroll: f32,
+    wheel: super::knob::Wheel<(DeviceId, usize)>,
     /// Shown in the status bar: why the last patch didn't work.
     pub message: Option<String>,
 }
@@ -253,16 +254,36 @@ impl RackView {
         let mut changes = Vec::new();
         let mut undo = None;
 
-        // Scrolling.
         let content = ADD_BAR + rack.devices.len() as f32 * (PANEL_HEIGHT + PANEL_GAP) + MARGIN;
-        if response.hovered() {
-            self.scroll -= ui.input(|i| i.smooth_scroll_delta.y);
-        }
         self.scroll = self.scroll.clamp(0.0, (content - area.height()).max(0.0));
-
         let l = layout(rack, area, self.scroll, &font, ui);
         let pointer = ui.input(|i| i.pointer.interact_pos());
         let shift = ui.input(|i| i.modifiers.shift);
+
+        // The wheel turns the knob under the pointer, or scrolls the rack.
+        let hover = ui
+            .input(|i| i.pointer.hover_pos())
+            .filter(|_| response.hovered());
+        if let Some((device, param)) = hover.and_then(|p| l.knob_at(p)) {
+            let (delta, now) = ui.input(|i| (super::knob::wheel_delta(i), i.time));
+            let d = rack.device(device).unwrap();
+            let spec = &d.kind.params()[param];
+            if let Some((v, first)) =
+                self.wheel
+                    .turn((device, param), spec, d.params[param], delta, shift, now)
+            {
+                let before = rack.clone();
+                if let Some(v) = rack.set_param(device, param, v) {
+                    changes.push((device, param, v));
+                    if first {
+                        undo = Some(before);
+                    }
+                }
+            }
+        } else if hover.is_some() {
+            self.scroll -= ui.input(|i| i.smooth_scroll_delta.y);
+            self.scroll = self.scroll.clamp(0.0, (content - area.height()).max(0.0));
+        }
 
         // Interaction.
         if response.drag_started()
@@ -745,6 +766,49 @@ mod tests {
         let c = knob(&mut h, 0);
         click(&mut h, c);
         assert_eq!(h.rack.device(lfo).unwrap().params[0], rate);
+    }
+
+    #[test]
+    fn the_wheel_turns_the_knob_under_the_pointer() {
+        let mut rack = Rack::simple(1);
+        let lfo = rack.add(Kind::Lfo);
+        let mut h = Harness::new(rack);
+        let knob = |h: &mut Harness, param| {
+            h.layout()
+                .knobs
+                .iter()
+                .find(|k| k.0 == lfo && k.1 == param)
+                .unwrap()
+                .2
+        };
+        let wheel = |lines: f32| Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, lines),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        };
+        let depth = |h: &Harness| h.rack.device(lfo).unwrap().params[2];
+        let c = knob(&mut h, 2);
+        h.frame(vec![Event::PointerMoved(c)]);
+        let start = depth(&h);
+        h.frame(vec![wheel(-1.0)]);
+        h.frame(vec![wheel(-1.0)]);
+        assert!(depth(&h) < start, "down turns it down");
+        assert_eq!(h.undos, 1, "one gesture, one undo step");
+        h.frame(vec![wheel(3.0)]);
+        assert_eq!(depth(&h), start, "back up, and no further than the top");
+
+        // Switches step one choice per notch.
+        let c = knob(&mut h, 1);
+        h.frame(vec![Event::PointerMoved(c)]);
+        h.frame(vec![wheel(1.0)]);
+        assert_eq!(h.rack.device(lfo).unwrap().params[1], 1.0);
+        assert!(
+            h.changes
+                .iter()
+                .any(|&(d, p, v)| d == lfo && p == 1 && v == 1.0)
+        );
     }
 
     #[test]

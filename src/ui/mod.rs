@@ -315,6 +315,8 @@ struct App {
     /// A synth knob being dragged: (instrument, param, start y, start knob
     /// position, moved yet).
     synth_drag: Option<(usize, usize, f32, f32, bool)>,
+    /// Mouse wheel over a synth knob: (instrument, param).
+    synth_wheel: knob::Wheel<(usize, usize)>,
     palette: Option<palette::Palette>,
     tutorial: Option<Tutorial>,
     /// What the tutorial's current step has seen happen.
@@ -371,6 +373,7 @@ impl App {
             sensitivity: SENSITIVITY,
             marker_drag: None,
             synth_drag: None,
+            synth_wheel: knob::Wheel::default(),
             palette: None,
             tutorial: None,
             tutorial_facts: Facts::default(),
@@ -1106,7 +1109,7 @@ impl App {
         p.text(
             header.right_center() - vec2(8.0, 0.0),
             Align2::RIGHT_CENTER,
-            "notes: z-m and q-u · . note off · [ ] octave · drag knobs (shift: fine) · click switches · double-click resets",
+            "notes: z-m and q-u · . note off · [ ] octave · drag or scroll knobs (shift: fine) · click switches · double-click resets",
             small.clone(),
             color::DIM,
         );
@@ -1158,6 +1161,22 @@ impl App {
         }
         if response.drag_stopped() {
             self.synth_drag = None;
+        }
+        if response.hovered()
+            && let Some(pos) = ui.input(|i| i.pointer.hover_pos())
+            && let Some(i) = knob_at(pos)
+        {
+            let (delta, now) = ui.input(|i| (knob::wheel_delta(i), i.time));
+            if let Some((v, first)) = self.synth_wheel.turn(
+                (instrument, i),
+                &specs[i],
+                patch.params[i],
+                delta,
+                shift,
+                now,
+            ) {
+                self.editor.set_synth_param(instrument, i, v, first);
+            }
         }
         if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
@@ -1535,7 +1554,7 @@ impl App {
             font.clone(),
             c,
         );
-        let hints = "drag between jacks to patch · drag a plug out to unplug · drag knobs (shift: fine) · click switches · double-click resets · ctrl+z/y undo/redo";
+        let hints = "drag between jacks to patch · drag a plug out to unplug · drag or scroll knobs (shift: fine) · click switches · double-click resets · ctrl+z/y undo/redo";
         p.text(
             r.left_top() + vec2(8.0, 24.0),
             Align2::LEFT_TOP,

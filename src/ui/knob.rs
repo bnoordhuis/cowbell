@@ -6,7 +6,7 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Shape, Stroke, Vec2, vec2};
 
 use super::color;
-use crate::rack::ParamSpec;
+use crate::rack::{Curve, ParamSpec};
 
 /// Radius of a knob's body.
 pub const RADIUS: f32 = 20.0;
@@ -16,6 +16,14 @@ pub const HIT: f32 = RADIUS + 8.0;
 /// Pointer travel for the whole range, in points; shift is finer.
 pub const DRAG_RANGE: f32 = 150.0;
 pub const FINE_DRAG_RANGE: f32 = 600.0;
+/// Wheel travel for the whole range, in points; shift is finer.
+const WHEEL_RANGE: f32 = 1000.0;
+const FINE_WHEEL_RANGE: f32 = 4000.0;
+/// Wheel travel per step of a stepped knob, like a switch: about a notch.
+const WHEEL_NOTCH: f32 = 50.0;
+/// Seconds without scrolling that end a wheel gesture. Each gesture is
+/// one undo step.
+const WHEEL_PAUSE: f64 = 0.6;
 /// Narrowest cell a knob is laid out in.
 const CELL: f32 = 76.0;
 
@@ -35,6 +43,90 @@ const POINTER_LINE: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2a);
 const SWITCH_RADIUS: f32 = 15.0;
 const SWITCH_POINTER: f32 = 27.0;
 const STOP_LABEL: f32 = SWITCH_POINTER + 4.0;
+
+/// This frame's mouse wheel motion, in points, up positive. Read from the
+/// raw events: egui turns shift+wheel into sideways scrolling, and shift
+/// is fine control here.
+pub fn wheel_delta(input: &egui::InputState) -> f32 {
+    input
+        .raw
+        .events
+        .iter()
+        .map(|e| match e {
+            egui::Event::MouseWheel { unit, delta, .. } => {
+                let d = delta.y + delta.x;
+                match unit {
+                    egui::MouseWheelUnit::Point => d,
+                    egui::MouseWheelUnit::Line => d * WHEEL_NOTCH,
+                    egui::MouseWheelUnit::Page => d * WHEEL_NOTCH * 10.0,
+                }
+            }
+            _ => 0.0,
+        })
+        .sum()
+}
+
+/// Turning knobs with the mouse wheel. `K` names a knob, so a gesture
+/// that moves to another knob starts over.
+pub struct Wheel<K> {
+    last: Option<(K, f64)>,
+    /// Scrolling not yet turned into steps, for stepped knobs.
+    acc: f32,
+    /// The gesture hasn't changed anything yet, so its first change
+    /// should start an undo step.
+    fresh: bool,
+}
+
+impl<K> Default for Wheel<K> {
+    fn default() -> Self {
+        Wheel {
+            last: None,
+            acc: 0.0,
+            fresh: true,
+        }
+    }
+}
+
+impl<K: Copy + PartialEq> Wheel<K> {
+    /// Scroll `delta` points over knob `key` (up is positive) at time
+    /// `now`. Returns the new value, and whether it's the gesture's first
+    /// change, if the knob moves.
+    pub fn turn(
+        &mut self,
+        key: K,
+        spec: &ParamSpec,
+        value: f32,
+        delta: f32,
+        fine: bool,
+        now: f64,
+    ) -> Option<(f32, bool)> {
+        if delta == 0.0 {
+            return None;
+        }
+        let same = matches!(self.last, Some((k, t)) if k == key && now - t < WHEEL_PAUSE);
+        if !same {
+            self.acc = 0.0;
+            self.fresh = true;
+        }
+        self.last = Some((key, now));
+        self.acc += delta;
+        let v = if spec.curve == Curve::Steps {
+            let steps = (self.acc / WHEEL_NOTCH).trunc();
+            self.acc -= steps * WHEEL_NOTCH;
+            spec.clamp(value.round() + steps)
+        } else {
+            let range = if fine { FINE_WHEEL_RANGE } else { WHEEL_RANGE };
+            let k = spec.to_knob(value) + self.acc / range;
+            self.acc = 0.0;
+            spec.from_knob(k)
+        };
+        if v == value {
+            return None;
+        }
+        let first = std::mem::replace(&mut self.fresh, false);
+        Some((v, first))
+    }
+}
 
 /// Direction for knob position `k` (0..=1): a 270 degree sweep from
 /// bottom-left to bottom-right, clockwise.
@@ -217,8 +309,42 @@ mod tests {
     }
 
     #[test]
+    fn wheel_turns_knobs_and_steps_switches() {
+        let plain = ParamSpec::new("mix", 0.0, 1.0, 0.5, Curve::Linear, "");
+        let mut w = Wheel::default();
+        let (v, first) = w.turn(1, &plain, 0.5, 50.0, false, 0.0).unwrap();
+        assert!(first && (v - 0.55).abs() < 1e-4, "{v}");
+        let (v, first) = w.turn(1, &plain, v, -100.0, false, 0.1).unwrap();
+        assert!(!first && (v - 0.45).abs() < 1e-4, "{v}");
+        // Shift is finer.
+        let (v, _) = w.turn(1, &plain, 0.5, 40.0, true, 0.2).unwrap();
+        assert!((v - 0.51).abs() < 1e-4, "{v}");
+        // A pause, or another knob, starts a new undo step.
+        assert!(w.turn(1, &plain, 0.5, 50.0, false, 5.0).unwrap().1);
+        assert!(w.turn(2, &plain, 0.5, 50.0, false, 5.1).unwrap().1);
+
+        // Switches step a notch at a time, and stop at the ends.
+        let switch = ParamSpec::labelled("shape", 0.0, &["sine", "square", "s&h"]);
+        let mut w = Wheel::default();
+        assert_eq!(w.turn(0, &switch, 0.0, 30.0, false, 0.0), None);
+        assert_eq!(
+            w.turn(0, &switch, 0.0, 30.0, false, 0.05),
+            Some((1.0, true))
+        );
+        assert_eq!(
+            w.turn(0, &switch, 1.0, 50.0, false, 0.1),
+            Some((2.0, false))
+        );
+        assert_eq!(w.turn(0, &switch, 2.0, 50.0, false, 0.15), None);
+        assert_eq!(
+            w.turn(0, &switch, 2.0, -60.0, false, 0.2),
+            Some((1.0, false))
+        );
+    }
+
+    #[test]
     fn switches_get_room_for_their_labels() {
-        let plain = ParamSpec::new("cutoff", 40.0, 8000.0, 400.0, crate::rack::Curve::Exp, "Hz");
+        let plain = ParamSpec::new("cutoff", 40.0, 8000.0, 400.0, Curve::Exp, "Hz");
         let switch = ParamSpec::labelled("shape", 0.0, &["sine", "square", "s&h"]);
         assert_eq!(width(&plain, 7.0), CELL);
         let w = width(&switch, 7.0);
