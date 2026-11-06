@@ -18,7 +18,8 @@ use crate::document::Document;
 use crate::engine::{Command, Controller, Engine};
 use crate::graph::Graph;
 use crate::project;
-use crate::song::{Song, TICKS_PER_BAR, Target, Tick};
+use crate::song::{Song, TICKS_PER_BAR, TRACK_VOLUME, Target, Tick};
+use arrange::Edit;
 
 mod color {
     use eframe::egui::Color32;
@@ -155,6 +156,81 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, on: bool) -> egui::Response {
     response
 }
 
+/// What to select after an edit.
+#[derive(Debug, PartialEq)]
+enum Select {
+    Keep,
+    Clip(crate::song::ClipRef),
+    Track(usize),
+}
+
+/// Make an arrangement edit on `song`, or say why it can't be done.
+fn apply(song: &mut Song, edit: &Edit) -> Result<Select, String> {
+    /// A new clip: a bar of sixteenths, or what fits.
+    const NEW_RPB: u32 = 4;
+    const NEW_ROWS: usize = 16;
+    let full = || format!("can't: {} tracks is the most", crate::engine::MAX_TRACKS);
+    match *edit {
+        Edit::MoveClip { clip, track, start } => song
+            .move_clip(clip, track, start)
+            .map(Select::Clip)
+            .ok_or_else(|| "no room there".to_owned()),
+        Edit::ResizeClip { clip, rows } => {
+            if song.resize_clip(clip, rows) {
+                Ok(Select::Keep)
+            } else {
+                Err("no room: it would run into the next clip".into())
+            }
+        }
+        Edit::NewClip { track, start } => song
+            .new_clip(track, start, NEW_RPB, NEW_ROWS)
+            .map(Select::Clip)
+            .ok_or_else(|| "no room for a clip there".to_owned()),
+        Edit::DuplicateClip(clip) => song
+            .duplicate_clip(clip)
+            .map(Select::Clip)
+            .ok_or_else(|| "no room for a copy right after it".to_owned()),
+        Edit::DeleteClip(clip) => {
+            song.delete_clip(clip);
+            Ok(Select::Track(clip.0))
+        }
+        Edit::AddTrack(instrument) => {
+            let name = song
+                .instruments
+                .get(instrument)
+                .map_or("track", |i| i.name())
+                .to_owned();
+            song.add_track(&name, instrument)
+                .map(Select::Track)
+                .ok_or_else(full)
+        }
+        Edit::DuplicateTrack(t) => song.duplicate_track(t).map(Select::Track).ok_or_else(full),
+        Edit::DeleteTrack(t) => {
+            song.delete_track(t);
+            // The one that took its place; `select` keeps it in range.
+            Ok(Select::Track(t))
+        }
+        Edit::RenameTrack(t, ref name) => {
+            let track = song.tracks.get_mut(t).ok_or("no such track")?;
+            track.name = name.clone();
+            Ok(Select::Keep)
+        }
+        Edit::Volume(t, v) => song
+            .set_volume(t, v)
+            .map(|_| Select::Keep)
+            .ok_or_else(|| "no such track".to_owned()),
+        Edit::Mute(t) | Edit::Solo(t) => {
+            let track = song.tracks.get_mut(t).ok_or("no such track")?;
+            if matches!(edit, Edit::Mute(_)) {
+                track.mute ^= true;
+            } else {
+                track.solo ^= true;
+            }
+            Ok(Select::Keep)
+        }
+    }
+}
+
 struct App {
     doc: Document,
     controller: Controller,
@@ -181,6 +257,9 @@ struct App {
     /// close goes through.
     close_armed: bool,
     title: String,
+    /// The song as it was when the current drag in the arrangement
+    /// started, and whether the drag has changed anything yet.
+    gesture: Option<(Song, bool)>,
     #[cfg(feature = "screenshot")]
     screenshot: Option<screenshot::Screenshot>,
 }
@@ -221,6 +300,7 @@ impl App {
             message: None,
             close_armed: false,
             title: String::new(),
+            gesture: None,
             #[cfg(feature = "screenshot")]
             screenshot: screenshot::Screenshot::from_env(),
         }
@@ -313,6 +393,7 @@ impl App {
             // Knob turns don't bump the rack version, so rebuild the graph
             // to be sure it has the restored settings.
             self.rack_version = self.doc.song.rack.version.wrapping_add(1);
+            self.select(Select::Keep);
         }
     }
 
@@ -465,6 +546,17 @@ impl App {
                 self.doc.song.bpm = bpm;
                 self.doc.changed();
             }
+            let snap = arrange::SNAPS
+                .iter()
+                .find(|(t, _)| *t == self.arrange.snap)
+                .map_or("Beat", |(_, name)| name);
+            egui::ComboBox::from_id_salt("snap")
+                .selected_text(format!("Snap: {snap}"))
+                .show_ui(ui, |ui| {
+                    for (ticks, name) in arrange::SNAPS {
+                        ui.selectable_value(&mut self.arrange.snap, ticks, name);
+                    }
+                });
             ui.checkbox(&mut self.follow, "Follow");
             ui.add_space(16.0);
             ui.selectable_value(&mut self.view, View::Arrange, "Arrange");
@@ -496,7 +588,7 @@ impl App {
         );
         let hints = match self.view {
             View::Arrange => {
-                "space plays and stops · click the ruler to move the playhead · drag along it to set the loop · drag the tracks to move around · scroll up and down · ctrl+scroll to zoom"
+                "space plays and stops · drag clips to move them, their right edge to resize · double-click an empty spot for a new clip · right-click clips and tracks for more · drag empty space to move around · ctrl+scroll to zoom"
             }
             View::Rack => {
                 "drag between jacks to patch · drag a plug out to unplug · drag or scroll knobs (shift: fine) · click switches · double-click resets · right-click a knob to automate it"
@@ -524,17 +616,102 @@ impl App {
             self.loop_memory = range;
             self.set_loop(true);
         }
-        // Mute and solo are mixing, not editing: no undo step.
-        if let Some(t) = out.mute {
-            self.doc.song.tracks[t].mute ^= true;
-            self.doc.changed();
+        for edit in out.edits {
+            self.edit(edit);
         }
-        if let Some(t) = out.solo {
-            self.doc.song.tracks[t].solo ^= true;
-            self.doc.changed();
+        if let Some(edit) = out.live {
+            self.live_edit(edit);
+        }
+        if out.gesture_done
+            && let Some((before, changed)) = self.gesture.take()
+            && changed
+        {
+            self.doc.record(before);
         }
         if playing || ui.input(|i| i.pointer.any_down()) {
             ui.ctx().request_repaint();
+        }
+    }
+
+    /// Make an edit from the arrangement as one undo step.
+    fn edit(&mut self, edit: Edit) {
+        // Mute and solo are mixing, not editing: no undo step.
+        match edit {
+            Edit::Mute(t) | Edit::Solo(t) if t < self.doc.song.tracks.len() => {
+                let track = &mut self.doc.song.tracks[t];
+                if matches!(edit, Edit::Mute(_)) {
+                    track.mute ^= true;
+                } else {
+                    track.solo ^= true;
+                }
+                self.doc.changed();
+                return;
+            }
+            _ => {}
+        }
+        let before = self.doc.song.clone();
+        match apply(&mut self.doc.song, &edit) {
+            Ok(select) => {
+                self.doc.record(before);
+                self.select(select);
+                self.volume_to_engine(&edit);
+            }
+            Err(why) => {
+                self.doc.song = before;
+                self.say(why);
+            }
+        }
+    }
+
+    /// One step of a drag: made on the song as it was when the drag
+    /// started. A step that can't be made (a clip dragged onto another)
+    /// leaves the song as the last one that could.
+    fn live_edit(&mut self, edit: Edit) {
+        let (before, changed) = self
+            .gesture
+            .get_or_insert_with(|| (self.doc.song.clone(), false));
+        let mut song = before.clone();
+        if let Ok(select) = apply(&mut song, &edit) {
+            *changed = true;
+            self.doc.song = song;
+            self.doc.changed();
+            self.select(select);
+            self.volume_to_engine(&edit);
+        }
+    }
+
+    fn select(&mut self, select: Select) {
+        let a = &mut self.arrange;
+        match select {
+            Select::Keep => {}
+            Select::Clip(c) => {
+                a.selected_track = c.0;
+                a.selected_clip = Some(c);
+            }
+            Select::Track(t) => {
+                a.selected_track = t;
+                a.selected_clip = None;
+            }
+        }
+        let tracks = self.doc.song.tracks.len();
+        a.selected_track = a.selected_track.min(tracks.saturating_sub(1));
+        if a.selected_clip
+            .is_some_and(|c| self.doc.song.clip(c).is_none())
+        {
+            a.selected_clip = None;
+        }
+    }
+
+    /// Volume changes go straight to the engine, like knobs in the rack.
+    fn volume_to_engine(&mut self, edit: &Edit) {
+        if let Edit::Volume(t, value) = *edit
+            && let Some(d) = self.doc.song.rack.track_device(t)
+        {
+            let _ = self.controller.send(Command::SetParam {
+                device: d.id,
+                param: TRACK_VOLUME,
+                value,
+            });
         }
     }
 
@@ -666,5 +843,75 @@ impl eframe::App for App {
         if let Some(s) = &mut self.screenshot {
             s.update(&ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::song::{Clip, Track};
+
+    fn song() -> Song {
+        let a = Track::new("a", 0).with_clip(Clip::beats(0, 4, 4));
+        let b = Track::new("b", 0).with_clip(Clip::beats(0, 4, 4));
+        Song::new(120.0, Vec::new(), vec![a, b])
+    }
+
+    #[test]
+    fn edits_say_what_to_select() {
+        let mut s = song();
+        assert_eq!(
+            apply(&mut s, &Edit::DuplicateClip((0, 0))),
+            Ok(Select::Clip((0, 1)))
+        );
+        assert_eq!(
+            apply(
+                &mut s,
+                &Edit::MoveClip {
+                    clip: (0, 1),
+                    track: 1,
+                    start: 768
+                }
+            ),
+            Ok(Select::Clip((1, 1)))
+        );
+        assert_eq!(apply(&mut s, &Edit::DeleteTrack(0)), Ok(Select::Track(0)));
+        assert_eq!(s.tracks[0].name, "b");
+        assert_eq!(apply(&mut s, &Edit::AddTrack(0)), Ok(Select::Track(1)));
+        assert_eq!(s.tracks[1].name, "track", "no instrument to name it after");
+    }
+
+    #[test]
+    fn edits_that_cant_be_made_say_why() {
+        let mut s = song();
+        let e = apply(
+            &mut s,
+            &Edit::MoveClip {
+                clip: (0, 0),
+                track: 1,
+                start: 0,
+            },
+        );
+        assert_eq!(e, Err("no room there".to_owned()));
+        assert!(
+            apply(
+                &mut s,
+                &Edit::NewClip {
+                    track: 0,
+                    start: 10
+                }
+            )
+            .is_err()
+        );
+        assert!(apply(&mut s, &Edit::RenameTrack(9, "x".into())).is_err());
+    }
+
+    #[test]
+    fn volume_and_rename() {
+        let mut s = song();
+        apply(&mut s, &Edit::Volume(1, 0.25)).unwrap();
+        assert_eq!(s.volume(1), 0.25);
+        apply(&mut s, &Edit::RenameTrack(0, "kick".into())).unwrap();
+        assert_eq!(s.tracks[0].name, "kick");
     }
 }

@@ -64,6 +64,8 @@ pub struct Graph {
     gate_left: [u32; MAX_TRACKS],
     /// Per track: whether its voice fades instead of clicking.
     declick: [bool; MAX_TRACKS],
+    /// Per track: the track device's volume.
+    gain: [f32; MAX_TRACKS],
     /// Where the master device writes its output.
     master: usize,
 }
@@ -139,12 +141,14 @@ impl Graph {
 
         let mut tracks = [None; MAX_TRACKS];
         let mut declick = [true; MAX_TRACKS];
+        let mut gain = [1.0; MAX_TRACKS];
         for n in &nodes {
             if let Kind::Track(t) = n.kind
                 && t < MAX_TRACKS
             {
                 tracks[t] = Some((n.outputs[0], n.outputs[1]));
                 declick[t] = declick_param(&n.params);
+                gain[t] = volume_param(&n.params);
             }
         }
         Graph {
@@ -155,6 +159,7 @@ impl Graph {
             tracks,
             gate_left: [0; MAX_TRACKS],
             declick,
+            gain,
             master,
         }
     }
@@ -188,6 +193,7 @@ impl Graph {
             && t < MAX_TRACKS
         {
             self.declick[t] = declick_param(&n.params);
+            self.gain[t] = volume_param(&n.params);
         }
     }
 
@@ -211,7 +217,8 @@ impl Graph {
         let Some(&Some((audio, gate))) = self.tracks.get(track) else {
             return;
         };
-        self.bufs[audio][i] = frame;
+        let g = self.gain[track];
+        self.bufs[audio][i] = [frame[0] * g, frame[1] * g];
         if hit {
             self.gate_left[track] = (self.rate * GATE_MS / 1000.0) as u32;
         }
@@ -275,6 +282,10 @@ impl Graph {
 /// The track device's `declick` param. On if missing, like its default.
 fn declick_param(params: &[f32]) -> bool {
     params.first().is_none_or(|&v| v >= 0.5)
+}
+
+fn volume_param(params: &[f32]) -> f32 {
+    params.get(1).copied().unwrap_or(1.0)
 }
 
 fn run<'a>(
@@ -543,6 +554,23 @@ mod tests {
         assert!(!g.track_declick(1));
         g.set_param(t1, 0, 1.0);
         assert!(g.track_declick(1));
+    }
+
+    #[test]
+    fn track_volume_scales_its_output() {
+        let mut rack = Rack::simple(2);
+        let t1 = rack.track_device(1).unwrap().id;
+        rack.set_param(t1, 1, 0.5);
+        let mut g = Graph::build(&rack, RATE);
+        g.begin(1);
+        g.write_track(0, 0, [0.8, 0.8], false);
+        g.write_track(1, 0, [0.8, -0.4], false);
+        let (a, b) = (g.tracks[0].unwrap().0, g.tracks[1].unwrap().0);
+        assert_eq!(g.bufs[a][0], [0.8, 0.8], "full volume is exact");
+        assert_eq!(g.bufs[b][0], [0.4, -0.2]);
+        g.set_param(t1, 1, 0.0);
+        g.write_track(1, 0, [0.8, 0.8], false);
+        assert_eq!(g.bufs[b][0], [0.0, 0.0]);
     }
 
     #[test]

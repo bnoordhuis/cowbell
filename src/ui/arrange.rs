@@ -1,18 +1,26 @@
 //! The arrangement: one lane per track, its clips laid out on a timeline,
 //! with a bar ruler on top and the track headers on the left.
 //!
-//! Click the ruler to move the playhead; drag along it to set the loop.
-//! Click a clip or a lane to select it, drag there to move the view around.
-//! Scroll to scroll the tracks, ctrl+scroll to zoom.
+//! - Ruler: click to move the playhead, drag along it to set the loop.
+//! - Clips: drag to move (to another lane too), drag the right edge to
+//!   resize, right-click to duplicate or delete. Moves and resizes snap to
+//!   [`ArrangeView::snap`].
+//! - Empty lane: double-click for a new clip, drag to move the view.
+//! - Headers: mute, solo and a volume fader; right-click or double-click
+//!   the name to rename; right-click to duplicate or delete the track.
+//! - Scroll to scroll the tracks, ctrl+scroll to zoom.
+//!
+//! The view never changes the song itself. It reports edits, and the
+//! caller applies them (see [`Output`]).
 
 use std::ops::Range;
 
 use eframe::egui::{
-    self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2,
+    self, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2,
 };
 
 use super::color;
-use crate::song::{Clip, Instrument, Song, TICKS_PER_BAR, TICKS_PER_BEAT, Tick};
+use crate::song::{Clip, ClipRef, Instrument, Song, TICKS_PER_BAR, TICKS_PER_BEAT, Tick};
 
 pub const HEADER_W: f32 = 280.0;
 pub const RULER_H: f32 = 32.0;
@@ -21,6 +29,122 @@ const MIN_PX_PER_BEAT: f32 = 4.0;
 const MAX_PX_PER_BEAT: f32 = 400.0;
 /// Bar numbers closer than this skip some bars.
 const LABEL_GAP: f32 = 44.0;
+/// How close to a clip's right edge counts as grabbing the edge.
+const EDGE_GRAB: f32 = 8.0;
+/// How far the pointer must move before a press on a clip moves it.
+const DRAG_SLOP: f32 = 4.0;
+/// The volume fader's range, as on the track device.
+const MAX_VOLUME: f32 = 1.5;
+
+/// The grids moves and resizes snap to, with their names.
+pub const SNAPS: [(Tick, &str); 4] = [
+    (TICKS_PER_BAR, "Bar"),
+    (TICKS_PER_BEAT, "Beat"),
+    (TICKS_PER_BEAT / 4, "1/16"),
+    (1, "Off"),
+];
+
+/// One change to the song, for the caller to make.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Edit {
+    MoveClip {
+        clip: ClipRef,
+        track: usize,
+        start: Tick,
+    },
+    ResizeClip {
+        clip: ClipRef,
+        rows: usize,
+    },
+    NewClip {
+        track: usize,
+        start: Tick,
+    },
+    DuplicateClip(ClipRef),
+    DeleteClip(ClipRef),
+    /// A new track playing this instrument.
+    AddTrack(usize),
+    DuplicateTrack(usize),
+    DeleteTrack(usize),
+    RenameTrack(usize, String),
+    Volume(usize, f32),
+    Mute(usize),
+    Solo(usize),
+}
+
+/// What happened in the arrangement this frame.
+#[derive(Default, Debug, PartialEq)]
+pub struct Output {
+    /// Move the playhead here.
+    pub locate: Option<Tick>,
+    /// Set the loop range to this.
+    pub loop_range: Option<Range<Tick>>,
+    /// Edits to make now, each one undo step.
+    pub edits: Vec<Edit>,
+    /// Part of a mouse gesture (a drag): to be made on the song as it was
+    /// when the gesture started, replacing the gesture's previous edit.
+    pub live: Option<Edit>,
+    /// The gesture is over: what `live` did is one undo step.
+    pub gesture_done: bool,
+}
+
+enum Drag {
+    /// On the ruler: the beat it started on, where on screen, and whether
+    /// it has turned into a drag yet.
+    Ruler {
+        from: Tick,
+        x: f32,
+        moved: bool,
+    },
+    /// Moving the view: where the press was, and the scroll offsets then.
+    Pan {
+        from: Pos2,
+        scroll: f64,
+        scroll_y: f32,
+    },
+    /// Moving a clip, held `grab` ticks in from its start.
+    Move {
+        clip: ClipRef,
+        grab: f64,
+        from: Pos2,
+        moved: bool,
+    },
+    /// Stretching a clip's right edge.
+    Resize {
+        clip: ClipRef,
+        start: Tick,
+        ticks_per_row: Tick,
+        moved: bool,
+    },
+    Volume {
+        track: usize,
+    },
+}
+
+impl Drag {
+    /// Whether the drag has made edits that need an undo step.
+    fn edited(&self) -> bool {
+        match self {
+            Drag::Move { moved, .. } | Drag::Resize { moved, .. } => *moved,
+            Drag::Volume { .. } => true,
+            Drag::Ruler { .. } | Drag::Pan { .. } => false,
+        }
+    }
+}
+
+/// What a right-click menu is for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Context {
+    Clip(ClipRef),
+    Track(usize),
+}
+
+/// A track name being edited.
+struct Rename {
+    track: usize,
+    text: String,
+    focused: bool,
+}
 
 pub struct ArrangeView {
     /// Leftmost tick in view.
@@ -29,14 +153,12 @@ pub struct ArrangeView {
     pub scroll_y: f32,
     pub px_per_beat: f32,
     pub selected_track: usize,
-    /// (track, clip index).
-    pub selected_clip: Option<(usize, usize)>,
-    /// A press on the ruler: the beat it started on, where on screen, and
-    /// whether it has turned into a drag yet.
-    ruler_press: Option<(Tick, f32, bool)>,
-    /// A press in the lanes, dragging the view: where it started, and the
-    /// scroll offsets then.
-    pan: Option<(Pos2, f64, f32)>,
+    pub selected_clip: Option<ClipRef>,
+    /// Moves and resizes land on multiples of this.
+    pub snap: Tick,
+    drag: Option<Drag>,
+    context: Option<Context>,
+    rename: Option<Rename>,
 }
 
 impl Default for ArrangeView {
@@ -47,23 +169,12 @@ impl Default for ArrangeView {
             px_per_beat: 24.0,
             selected_track: 0,
             selected_clip: None,
-            ruler_press: None,
-            pan: None,
+            snap: TICKS_PER_BEAT,
+            drag: None,
+            context: None,
+            rename: None,
         }
     }
-}
-
-/// What happened in the arrangement this frame.
-#[derive(Default, Debug, PartialEq)]
-pub struct Output {
-    /// Move the playhead here.
-    pub locate: Option<Tick>,
-    /// Set the loop range to this.
-    pub loop_range: Option<Range<Tick>>,
-    /// Flip this track's mute.
-    pub mute: Option<usize>,
-    /// Flip this track's solo.
-    pub solo: Option<usize>,
 }
 
 /// Where everything is, worked out before drawing so hit testing uses the
@@ -80,10 +191,13 @@ struct Geometry {
 #[derive(Debug, PartialEq)]
 enum Hit {
     Ruler(f64),
-    Clip(usize, usize),
+    Clip(ClipRef),
+    ClipEdge(ClipRef),
     Lane(usize),
+    Header(usize),
     Mute(usize),
     Solo(usize),
+    Volume(usize),
     Nothing,
 }
 
@@ -96,6 +210,30 @@ fn header_button(header: Rect, which: usize) -> Rect {
         ),
         vec2(32.0, 28.0),
     )
+}
+
+/// A track header's volume fader: the groove.
+fn fader(header: Rect) -> Rect {
+    Rect::from_min_max(
+        pos2(header.left() + 42.0, header.top() + 97.0),
+        pos2(header.right() - 24.0, header.top() + 103.0),
+    )
+}
+
+/// Where the track name goes, for renaming in place.
+fn name_rect(header: Rect) -> Rect {
+    Rect::from_min_max(
+        header.left_top() + vec2(36.0, 16.0),
+        pos2(header.right() - 96.0, header.top() + 48.0),
+    )
+}
+
+fn db(volume: f32) -> String {
+    if volume <= 0.0 {
+        "−∞ dB".to_owned()
+    } else {
+        format!("{:+.1} dB", 20.0 * volume.log10())
+    }
 }
 
 impl Geometry {
@@ -152,6 +290,15 @@ impl Geometry {
         )
     }
 
+    /// The add-track button, under the last header.
+    fn add_track(&self, tracks: usize) -> Rect {
+        let top = self.lane_top(tracks);
+        Rect::from_min_max(
+            pos2(self.headers.left() + 12.0, top + 12.0),
+            pos2(self.headers.right() - 12.0, top + 52.0),
+        )
+    }
+
     fn hit(&self, p: Pos2, song: &Song) -> Hit {
         if self.ruler.contains(p) {
             return Hit::Ruler(self.tick_at(p.x));
@@ -171,22 +318,33 @@ impl Geometry {
             if header_button(header, 1).contains(p) {
                 return Hit::Solo(t);
             }
-        } else {
-            let tick = self.tick_at(p.x) as Tick;
-            if let Some(i) = song.tracks[t]
-                .clips
-                .iter()
-                .position(|c| c.span().contains(&tick))
-            {
-                return Hit::Clip(t, i);
+            if fader(header).expand2(vec2(8.0, 10.0)).contains(p) {
+                return Hit::Volume(t);
+            }
+            return Hit::Header(t);
+        }
+        for (i, clip) in song.tracks[t].clips.iter().enumerate() {
+            let r = self.clip_rect(t, clip);
+            if (r.right() - p.x).abs() <= EDGE_GRAB && p.x > r.left() + EDGE_GRAB {
+                return Hit::ClipEdge((t, i));
+            }
+            if r.left() <= p.x && p.x < r.right() {
+                return Hit::Clip((t, i));
             }
         }
         Hit::Lane(t)
     }
+
+    /// The volume a pointer at `x` sets on a fader.
+    fn volume_at(&self, track: usize, x: f32) -> f32 {
+        let f = fader(self.header_rect(track));
+        ((x - f.left()) / f.width()).clamp(0.0, 1.0) * MAX_VOLUME
+    }
 }
 
+/// `tick` rounded to the nearest multiple of `grid`.
 fn snap(tick: f64, grid: Tick) -> Tick {
-    (tick / grid as f64).round() as Tick * grid
+    (tick.max(0.0) / grid as f64).round() as Tick * grid
 }
 
 /// Bar.beat.sixteenth, all counting from 1.
@@ -208,43 +366,7 @@ impl ArrangeView {
         let g = Geometry::new(self, area);
         let pointer = ui.input(|i| i.pointer.interact_pos());
 
-        // Scrolling and zooming.
-        if response.hovered() {
-            let (delta, zoom) = ui.input(|i| {
-                let (mut d, mut zoom) = (egui::Vec2::ZERO, false);
-                for e in &i.raw.events {
-                    if let egui::Event::MouseWheel {
-                        unit,
-                        delta,
-                        modifiers,
-                        ..
-                    } = e
-                    {
-                        zoom |= modifiers.command;
-                        let scale = match unit {
-                            egui::MouseWheelUnit::Point => 1.0,
-                            egui::MouseWheelUnit::Line => 40.0,
-                            egui::MouseWheelUnit::Page => 400.0,
-                        };
-                        d += *delta * scale;
-                    }
-                }
-                (d, zoom)
-            });
-            if delta != egui::Vec2::ZERO {
-                if zoom {
-                    // The beat at the left edge stays put; the rest
-                    // stretches out to the right.
-                    let factor = (delta.y + delta.x).mul_add(0.002, 1.0).clamp(0.5, 2.0);
-                    self.px_per_beat =
-                        (self.px_per_beat * factor).clamp(MIN_PX_PER_BEAT, MAX_PX_PER_BEAT);
-                } else {
-                    // Sideways wheels and trackpads still move along.
-                    self.scroll = (self.scroll - delta.x as f64 / g.px_per_tick).max(0.0);
-                    self.scroll_y = self.clamp_y(self.scroll_y - delta.y, song, &g);
-                }
-            }
-        }
+        self.wheel(ui, &response, song, &g);
         if follow {
             let x = g.x(playhead as f64);
             if x < g.lanes.left() || x > g.lanes.right() - 20.0 {
@@ -254,69 +376,341 @@ impl ArrangeView {
         }
         let g = Geometry::new(self, area);
 
-        // Presses select, or start on the ruler.
-        let pressed = ui.input(|i| i.pointer.primary_pressed());
+        let (pressed, secondary) =
+            ui.input(|i| (i.pointer.primary_pressed(), i.pointer.secondary_pressed()));
         if pressed
+            && self.rename.is_none()
             && response.contains_pointer()
             && let Some(p) = ui.input(|i| i.pointer.press_origin())
         {
-            match g.hit(p, song) {
-                Hit::Ruler(tick) => {
-                    self.ruler_press = Some((snap(tick, TICKS_PER_BEAT), p.x, false))
-                }
-                Hit::Clip(t, i) => {
-                    self.selected_track = t;
-                    self.selected_clip = Some((t, i));
-                }
-                Hit::Lane(t) => {
-                    self.selected_track = t;
-                    self.selected_clip = None;
-                }
-                Hit::Mute(t) => out.mute = Some(t),
-                Hit::Solo(t) => out.solo = Some(t),
-                Hit::Nothing => {}
-            }
-            if g.lanes.contains(p) {
-                self.pan = Some((p, self.scroll, self.scroll_y));
-            }
+            self.press(p, &g, song, &mut out);
         }
-        if let (Some((from, scroll, scroll_y)), Some(p)) = (self.pan, pointer) {
-            let d = p - from;
-            self.scroll = (scroll - d.x as f64 / g.px_per_tick).max(0.0);
-            self.scroll_y = self.clamp_y(scroll_y - d.y, song, &g);
-        }
-        if !ui.input(|i| i.pointer.primary_down()) {
-            self.pan = None;
-        }
-        let g = Geometry::new(self, area);
-        if let (Some((from, x, moved)), Some(p)) = (&mut self.ruler_press, pointer) {
-            let to = g.tick_at(p.x);
-            if (*x - p.x).abs() > 4.0 {
-                *moved = true;
-            }
-            if *moved {
-                let a = snap((*from as f64).min(to), TICKS_PER_BAR);
-                let b = snap((*from as f64).max(to), TICKS_PER_BAR);
-                if b > a {
-                    out.loop_range = Some(a..b);
-                }
-            }
-        }
-        if !ui.input(|i| i.pointer.any_down())
-            && let Some((from, _, moved)) = self.ruler_press.take()
-            && !moved
+        if secondary
+            && response.contains_pointer()
+            && let Some(p) = pointer
         {
-            out.locate = Some(from);
+            self.context = match g.hit(p, song) {
+                Hit::Clip(c) | Hit::ClipEdge(c) => {
+                    self.selected_track = c.0;
+                    self.selected_clip = Some(c);
+                    Some(Context::Clip(c))
+                }
+                Hit::Header(t) | Hit::Volume(t) | Hit::Mute(t) | Hit::Solo(t) => {
+                    self.selected_track = t;
+                    Some(Context::Track(t))
+                }
+                _ => None,
+            };
         }
+        if let Some(p) = pointer {
+            self.drag_to(p, &g, song, &mut out);
+        }
+        if !ui.input(|i| i.pointer.primary_down())
+            && let Some(drag) = self.drag.take()
+        {
+            match drag {
+                Drag::Ruler {
+                    from, moved: false, ..
+                } => out.locate = Some(from),
+                d if d.edited() => out.gesture_done = true,
+                _ => {}
+            }
+        }
+        if response.double_clicked()
+            && let Some(p) = pointer
+        {
+            match g.hit(p, song) {
+                Hit::Lane(track) => {
+                    let start = (g.tick_at(p.x) / self.snap as f64).floor() as Tick * self.snap;
+                    out.edits.push(Edit::NewClip { track, start });
+                }
+                Hit::Header(track) if name_rect(g.header_rect(track)).contains(p) => {
+                    self.start_rename(track, song);
+                }
+                _ => {}
+            }
+        }
+        self.cursor(ui, pointer, &g, song);
 
         self.draw(ui, &g, song, playhead);
+        self.context_menu(&response, song, &mut out);
+        self.rename_box(ui, &g, &mut out);
+        self.add_track_button(ui, &g, song, &mut out);
         out
+    }
+
+    fn wheel(&mut self, ui: &egui::Ui, response: &egui::Response, song: &Song, g: &Geometry) {
+        if !response.hovered() {
+            return;
+        }
+        let (delta, zoom) = ui.input(|i| {
+            let (mut d, mut zoom) = (egui::Vec2::ZERO, false);
+            for e in &i.raw.events {
+                if let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                    ..
+                } = e
+                {
+                    zoom |= modifiers.command;
+                    let scale = match unit {
+                        egui::MouseWheelUnit::Point => 1.0,
+                        egui::MouseWheelUnit::Line => 40.0,
+                        egui::MouseWheelUnit::Page => 400.0,
+                    };
+                    d += *delta * scale;
+                }
+            }
+            (d, zoom)
+        });
+        if delta == egui::Vec2::ZERO {
+            return;
+        }
+        if zoom {
+            // The beat at the left edge stays put; the rest stretches out
+            // to the right.
+            let factor = (delta.y + delta.x).mul_add(0.002, 1.0).clamp(0.5, 2.0);
+            self.px_per_beat = (self.px_per_beat * factor).clamp(MIN_PX_PER_BEAT, MAX_PX_PER_BEAT);
+        } else {
+            // Sideways wheels and trackpads still move along.
+            self.scroll = (self.scroll - delta.x as f64 / g.px_per_tick).max(0.0);
+            self.scroll_y = self.clamp_y(self.scroll_y - delta.y, song, g);
+        }
+    }
+
+    fn press(&mut self, p: Pos2, g: &Geometry, song: &Song, out: &mut Output) {
+        match g.hit(p, song) {
+            Hit::Ruler(tick) => {
+                self.drag = Some(Drag::Ruler {
+                    from: snap(tick, TICKS_PER_BEAT),
+                    x: p.x,
+                    moved: false,
+                });
+            }
+            Hit::Clip(c) => {
+                self.selected_track = c.0;
+                self.selected_clip = Some(c);
+                let start = song.clip(c).map_or(0, |clip| clip.start);
+                self.drag = Some(Drag::Move {
+                    clip: c,
+                    grab: g.tick_at(p.x) - start as f64,
+                    from: p,
+                    moved: false,
+                });
+            }
+            Hit::ClipEdge(c) => {
+                self.selected_track = c.0;
+                self.selected_clip = Some(c);
+                if let Some(clip) = song.clip(c) {
+                    self.drag = Some(Drag::Resize {
+                        clip: c,
+                        start: clip.start,
+                        ticks_per_row: clip.ticks_per_row(),
+                        moved: false,
+                    });
+                }
+            }
+            Hit::Lane(t) => {
+                self.selected_track = t;
+                self.selected_clip = None;
+                self.drag = Some(Drag::Pan {
+                    from: p,
+                    scroll: self.scroll,
+                    scroll_y: self.scroll_y,
+                });
+            }
+            Hit::Header(t) => {
+                self.selected_track = t;
+                self.selected_clip = None;
+            }
+            Hit::Mute(t) => out.edits.push(Edit::Mute(t)),
+            Hit::Solo(t) => out.edits.push(Edit::Solo(t)),
+            Hit::Volume(t) => {
+                self.selected_track = t;
+                self.drag = Some(Drag::Volume { track: t });
+                out.live = Some(Edit::Volume(t, g.volume_at(t, p.x)));
+            }
+            Hit::Nothing => {}
+        }
+    }
+
+    fn drag_to(&mut self, p: Pos2, g: &Geometry, song: &Song, out: &mut Output) {
+        let snap_grid = self.snap;
+        let tracks = song.tracks.len();
+        match &mut self.drag {
+            Some(Drag::Ruler { from, x, moved }) => {
+                if (*x - p.x).abs() > DRAG_SLOP {
+                    *moved = true;
+                }
+                if *moved {
+                    let to = g.tick_at(p.x);
+                    let a = snap((*from as f64).min(to), TICKS_PER_BAR);
+                    let b = snap((*from as f64).max(to), TICKS_PER_BAR);
+                    if b > a {
+                        out.loop_range = Some(a..b);
+                    }
+                }
+            }
+            Some(Drag::Pan {
+                from,
+                scroll,
+                scroll_y,
+            }) => {
+                let d = p - *from;
+                let (scroll, scroll_y) = (*scroll, *scroll_y);
+                self.scroll = (scroll - d.x as f64 / g.px_per_tick).max(0.0);
+                self.scroll_y = self.clamp_y(scroll_y - d.y, song, g);
+            }
+            Some(Drag::Move {
+                clip,
+                grab,
+                from,
+                moved,
+            }) => {
+                if from.distance(p) > DRAG_SLOP {
+                    *moved = true;
+                }
+                if *moved && tracks > 0 {
+                    let start = snap(g.tick_at(p.x) - *grab, snap_grid);
+                    let track = g.lane_at(p.y).unwrap_or(0).min(tracks - 1);
+                    out.live = Some(Edit::MoveClip {
+                        clip: *clip,
+                        track,
+                        start,
+                    });
+                }
+            }
+            Some(Drag::Resize {
+                clip,
+                start,
+                ticks_per_row,
+                moved,
+            }) => {
+                let end = snap(g.tick_at(p.x), snap_grid).max(*start + *ticks_per_row);
+                let rows = ((end - *start) as f64 / *ticks_per_row as f64)
+                    .round()
+                    .max(1.0);
+                let rows = rows as usize;
+                if song.clip(*clip).is_some_and(|c| c.cells.len() != rows) {
+                    *moved = true;
+                }
+                if *moved {
+                    out.live = Some(Edit::ResizeClip { clip: *clip, rows });
+                }
+            }
+            Some(Drag::Volume { track }) => {
+                out.live = Some(Edit::Volume(*track, g.volume_at(*track, p.x)));
+            }
+            None => {}
+        }
+    }
+
+    fn cursor(&self, ui: &egui::Ui, pointer: Option<Pos2>, g: &Geometry, song: &Song) {
+        let icon = match &self.drag {
+            Some(Drag::Move { moved: true, .. } | Drag::Pan { .. }) => CursorIcon::Grabbing,
+            Some(Drag::Resize { .. }) => CursorIcon::ResizeHorizontal,
+            Some(_) => return,
+            None => match pointer.map(|p| g.hit(p, song)) {
+                Some(Hit::ClipEdge(_)) => CursorIcon::ResizeHorizontal,
+                Some(Hit::Clip(_)) => CursorIcon::Grab,
+                _ => return,
+            },
+        };
+        ui.ctx().set_cursor_icon(icon);
+    }
+
+    fn start_rename(&mut self, track: usize, song: &Song) {
+        if let Some(t) = song.tracks.get(track) {
+            self.rename = Some(Rename {
+                track,
+                text: t.name.clone(),
+                focused: false,
+            });
+        }
+    }
+
+    fn context_menu(&mut self, response: &egui::Response, song: &Song, out: &mut Output) {
+        let Some(context) = self.context else {
+            return;
+        };
+        let mut rename = None;
+        response.context_menu(|ui| match context {
+            Context::Clip(c) => {
+                if ui.button("Duplicate clip").clicked() {
+                    out.edits.push(Edit::DuplicateClip(c));
+                }
+                if ui.button("Delete clip").clicked() {
+                    out.edits.push(Edit::DeleteClip(c));
+                }
+            }
+            Context::Track(t) => {
+                if ui.button("Rename track").clicked() {
+                    rename = Some(t);
+                }
+                if ui.button("Duplicate track").clicked() {
+                    out.edits.push(Edit::DuplicateTrack(t));
+                }
+                if ui.button("Delete track").clicked() {
+                    out.edits.push(Edit::DeleteTrack(t));
+                }
+            }
+        });
+        if let Some(t) = rename {
+            self.start_rename(t, song);
+        }
+    }
+
+    fn rename_box(&mut self, ui: &mut egui::Ui, g: &Geometry, out: &mut Output) {
+        let Some(r) = &mut self.rename else {
+            return;
+        };
+        let edit = ui.put(
+            name_rect(g.header_rect(r.track)),
+            egui::TextEdit::singleline(&mut r.text).font(FontId::proportional(18.0)),
+        );
+        if !r.focused {
+            edit.request_focus();
+            r.focused = true;
+        } else if edit.lost_focus() {
+            let r = self.rename.take().unwrap();
+            let name = r.text.trim();
+            let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if !cancelled && !name.is_empty() {
+                out.edits.push(Edit::RenameTrack(r.track, name.to_owned()));
+            }
+        }
+    }
+
+    fn add_track_button(&mut self, ui: &mut egui::Ui, g: &Geometry, song: &Song, out: &mut Output) {
+        let rect = g.add_track(song.tracks.len());
+        if !g.headers.intersects(rect) {
+            return;
+        }
+        let builder = egui::UiBuilder::new().max_rect(rect);
+        ui.scope_builder(builder, |ui| {
+            ui.set_clip_rect(g.headers);
+            let button = egui::Button::new(egui::RichText::new("+ Add track").size(15.0))
+                .min_size(rect.size());
+            egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+                ui.label(egui::RichText::new("Plays").color(color::MUTED));
+                for (i, inst) in song.instruments.iter().enumerate() {
+                    if ui.button(inst.name()).clicked() {
+                        out.edits.push(Edit::AddTrack(i));
+                    }
+                }
+                if song.instruments.is_empty() {
+                    ui.label("no instruments yet");
+                }
+            });
+        });
     }
 
     /// Keep the tracks from scrolling away: no further than the last one
     /// at the bottom.
     fn clamp_y(&self, y: f32, song: &Song, g: &Geometry) -> f32 {
-        let content = song.tracks.len() as f32 * LANE_H;
+        // Room for the add-track button under the last track.
+        let content = song.tracks.len() as f32 * LANE_H + 64.0;
         y.clamp(0.0, (content - g.lanes.height()).max(0.0))
     }
 
@@ -352,11 +746,10 @@ impl ArrangeView {
             if !bar && beat_px < 10.0 {
                 continue;
             }
-            let c = if bar { color::BAR } else { color::BEAT };
             let c = if bar {
-                c.gamma_multiply(1.6)
+                color::BAR.gamma_multiply(1.6)
             } else {
-                c.gamma_multiply(1.3)
+                color::BEAT.gamma_multiply(1.3)
             };
             lanes.vline(x, g.lanes.y_range(), Stroke::new(1.0, c));
         }
@@ -392,6 +785,12 @@ impl ArrangeView {
                     color::TEXT,
                 );
                 draw_hits(&inner, g, clip, r, tint, synth);
+                // A grip on the right edge, for resizing.
+                let grip = Rect::from_min_max(
+                    pos2(r.right() - 6.0, r.center().y - 12.0),
+                    pos2(r.right() - 3.0, r.center().y + 12.0),
+                );
+                lanes.rect_filled(grip, 1.5, tint.gamma_multiply(0.7));
             }
         }
 
@@ -431,11 +830,7 @@ impl ArrangeView {
         p.rect_filled(g.headers, 0.0, color::PANEL);
         let headers = p.with_clip_rect(g.headers);
         for (t, track) in song.tracks.iter().enumerate() {
-            let top = g.lane_top(t);
-            let r = Rect::from_min_max(
-                pos2(g.headers.left(), top),
-                pos2(g.headers.right(), top + LANE_H),
-            );
+            let r = g.header_rect(t);
             if t == self.selected_track {
                 headers.rect_filled(r, 0.0, color::CURSOR_ROW);
                 headers.rect_filled(
@@ -446,13 +841,17 @@ impl ArrangeView {
             }
             let tint = color::TRACKS[t % color::TRACKS.len()];
             headers.circle_filled(r.left_top() + vec2(24.0, 32.0), 8.0, tint);
-            headers.text(
-                r.left_top() + vec2(42.0, 32.0),
-                Align2::LEFT_CENTER,
-                &track.name,
-                font.clone(),
-                color::TEXT,
-            );
+            if self.rename.as_ref().is_none_or(|n| n.track != t) {
+                headers
+                    .with_clip_rect(name_rect(r).intersect(g.headers))
+                    .text(
+                        r.left_top() + vec2(42.0, 32.0),
+                        Align2::LEFT_CENTER,
+                        &track.name,
+                        font.clone(),
+                        color::TEXT,
+                    );
+            }
             let instrument = song
                 .instruments
                 .get(track.instrument)
@@ -486,11 +885,31 @@ impl ArrangeView {
                     text,
                 );
             }
-            headers.hline(
-                g.headers.x_range(),
-                top + LANE_H,
-                Stroke::new(1.0, color::BG),
+            // The volume fader, with a mark at full (unity) volume.
+            let volume = song.volume(t);
+            let f = fader(r);
+            headers.rect_filled(f, 3.0, color::BG);
+            let x = f.left() + volume / MAX_VOLUME * f.width();
+            headers.rect_filled(
+                Rect::from_min_max(f.min, pos2(x, f.bottom())),
+                3.0,
+                tint.gamma_multiply(0.7),
             );
+            let unity = f.left() + f.width() / MAX_VOLUME;
+            headers.vline(
+                unity,
+                f.top() - 5.0..=f.bottom() + 5.0,
+                Stroke::new(1.0, color::DIM),
+            );
+            headers.circle_filled(pos2(x, f.center().y), 8.0, color::TEXT);
+            headers.text(
+                pos2(f.right(), f.top() - 10.0),
+                Align2::RIGHT_BOTTOM,
+                db(volume),
+                FontId::proportional(13.0),
+                color::MUTED,
+            );
+            headers.hline(g.headers.x_range(), r.bottom(), Stroke::new(1.0, color::BG));
         }
         p.vline(
             g.headers.right(),
@@ -553,7 +972,7 @@ fn draw_hits(p: &egui::Painter, g: &Geometry, clip: &Clip, r: Rect, tint: Color3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::song::{Cell, Track};
+    use crate::song::{Cell, TRACK_VOLUME, Track};
     use eframe::egui::{Event, Modifiers, PointerButton, RawInput};
 
     fn song() -> Song {
@@ -612,6 +1031,17 @@ mod tests {
                     / TICKS_PER_BEAT as f64) as f32
         }
 
+        fn lane(t: usize) -> f32 {
+            RULER_H + LANE_H * (t as f32 + 0.5)
+        }
+
+        fn header(t: usize) -> Rect {
+            Rect::from_min_size(
+                pos2(0.0, RULER_H + LANE_H * t as f32),
+                vec2(HEADER_W, LANE_H),
+            )
+        }
+
         fn press(&mut self, at: Pos2, pressed: bool) {
             self.frame(vec![Event::PointerButton {
                 pos: at,
@@ -650,6 +1080,18 @@ mod tests {
                 modifiers,
             }]);
         }
+
+        fn lives(&self) -> Vec<Edit> {
+            self.out.iter().filter_map(|o| o.live.clone()).collect()
+        }
+
+        fn edits(&self) -> Vec<Edit> {
+            self.out.iter().flat_map(|o| o.edits.clone()).collect()
+        }
+
+        fn done(&self) -> usize {
+            self.out.iter().filter(|o| o.gesture_done).count()
+        }
     }
 
     #[test]
@@ -682,20 +1124,106 @@ mod tests {
     #[test]
     fn clicks_select_clips_and_tracks() {
         let mut h = Harness::new();
-        let lane = |t: usize| RULER_H + LANE_H * (t as f32 + 0.5);
-        h.click(pos2(h.x(3 * TICKS_PER_BAR + 10), lane(1)));
+        h.click(pos2(h.x(3 * TICKS_PER_BAR + 10), Harness::lane(1)));
         assert_eq!(
             (h.view.selected_track, h.view.selected_clip),
             (1, Some((1, 0)))
         );
-        h.click(pos2(h.x(TICKS_PER_BAR), lane(1)));
+        h.click(pos2(h.x(TICKS_PER_BAR), Harness::lane(1)));
         assert_eq!(
             (h.view.selected_track, h.view.selected_clip),
             (1, None),
             "the gap"
         );
-        h.click(pos2(40.0, lane(0)));
+        h.click(pos2(40.0, Harness::lane(0)));
         assert_eq!(h.view.selected_track, 0, "the header");
+        assert!(h.out.is_empty(), "clicks change nothing");
+    }
+
+    #[test]
+    fn dragging_a_clip_moves_it_on_the_grid() {
+        let mut h = Harness::new();
+        // Grab the first clip a little in, drop it 2 beats and a bit later.
+        let from = pos2(h.x(50), Harness::lane(0));
+        let to = pos2(h.x(50 + 2 * TICKS_PER_BEAT + 40), Harness::lane(0));
+        h.drag(from, to);
+        assert_eq!(
+            h.lives().last(),
+            Some(&Edit::MoveClip {
+                clip: (0, 0),
+                track: 0,
+                start: 2 * TICKS_PER_BEAT
+            })
+        );
+        assert_eq!(h.done(), 1, "one undo step");
+        // To the lane below, on a bar grid.
+        h.out.clear();
+        h.view.snap = TICKS_PER_BAR;
+        h.drag(from, pos2(h.x(50 + TICKS_PER_BAR + 100), Harness::lane(1)));
+        assert_eq!(
+            h.lives().last(),
+            Some(&Edit::MoveClip {
+                clip: (0, 0),
+                track: 1,
+                start: TICKS_PER_BAR
+            })
+        );
+    }
+
+    #[test]
+    fn dragging_the_right_edge_resizes() {
+        let mut h = Harness::new();
+        // The first clip is 8 beats of 4 rows; pull its end to beat 10.
+        let edge = pos2(h.x(8 * TICKS_PER_BEAT) - 2.0, Harness::lane(0));
+        h.drag(edge, pos2(h.x(10 * TICKS_PER_BEAT) + 5.0, Harness::lane(0)));
+        assert_eq!(
+            h.lives().last(),
+            Some(&Edit::ResizeClip {
+                clip: (0, 0),
+                rows: 40
+            })
+        );
+        assert_eq!(h.done(), 1);
+    }
+
+    #[test]
+    fn double_click_on_an_empty_lane_makes_a_clip() {
+        let mut h = Harness::new();
+        let at = pos2(
+            h.x(TICKS_PER_BAR + 3 * TICKS_PER_BEAT + 50),
+            Harness::lane(1),
+        );
+        h.click(at);
+        h.click(at);
+        assert_eq!(
+            h.edits(),
+            vec![Edit::NewClip {
+                track: 1,
+                start: TICKS_PER_BAR + 3 * TICKS_PER_BEAT
+            }],
+            "starts on the beat it was clicked in"
+        );
+    }
+
+    #[test]
+    fn the_fader_sets_volume() {
+        let mut h = Harness::new();
+        let f = fader(Harness::header(1));
+        h.drag(f.center(), pos2(f.left() + f.width() / 3.0, f.center().y));
+        let last = h.lives().last().cloned();
+        let Some(Edit::Volume(1, v)) = last else {
+            panic!("{last:?}")
+        };
+        assert!((v - 0.5).abs() < 0.01, "{v}");
+        assert_eq!(h.done(), 1);
+    }
+
+    #[test]
+    fn header_buttons_flip_mute_and_solo() {
+        let mut h = Harness::new();
+        h.click(header_button(Harness::header(1), 0).center());
+        h.click(header_button(Harness::header(0), 1).center());
+        assert_eq!(h.edits(), vec![Edit::Mute(1), Edit::Solo(0)]);
     }
 
     #[test]
@@ -732,8 +1260,8 @@ mod tests {
         let lanes = 600.0 - RULER_H;
         assert_eq!(
             h.view.scroll_y,
-            10.0 * LANE_H - lanes,
-            "the last track at the bottom"
+            10.0 * LANE_H + 64.0 - lanes,
+            "the last track and the add button at the bottom"
         );
     }
 
@@ -751,23 +1279,7 @@ mod tests {
         // Not past the start.
         h.drag(pos2(400.0, 300.0), pos2(1100.0, 300.0));
         assert_eq!(h.view.scroll, 0.0);
-        assert!(h.out.is_empty(), "panning doesn't move the playhead");
-    }
-
-    #[test]
-    fn header_buttons_flip_mute_and_solo() {
-        let mut h = Harness::new();
-        let header = |t: usize| {
-            Rect::from_min_size(
-                pos2(0.0, RULER_H + LANE_H * t as f32),
-                vec2(HEADER_W, LANE_H),
-            )
-        };
-        h.click(header_button(header(1), 0).center());
-        h.click(header_button(header(0), 1).center());
-        let flips: Vec<_> = h.out.iter().map(|o| (o.mute, o.solo)).collect();
-        assert_eq!(flips, vec![(Some(1), None), (None, Some(0))]);
-        assert_eq!(h.view.selected_track, 0, "buttons don't select");
+        assert!(h.out.is_empty(), "panning changes nothing");
     }
 
     #[test]
@@ -777,5 +1289,14 @@ mod tests {
             position_text(TICKS_PER_BAR + 2 * TICKS_PER_BEAT + 96),
             "2.3.3"
         );
+        assert_eq!(db(1.0), "+0.0 dB");
+        assert_eq!(db(0.5), "-6.0 dB");
+    }
+
+    #[test]
+    fn volume_marks_unity() {
+        // The fader's full-volume mark matches the track device's default.
+        let spec = &crate::rack::Kind::Track(0).params()[TRACK_VOLUME];
+        assert_eq!((spec.default, spec.max), (1.0, MAX_VOLUME));
     }
 }

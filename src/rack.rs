@@ -240,7 +240,10 @@ impl Kind {
         const MASTER: &[ParamSpec] = &[ParamSpec::new("volume", 0.0, 1.5, 1.0, Linear, "")];
         // Short fades on cuts, steals and retriggers. Off gives hard edges,
         // clicks and all.
-        const TRACK: &[ParamSpec] = &[ParamSpec::labelled("declick", 1.0, &["off", "on"])];
+        const TRACK: &[ParamSpec] = &[
+            ParamSpec::labelled("declick", 1.0, &["off", "on"]),
+            ParamSpec::new("volume", 0.0, 1.5, 1.0, Linear, ""),
+        ];
         match self {
             Kind::Track(_) => TRACK,
             Kind::Crusher => CRUSHER,
@@ -494,6 +497,37 @@ impl Rack {
         self.version += 1;
     }
 
+    /// Make room for a new track `track`, shifting the ones from there on
+    /// down, and add its device.
+    pub fn insert_track(&mut self, track: usize) -> DeviceId {
+        for d in &mut self.devices {
+            if let Kind::Track(t) = &mut d.kind
+                && *t >= track
+            {
+                *t += 1;
+            }
+        }
+        self.add_track(track)
+    }
+
+    /// Remove track `track`'s device and its cables, shifting the tracks
+    /// after it up.
+    pub fn remove_track(&mut self, track: usize) {
+        if let Some(id) = self.track_device(track).map(|d| d.id) {
+            self.devices.retain(|d| d.id != id);
+            self.cables
+                .retain(|c| c.from.device != id && c.to.device != id);
+        }
+        for d in &mut self.devices {
+            if let Kind::Track(t) = &mut d.kind
+                && *t > track
+            {
+                *t -= 1;
+            }
+        }
+        self.version += 1;
+    }
+
     /// Track devices whose track no longer exists are removed.
     pub fn sync_tracks(&mut self, tracks: usize) {
         for t in 0..tracks.min(MAX_TRACKS) {
@@ -618,10 +652,34 @@ mod tests {
         rack.devices.iter_mut().find(|d| d.id == t).unwrap().params = vec![];
         rack.devices.iter_mut().find(|d| d.id == f).unwrap().params = vec![500.0];
         rack.repair();
-        assert_eq!(rack.device(t).unwrap().params, vec![1.0], "declick on");
+        assert_eq!(
+            rack.device(t).unwrap().params,
+            vec![1.0, 1.0],
+            "declick on, full volume"
+        );
         let defaults: Vec<f32> = Kind::Filter.params().iter().map(|p| p.default).collect();
         assert_eq!(rack.device(f).unwrap().params[0], 500.0);
         assert_eq!(rack.device(f).unwrap().params[1..], defaults[1..]);
+    }
+
+    #[test]
+    fn tracks_can_be_inserted_and_removed_in_the_middle() {
+        let mut rack = Rack::simple(3);
+        let ids: Vec<DeviceId> = (0..3).map(|t| rack.track_device(t).unwrap().id).collect();
+        let new = rack.insert_track(1);
+        assert_eq!(rack.track_device(1).unwrap().id, new);
+        assert_eq!(rack.track_device(2).unwrap().id, ids[1], "shifted down");
+        assert_eq!(rack.track_device(3).unwrap().id, ids[2]);
+        assert!(
+            rack.cables.iter().any(|c| c.from.device == new),
+            "plugged into the mixer"
+        );
+        rack.remove_track(0);
+        assert!(rack.device(ids[0]).is_none());
+        assert!(rack.cables.iter().all(|c| c.from.device != ids[0]));
+        assert_eq!(rack.track_device(0).unwrap().id, new, "shifted up");
+        assert_eq!(rack.track_device(2).unwrap().id, ids[2]);
+        assert!(rack.track_device(3).is_none());
     }
 
     #[test]

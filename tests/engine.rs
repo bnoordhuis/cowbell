@@ -312,7 +312,7 @@ fn cut_song(declick: bool) -> Song {
 fn declick_is_on_by_default() {
     let song = one_track_song(click(10), 120.0, 4, 1);
     let t = song.rack.track_device(0).unwrap();
-    assert_eq!(t.params, vec![1.0]);
+    assert_eq!(t.params, vec![1.0, 1.0], "declick on, full volume");
 }
 
 #[test]
