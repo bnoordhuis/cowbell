@@ -4,6 +4,8 @@
 //! Drag from a jack to another jack to patch. Drag a cable's plug out of an
 //! input to move it, or drop it anywhere else to unplug it. Drag knobs up and
 //! down (hold shift for fine control); double-click a knob to reset it.
+//! Switches (LFO shape, filter mode, declick) step through their choices on
+//! a click.
 
 use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2,
@@ -352,6 +354,8 @@ impl RackView {
         if response.double_clicked()
             && let Some(p) = pointer
             && let Some((device, param)) = l.knob_at(p)
+            // Switches step on every click instead.
+            && rack.device(device).unwrap().kind.params()[param].labels.is_empty()
         {
             let default = rack.device(device).unwrap().kind.params()[param].default;
             let before = rack.clone();
@@ -369,6 +373,14 @@ impl RackView {
                 self.scroll = f32::MAX; // show the new device at the bottom
             } else if let Some(&(id, _)) = l.removes.iter().find(|(_, r)| r.contains(p)) {
                 rack.remove(id);
+            } else if let Some((device, param)) = l.knob_at(p) {
+                let d = rack.device(device).unwrap();
+                if let Some(next) = d.kind.params()[param].next_choice(d.params[param])
+                    && let Some(v) = rack.set_param(device, param, next)
+                {
+                    changes.push((device, param, v));
+                    undo = Some(before.clone());
+                }
             }
             if !before.same_patch(rack) {
                 undo = Some(before);
@@ -691,5 +703,70 @@ mod tests {
         assert!(after > before * 1.5, "{before} -> {after}");
         assert_eq!(h.changes.last().copied(), Some((f, 0, after)));
         assert_eq!(h.undos, 1, "a whole drag is one undo step");
+    }
+
+    #[test]
+    fn clicking_a_switch_steps_through_its_choices() {
+        let mut rack = Rack::simple(1);
+        let lfo = rack.add(Kind::Lfo);
+        let mut h = Harness::new(rack);
+        let knob = |h: &mut Harness, param| {
+            h.layout()
+                .knobs
+                .iter()
+                .find(|k| k.0 == lfo && k.1 == param)
+                .unwrap()
+                .2
+        };
+        let click = |h: &mut Harness, pos| {
+            let button = |pressed| Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            h.frame(vec![Event::PointerMoved(pos)]);
+            h.frame(vec![button(true)]);
+            h.frame(vec![button(false)]);
+            h.frame(vec![]);
+        };
+        let shape = |h: &Harness| h.rack.device(lfo).unwrap().params[1];
+        for want in [1.0, 2.0, 0.0] {
+            let c = knob(&mut h, 1);
+            click(&mut h, c);
+            assert_eq!(shape(&h), want);
+        }
+        assert_eq!(h.undos, 3, "each click is an undo step");
+        // A plain knob doesn't move on a click.
+        let rate = h.rack.device(lfo).unwrap().params[0];
+        let c = knob(&mut h, 0);
+        click(&mut h, c);
+        assert_eq!(h.rack.device(lfo).unwrap().params[0], rate);
+    }
+
+    #[test]
+    fn dragging_a_labelled_knob_steps_through_its_choices() {
+        let mut rack = Rack::simple(1);
+        let lfo = rack.add(Kind::Lfo);
+        let mut h = Harness::new(rack);
+        let c = h
+            .layout()
+            .knobs
+            .iter()
+            .find(|k| k.0 == lfo && k.1 == 1)
+            .unwrap()
+            .2;
+        assert_eq!(h.rack.device(lfo).unwrap().params[1], 0.0, "starts at sine");
+        h.drag(c, c - vec2(0.0, 60.0));
+        assert_eq!(h.rack.device(lfo).unwrap().params[1], 1.0, "square");
+        let c2 = h
+            .layout()
+            .knobs
+            .iter()
+            .find(|k| k.0 == lfo && k.1 == 1)
+            .unwrap()
+            .2;
+        h.drag(c2, c2 - vec2(0.0, 60.0));
+        assert_eq!(h.rack.device(lfo).unwrap().params[1], 2.0, "s&h");
     }
 }

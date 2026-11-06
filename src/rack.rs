@@ -105,6 +105,15 @@ impl ParamSpec {
         })
     }
 
+    /// For switches (params with labels): the choice after `v`, wrapping
+    /// around. Clicking such a knob steps through its choices.
+    pub fn next_choice(&self, v: f32) -> Option<f32> {
+        if self.labels.is_empty() {
+            return None;
+        }
+        Some((v.round() + 1.0) % self.labels.len() as f32)
+    }
+
     pub fn format(&self, v: f32) -> String {
         if let Some(label) = self.labels.get(v.round() as usize) {
             return (*label).to_owned();

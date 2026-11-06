@@ -1108,7 +1108,7 @@ impl App {
         p.text(
             header.right_center() - vec2(8.0, 0.0),
             Align2::RIGHT_CENTER,
-            "notes: z-m and q-u · . note off · [ ] octave · drag knobs (shift: fine) · double-click resets",
+            "notes: z-m and q-u · . note off · [ ] octave · drag knobs (shift: fine) · click switches · double-click resets",
             small.clone(),
             color::DIM,
         );
@@ -1157,7 +1157,14 @@ impl App {
         if response.drag_stopped() {
             self.synth_drag = None;
         }
-        if response.double_clicked()
+        if response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(i) = knob_at(pos)
+            && let Some(next) = specs[i].next_choice(patch.params[i])
+        {
+            // Switches, like the acid wave, step on every click.
+            self.editor.set_synth_param(instrument, i, next, true);
+        } else if response.double_clicked()
             && let Some(pos) = response.interact_pointer_pos()
             && let Some(i) = knob_at(pos)
         {
@@ -1526,7 +1533,7 @@ impl App {
             font.clone(),
             c,
         );
-        let hints = "drag between jacks to patch · drag a plug out to unplug · drag knobs (shift: fine) · double-click resets · ctrl+z/y undo/redo";
+        let hints = "drag between jacks to patch · drag a plug out to unplug · drag knobs (shift: fine) · click switches · double-click resets · ctrl+z/y undo/redo";
         p.text(
             r.left_top() + vec2(8.0, 24.0),
             Align2::LEFT_TOP,
