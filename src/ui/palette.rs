@@ -172,8 +172,14 @@ pub fn commands() -> Vec<Command> {
         cmd(
             "Remove this order slot",
             "ctrl+delete",
-            "song delete",
+            "song delete pattern",
             e(DeleteSlot),
+        ),
+        cmd(
+            "Delete this pattern",
+            "ctrl+shift+delete",
+            "remove song order slots",
+            e(DeletePattern),
         ),
         cmd(
             "This slot plays the next pattern",

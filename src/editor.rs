@@ -110,8 +110,11 @@ pub enum Action {
     DuplicatePattern,
     /// Play the current pattern again in the next order slot.
     RepeatSlot,
-    /// Remove the current order slot.
+    /// Remove the current order slot, and its pattern if no other slot
+    /// plays it.
     DeleteSlot,
+    /// Delete the current pattern and every order slot that plays it.
+    DeletePattern,
     /// Make the current order slot play another pattern.
     SlotPattern(isize),
     /// Step the rows per beat through [`RESOLUTIONS`], keeping the timing
@@ -527,6 +530,7 @@ impl Editor {
             Action::DuplicatePattern => self.new_pattern(true),
             Action::RepeatSlot => self.repeat_slot(),
             Action::DeleteSlot => self.delete_slot(),
+            Action::DeletePattern => self.delete_pattern(),
             Action::SlotPattern(d) => self.slot_pattern(d),
             Action::Resolution(d) => self.step_resolution(d),
             Action::Length(d) => self.change_length(d),
@@ -911,11 +915,48 @@ impl Editor {
             return;
         }
         self.snapshot();
-        self.song.order.remove(self.cursor.order);
-        self.go_to(
-            self.cursor.order.min(self.song.order.len() - 1),
-            self.cursor.row,
-        );
+        let p = self.song.order.remove(self.cursor.order);
+        let order = self.cursor.order;
+        if !self.song.order.contains(&p) {
+            self.remove_pattern(p);
+            self.message = Some(format!(
+                "removed the slot and pattern {p:02X}, which no other slot played"
+            ));
+        }
+        self.go_to(order.min(self.song.order.len() - 1), self.cursor.row);
+    }
+
+    fn delete_pattern(&mut self) {
+        if self.song.patterns.len() < 2 {
+            self.message = Some("can't delete the only pattern".into());
+            return;
+        }
+        self.snapshot();
+        let p = self.pattern_index();
+        // Land on the slot after the ones that go away.
+        let order = self.song.order[..self.cursor.order]
+            .iter()
+            .filter(|&&i| i != p)
+            .count();
+        self.song.order.retain(|&i| i != p);
+        self.remove_pattern(p);
+        if self.song.order.is_empty() {
+            self.song.order.push(p.min(self.song.patterns.len() - 1));
+        }
+        self.go_to(order.min(self.song.order.len() - 1), self.cursor.row);
+        self.message = Some(format!("deleted pattern {p:02X}"));
+    }
+
+    /// Take pattern `p` out of the song, renumbering the order list. No
+    /// slot may still play it.
+    fn remove_pattern(&mut self, p: usize) {
+        debug_assert!(!self.song.order.contains(&p));
+        self.song.patterns.remove(p);
+        for i in &mut self.song.order {
+            if *i > p {
+                *i -= 1;
+            }
+        }
     }
 
     fn slot_pattern(&mut self, delta: isize) {
@@ -1755,6 +1796,49 @@ mod tests {
         e.apply(Action::DeleteSlot);
         e.apply(Action::DeleteSlot);
         assert_eq!(e.song.order.len(), 1, "the last slot stays");
+    }
+
+    #[test]
+    fn removing_a_patterns_last_slot_deletes_the_pattern() {
+        let mut e = editor();
+        e.apply(Action::NewPattern);
+        e.apply(Action::RepeatSlot);
+        assert_eq!(e.song.order, vec![0, 1, 1]);
+        e.apply(Action::DeleteSlot);
+        assert_eq!(e.song.patterns.len(), 2, "another slot still plays it");
+        e.go_to(0, 0);
+        e.apply(Action::DeleteSlot);
+        assert_eq!(e.song.order, vec![0]);
+        assert_eq!(e.song.patterns.len(), 1, "pattern 0 went, 1 became 0");
+        e.apply(Action::Undo);
+        assert_eq!(
+            (e.song.order.clone(), e.song.patterns.len()),
+            (vec![0, 1], 2)
+        );
+    }
+
+    #[test]
+    fn delete_pattern_takes_all_its_slots() {
+        let mut e = editor();
+        type_str(&mut e, "05");
+        e.apply(Action::NewPattern);
+        e.apply(Action::DuplicatePattern);
+        // Order 0 1 2 0 1 2, cursor on the second 1.
+        e.song.order = vec![0, 1, 2, 0, 1, 2];
+        e.go_to(4, 0);
+        e.apply(Action::DeletePattern);
+        assert_eq!(e.song.order, vec![0, 1, 0, 1]);
+        assert_eq!(e.song.patterns.len(), 2);
+        assert_eq!(e.cursor.order, 3, "the slot after the deleted one");
+        e.go_to(0, 0);
+        e.apply(Action::DeletePattern);
+        assert_eq!(e.song.order, vec![0, 0]);
+        e.apply(Action::DeletePattern);
+        assert_eq!(e.song.patterns.len(), 1, "the only pattern stays");
+        e.apply(Action::Undo);
+        e.apply(Action::Undo);
+        assert_eq!(e.song.order, vec![0, 1, 2, 0, 1, 2]);
+        assert_eq!(e.pattern().tracks[0].cells[0].trigger.unwrap().slice, 5);
     }
 
     #[test]

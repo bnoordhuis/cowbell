@@ -193,6 +193,7 @@ fn key_act(key: Key, m: Modifiers, view: View) -> Option<Act> {
         Key::End => edit(Bottom),
         Key::Tab if m.shift => edit(PrevTrack),
         Key::Tab => edit(NextTrack),
+        Key::Delete if m.command && m.shift => edit(DeletePattern),
         Key::Delete if m.command => edit(DeleteSlot),
         Key::Delete | Key::Backspace => edit(Clear),
         Key::N if m.command => edit(NewPattern),
