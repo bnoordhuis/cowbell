@@ -226,3 +226,31 @@ fn knob_effects_automate_rack_and_synth_knobs() {
     assert!(out[..quarter].iter().any(|s| s.abs() > 0.1));
     assert!(out[quarter + 1..].iter().all(|&s| s == 0.0));
 }
+
+#[test]
+fn held_audition_rings_until_released() {
+    use cowbell::engine::Command;
+    let rms = |b: &[f32]| (b.iter().map(|s| s * s).sum::<f32>() / b.len() as f32).sqrt();
+    let (mut engine, mut c) = Engine::new(RATE, sine_song(Tuning::default()));
+    let mut buf = vec![0.0; 2 * RATE as usize]; // one second
+    let audition = |hold| Command::Audition {
+        instrument: 0,
+        slice: 69,
+        velocity: 127,
+        hold,
+    };
+    // A short audition dies down within the second.
+    assert!(c.send(audition(false)).is_ok());
+    engine.process(&mut buf);
+    let tail = &buf[buf.len() - 4800..];
+    assert!(rms(tail) < 1e-3, "short audition still at {}", rms(tail));
+    // A held one is still going after a second, until released.
+    assert!(c.send(audition(true)).is_ok());
+    engine.process(&mut buf);
+    let tail = &buf[buf.len() - 4800..];
+    assert!(rms(tail) > 0.05, "held audition faded to {}", rms(tail));
+    assert!(c.send(Command::Release).is_ok());
+    engine.process(&mut buf);
+    let tail = &buf[buf.len() - 4800..];
+    assert!(rms(tail) < 1e-3, "released audition still at {}", rms(tail));
+}

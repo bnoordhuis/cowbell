@@ -208,6 +208,7 @@ fn audition_plays_while_stopped() {
         instrument: 0,
         slice: 0,
         velocity: 127,
+        hold: false,
     };
     assert!(controller.send(cmd).is_ok());
     engine.process(&mut buf);

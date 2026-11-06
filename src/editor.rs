@@ -256,6 +256,10 @@ fn set_nibble(value: u8, digit: usize, d: u8) -> u8 {
     }
 }
 
+/// The MIDI note that plays slice 00 on sample tracks: C-2 (36), where
+/// drum pads usually start.
+pub const MIDI_FIRST_SLICE: u8 = 36;
+
 impl Editor {
     pub fn new(song: Song) -> Self {
         assert!(
@@ -650,6 +654,46 @@ impl Editor {
             }
         }
         self.advance_after_entry();
+    }
+
+    /// A note from a MIDI keyboard. On synth tracks it's the note itself;
+    /// on sample tracks a slice, with [`MIDI_FIRST_SLICE`] as slice 00 and
+    /// one slice per key above it. With `enter` it goes into the cursor's
+    /// row, as typing would. Returns what to audition: the instrument and
+    /// the note or slice; `None` for a key with no slice.
+    pub fn midi_note(&mut self, note: u8, velocity: u8, enter: bool) -> Option<(usize, u16)> {
+        let synth = self.on_synth();
+        let value = if synth {
+            note.clamp(LOWEST_NOTE, HIGHEST_NOTE) as u16
+        } else {
+            let (_, sample) = self.track_sample()?;
+            let slice = note.checked_sub(MIDI_FIRST_SLICE)? as u16;
+            if slice as usize >= sample.slices.len() {
+                return None;
+            }
+            slice
+        };
+        let velocity = velocity.min(0x7f);
+        if enter {
+            let row = self.cursor.row;
+            let current = self.cell();
+            self.snapshot();
+            *self.cell_mut(row)? = Cell {
+                trigger: Some(Trigger {
+                    slice: value,
+                    velocity,
+                }),
+                ..current
+            };
+            if synth {
+                self.last_note = value as u8;
+            } else {
+                self.last_slice = value;
+            }
+            self.last_velocity = velocity;
+            self.step_down();
+        }
+        Some((self.instrument(), value))
     }
 
     fn enter_slice(&mut self, slice: u16) {
@@ -1409,6 +1453,35 @@ mod tests {
         assert!(cells[4..12].iter().all(|c| c.trigger.unwrap().slice == 3));
         assert_eq!(cells[11].fx[0], Some(Fx::Retrig(6)));
         assert_eq!(cells[12], Cell::default());
+    }
+
+    #[test]
+    fn midi_notes_enter_slices_or_notes() {
+        let mut e = editor();
+        let mut sample = Sample::new("s", 48_000, vec![[0.0; 2]; 10]);
+        sample.slices = vec![0, 3, 6];
+        e.song.instruments[0] = Instrument::Sampler(Arc::new(sample));
+        // Sample track: C-2 is slice 00, a key further up slice 01.
+        assert_eq!(e.midi_note(MIDI_FIRST_SLICE + 1, 90, true), Some((0, 1)));
+        let t = e.pattern().tracks[0].cells[0].trigger.unwrap();
+        assert_eq!((t.slice, t.velocity), (1, 90));
+        assert_eq!(e.cursor.row, 1, "steps down like typing");
+        // Below the first pad, or past the last slice: nothing.
+        assert_eq!(e.midi_note(MIDI_FIRST_SLICE - 1, 90, true), None);
+        assert_eq!(e.midi_note(127, 90, true), None);
+        // Audition only leaves the pattern alone.
+        let before = e.pattern().tracks[0].cells.clone();
+        assert!(e.midi_note(MIDI_FIRST_SLICE, 90, false).is_some());
+        assert_eq!(e.pattern().tracks[0].cells, before);
+        // Synth track: the note itself, one undo step each.
+        e.add_synth(SynthKind::Acid);
+        e.go_to(0, 4);
+        let (inst, note) = e.midi_note(62, 127, true).unwrap();
+        assert_eq!(note, 62);
+        assert!(e.song.instruments[inst].is_synth());
+        assert_eq!(e.pattern().tracks[0].cells[4].trigger.unwrap().slice, 62);
+        e.apply(Action::Undo);
+        assert_eq!(e.pattern().tracks[0].cells[4].trigger, None);
     }
 
     #[test]

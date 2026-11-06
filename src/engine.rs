@@ -26,12 +26,16 @@ pub enum Command {
     /// Start playing at this row.
     PlayFrom(Position),
     Stop,
-    /// Preview a slice, independent of the song.
+    /// Preview a slice or synth note, independent of the song. A held
+    /// synth note rings until [`Command::Release`]; otherwise it's short.
     Audition {
         instrument: usize,
         slice: u16,
         velocity: u8,
+        hold: bool,
     },
+    /// Release held audition notes.
+    Release,
     SetBpm(f64),
     /// Replace the song. Playback continues from the same order position and
     /// row, as far as the new song has them. Notes keep ringing if their
@@ -223,10 +227,12 @@ impl Engine {
                     self.row_clock = 0.0;
                     self.stop_voices();
                 }
+                Command::Release => self.synths[AUDITION].note_off_in(0.0),
                 Command::Audition {
                     instrument,
                     slice,
                     velocity,
+                    hold,
                 } => match self.song.instruments.get(instrument) {
                     Some(Instrument::Sampler(sample)) => {
                         let trigger = Trigger { slice, velocity };
@@ -244,7 +250,9 @@ impl Engine {
                         let freq = self.song.tuning.freq(slice.min(127) as u8);
                         let synth = &mut self.synths[AUDITION];
                         synth.note_on(instrument, &[freq], velocity, 0.0, self.out_rate);
-                        synth.note_off_in(0.3 * self.out_rate);
+                        if !hold {
+                            synth.note_off_in(0.3 * self.out_rate);
+                        }
                     }
                     None => {}
                 },

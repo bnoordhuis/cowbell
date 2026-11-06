@@ -6,6 +6,7 @@
 //! this module only maps keys to editor actions and draws the result.
 
 mod knob;
+mod midi;
 mod palette;
 mod rack;
 #[cfg(feature = "screenshot")]
@@ -120,6 +121,7 @@ enum Act {
     LengthBeats(isize),
     Palette,
     Tutorial,
+    RestartTutorial,
     /// Esc: skip a tutorial step.
     Escape,
 }
@@ -297,6 +299,10 @@ struct App {
     rack_version: u64,
     /// Where the project is saved, once it has been.
     path: Option<PathBuf>,
+    /// MIDI keyboards; opened on the first frame.
+    midi: Option<midi::Inputs>,
+    /// MIDI keys held down, to release the audition when the last one lifts.
+    midi_held: Vec<u8>,
     /// `editor.revision` when last saved or opened.
     saved_revision: u64,
     prompt: Option<Prompt>,
@@ -358,6 +364,8 @@ impl App {
             sample_rate,
             rack_version,
             path,
+            midi: None,
+            midi_held: Vec::new(),
             saved_revision: 0,
             prompt: None,
             close_armed: false,
@@ -502,10 +510,18 @@ impl App {
         }
     }
 
+    /// Load a Scala file, or a built-in tuning by name when there's no
+    /// such file.
     fn load_tuning(&mut self, path: PathBuf) {
-        let tuning = std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|t| Tuning::from_scala(&t));
+        let builtin = (!path.exists())
+            .then(|| path.to_str().and_then(crate::tuning::builtin))
+            .flatten();
+        let tuning = match builtin {
+            Some(t) => Ok(t),
+            None => std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| Tuning::from_scala(&t)),
+        };
         match tuning {
             Ok(t) => {
                 let name = t.name.clone();
@@ -518,7 +534,10 @@ impl App {
 
     fn export(&mut self, path: PathBuf) {
         self.editor.message = Some(match crate::export::export_wav(&self.editor.song, &path) {
-            Ok(seconds) => format!("exported {seconds:.1}s to {}", path.display()),
+            Ok(seconds) => {
+                self.tutorial_facts.exported = true;
+                format!("exported {seconds:.1}s to {}", path.display())
+            }
             Err(e) => format!("couldn't export: {e}"),
         });
     }
@@ -620,6 +639,53 @@ impl App {
         }
     }
 
+    /// MIDI keys audition what they play. While stopped, in the tracker,
+    /// they also enter it at the cursor; while playing you jam along
+    /// without writing anything.
+    fn handle_midi(&mut self, ctx: &egui::Context) {
+        #[cfg(feature = "screenshot")]
+        if self.screenshot.is_some() {
+            return;
+        }
+        let inputs = self
+            .midi
+            .get_or_insert_with(|| midi::Inputs::new(ctx.clone()));
+        let mut connected = Vec::new();
+        let msgs = inputs.poll(&mut connected);
+        if !connected.is_empty() {
+            self.editor.message = Some(format!("MIDI: {} connected", connected.join(", ")));
+        }
+        for msg in msgs {
+            match msg {
+                midi::Msg::NoteOn { note, velocity } => {
+                    let enter = self.view == View::Tracker
+                        && self.prompt.is_none()
+                        && self.palette.is_none()
+                        && !self.controller.is_playing();
+                    let Some((instrument, slice)) = self.editor.midi_note(note, velocity, enter)
+                    else {
+                        continue;
+                    };
+                    self.tutorial_facts.auditioned = true;
+                    self.midi_held.push(note);
+                    let _ = self.controller.send(Command::Audition {
+                        instrument,
+                        slice,
+                        velocity,
+                        hold: true,
+                    });
+                }
+                midi::Msg::NoteOff { note } => {
+                    let was_held = !self.midi_held.is_empty();
+                    self.midi_held.retain(|&n| n != note);
+                    if was_held && self.midi_held.is_empty() {
+                        let _ = self.controller.send(Command::Release);
+                    }
+                }
+            }
+        }
+    }
+
     fn palette_input(&mut self, event: &egui::Event) {
         let Some(p) = &mut self.palette else { return };
         match event {
@@ -651,8 +717,10 @@ impl App {
     }
 
     fn toggle_tutorial(&mut self) {
-        if self.tutorial.take().is_some() {
-            self.editor.message = Some("tutorial closed; F12 starts it again".into());
+        if self.tutorial.is_some() {
+            self.save_tutorial();
+            self.tutorial = None;
+            self.editor.message = Some("tutorial closed; F12 picks up where you left off".into());
             return;
         }
         if self.unsaved() && !self.tutorial_armed {
@@ -661,9 +729,30 @@ impl App {
                 Some("couldn't start: the tutorial replaces this song. ctrl+s to save it, or F12 again to go ahead".into());
             return;
         }
-        let song = tutorial::song();
+        let saved = self
+            .tutorial_dir()
+            .and_then(|d| tutorial::load_progress(&d));
+        let (tut, song) = match saved {
+            Some((tut, song)) => {
+                self.editor.message = Some(match tut.current() {
+                    Some(_) => format!(
+                        "resumed the tutorial at lesson {}, step {}. To start over: ? restart",
+                        tut.lesson + 1,
+                        tut.step + 1
+                    ),
+                    None => "you finished the tutorial. To start over: ? restart".into(),
+                });
+                (tut, song)
+            }
+            None => {
+                let song = tutorial::song();
+                (Tutorial::new(&song), song)
+            }
+        };
         let _ = self.controller.send(Command::Stop);
+        let message = self.editor.message.take();
         self.editor = Editor::new(song.clone());
+        self.editor.message = message;
         let _ = self
             .controller
             .send(Command::SwapSong(Box::new(song.clone())));
@@ -672,9 +761,40 @@ impl App {
         self.path = None;
         self.view = View::Tracker;
         self.scroll = 0;
-        self.tutorial = Some(Tutorial::new(&song));
+        self.tutorial = Some(tut);
         self.tutorial_facts = Facts::default();
         self.tutorial_armed = false;
+    }
+
+    /// Start the tutorial over from the first lesson, forgetting progress.
+    fn restart_tutorial(&mut self) {
+        if let Some(dir) = self.tutorial_dir() {
+            tutorial::clear_progress(&dir);
+        }
+        if self.tutorial.take().is_some() {
+            // Its song is the tutorial's own; nothing of yours to lose.
+            self.tutorial_armed = true;
+        }
+        self.toggle_tutorial();
+    }
+
+    /// Where tutorial progress goes; none while taking screenshots, so dev
+    /// runs don't touch your saved progress.
+    fn tutorial_dir(&self) -> Option<PathBuf> {
+        #[cfg(feature = "screenshot")]
+        if self.screenshot.is_some() {
+            return None;
+        }
+        tutorial::state_dir()
+    }
+
+    fn save_tutorial(&mut self) {
+        let (Some(t), Some(dir)) = (&self.tutorial, self.tutorial_dir()) else {
+            return;
+        };
+        if let Err(e) = tutorial::save_progress(&dir, t, &self.editor.song) {
+            self.editor.message = Some(format!("couldn't save tutorial progress: {e}"));
+        }
     }
 
     fn update_tutorial(&mut self) {
@@ -685,8 +805,10 @@ impl App {
         f.played |= playing;
         f.rack_view = self.view == View::Rack;
         f.palette_open = self.palette.is_some();
+        f.saved = self.path.is_some() && self.editor.revision == self.saved_revision;
         if t.update(&self.editor, *f) {
             *f = Facts::default();
+            self.save_tutorial();
         }
     }
 
@@ -710,7 +832,7 @@ impl App {
             ),
             None => (
                 "tutorial · done".to_owned(),
-                "That's every lesson so far. Keep playing with this song, or F12 to close and ctrl+o to open your own.",
+                "That's every lesson: you made a track from break to WAV. Keep going with this song, or F12 to close and ctrl+o to open your own.",
                 "F12",
             ),
         };
@@ -764,8 +886,10 @@ impl App {
                 if let Some(t) = &mut self.tutorial {
                     t.skip(&self.editor.song);
                     self.tutorial_facts = Facts::default();
+                    self.save_tutorial();
                 }
             }
+            Act::RestartTutorial => self.restart_tutorial(),
             // The rack view is for the mouse; editing keys stay with the
             // tracker so they can't change a pattern you can't see. Undo
             // and redo work in both, over one shared history.
@@ -847,6 +971,7 @@ impl App {
                 instrument,
                 slice,
                 velocity: 110,
+                hold: false,
             });
         }
         self.controller.collect_garbage();
@@ -930,10 +1055,14 @@ impl App {
             color::MUTED,
             18.0,
         );
-        let (text, c) = match &self.output {
+        let (mut text, c) = match &self.output {
             Ok(o) => (format!("{} · {} Hz", o.device, o.sample_rate), color::DIM),
             Err(err) => (format!("no audio: {err}"), color::ERROR),
         };
+        let keyboards: Vec<&str> = self.midi.iter().flat_map(|m| m.names()).collect();
+        if !keyboards.is_empty() {
+            text = format!("midi: {} · {text}", keyboards.join(", "));
+        }
         p.text(
             pos2(r.right() - 8.0, y),
             Align2::RIGHT_CENTER,
@@ -1359,7 +1488,9 @@ impl App {
                 PromptKind::SaveAs => "save as",
                 PromptKind::Open => "open",
                 PromptKind::LoadSample => "load sample (WAV) onto this track",
-                PromptKind::LoadTuning => "load tuning (Scala .scl) for synths",
+                PromptKind::LoadTuning => {
+                    "load tuning: a Scala .scl file, or just, stretched, slendro, pelog, 19-tet, 12-tet"
+                }
                 PromptKind::Export => "export the song to WAV",
             };
             return Some((
@@ -1549,6 +1680,7 @@ impl eframe::App for App {
             });
         }
         self.handle_input(&ctx);
+        self.handle_midi(&ctx);
         self.sync_engine();
 
         let title = format!("{} - cowbell", self.project_name());

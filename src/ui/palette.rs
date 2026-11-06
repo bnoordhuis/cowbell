@@ -72,6 +72,12 @@ pub fn commands() -> Vec<Command> {
             "help learn lesson guide",
             Act::Tutorial,
         ),
+        cmd(
+            "Restart the tutorial from lesson 1",
+            "",
+            "help learn lesson guide over reset",
+            Act::RestartTutorial,
+        ),
         cmd("Save", "ctrl+s", "file project", Act::Save),
         cmd(
             "Save as",
@@ -258,6 +264,11 @@ pub fn commands() -> Vec<Command> {
             "piano keyboard octave",
         ),
         info(
+            "MIDI keyboard: plays notes, or slices from C-2 up on sample tracks; enters them while stopped",
+            "midi",
+            "keyboard controller pads record jam",
+        ),
+        info(
             "Slicer: click hear · ctrl+click enter · shift+click add · drag move · right-click remove",
             "mouse",
             "markers slices",
@@ -416,9 +427,14 @@ mod tests {
 
     #[test]
     fn every_key_in_the_palette_is_described() {
-        // Each command has a name and a key or "mouse".
+        // Each command has a name; all but a few rare ones have keys.
         for c in commands() {
-            assert!(!c.name.is_empty() && !c.keys.is_empty(), "{}", c.name);
+            assert!(!c.name.is_empty(), "{}", c.name);
+            assert!(
+                !c.keys.is_empty() || matches!(c.act, Some(Act::RestartTutorial)),
+                "{}",
+                c.name
+            );
         }
     }
 }
