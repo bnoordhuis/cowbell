@@ -85,6 +85,10 @@ pub fn run(song: Song, path: Option<PathBuf>) -> Result<(), String> {
             .with_inner_size([1100.0, 720.0])
             .with_maximized(true)
             .with_title("cowbell"),
+        // Deliver ctrl+C/X/V as plain key events. Otherwise egui turns them
+        // into clipboard events and drops ctrl+V when the system clipboard
+        // holds no text, so pasting the editor's own clipboard did nothing.
+        clipboard_shortcuts: false,
         ..Default::default()
     };
     eframe::run_native(
@@ -183,7 +187,11 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
         Key::Z if m.command => edit(Undo),
         Key::Y if m.command => edit(Redo),
         Key::C if m.command => edit(Copy),
+        Key::X if m.command => edit(Cut),
         Key::V if m.command => edit(Paste),
+        Key::Copy => edit(Copy),
+        Key::Cut => edit(Cut),
+        Key::Paste => edit(Paste),
         Key::R if m.command => edit(Roll),
         Key::T if m.command => edit(AddTrack),
         Key::F if m.command => Some(Act::ToggleFollow),
@@ -376,7 +384,10 @@ impl App {
         if self.screenshot.is_none() {
             return;
         }
-        if let Some(n) = std::env::var("COWBELL_TUTORIAL").ok().and_then(|n| n.parse::<usize>().ok()) {
+        if let Some(n) = std::env::var("COWBELL_TUTORIAL")
+            .ok()
+            .and_then(|n| n.parse::<usize>().ok())
+        {
             // The script may have edited the demo song; replace it anyway.
             self.tutorial_armed = true;
             self.toggle_tutorial();
@@ -601,12 +612,6 @@ impl App {
                     }
                     None
                 }
-                egui::Event::Copy => Some(Act::Edit(Action::Copy)),
-                egui::Event::Cut => {
-                    self.editor.apply(Action::Copy);
-                    Some(Act::Edit(Action::Clear))
-                }
-                egui::Event::Paste(_) => Some(Act::Edit(Action::Paste)),
                 _ => None,
             };
             if let Some(act) = act {
@@ -1312,7 +1317,12 @@ impl App {
                     pos2(track_x(track) - cw * 0.5, y),
                     vec2(cw * (TRACK_CHARS as f32 + 1.0), ROW_HEIGHT),
                 );
-                p.rect_stroke(r, 2.0, Stroke::new(2.0, color::ACCENT), egui::StrokeKind::Outside);
+                p.rect_stroke(
+                    r,
+                    2.0,
+                    Stroke::new(2.0, color::ACCENT),
+                    egui::StrokeKind::Outside,
+                );
             }
         }
 
@@ -1677,6 +1687,21 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_keys_reach_the_editor() {
+        let ctrl = Modifiers::COMMAND;
+        for (key, want) in [
+            (Key::C, Action::Copy),
+            (Key::X, Action::Cut),
+            (Key::V, Action::Paste),
+        ] {
+            assert!(
+                matches!(key_act(key, ctrl), Some(Act::Edit(a)) if a == want),
+                "{key:?}"
+            );
+        }
+    }
 
     #[test]
     fn typed_paths_get_the_extension() {

@@ -101,6 +101,7 @@ pub fn commands() -> Vec<Command> {
         cmd("Undo", "ctrl+z", "back", e(Undo)),
         cmd("Redo", "ctrl+y", "forward", e(Redo)),
         cmd("Copy the selection", "ctrl+c", "clipboard", e(Copy)),
+        cmd("Cut the selection", "ctrl+x", "clipboard", e(Cut)),
         cmd("Paste", "ctrl+v", "clipboard", e(Paste)),
         cmd(
             "Clear the cell or selection",

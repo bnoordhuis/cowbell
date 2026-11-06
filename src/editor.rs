@@ -85,6 +85,7 @@ pub enum Action {
     Undo,
     Redo,
     Copy,
+    Cut,
     Paste,
     AddTrack,
     /// Render the selected rows (or the whole pattern) to a new sample on a
@@ -511,6 +512,7 @@ impl Editor {
             Action::Undo => self.undo_redo(true),
             Action::Redo => self.undo_redo(false),
             Action::Copy => self.copy(),
+            Action::Cut => self.cut(),
             Action::Paste => self.paste(),
             Action::AddTrack => self.add_track(),
             Action::Bounce => self.bounce(),
@@ -726,6 +728,20 @@ impl Editor {
         let p = self.pattern();
         if let Some(track) = p.tracks.get(self.cursor.track) {
             self.clipboard = track.cells[rows].to_vec();
+        }
+    }
+
+    /// Copy, then clear the selection (or the cursor's row) as one undo step.
+    fn cut(&mut self) {
+        self.copy();
+        let rows = self
+            .selection()
+            .unwrap_or(self.cursor.row..self.cursor.row + 1);
+        self.snapshot();
+        for row in rows {
+            if let Some(c) = self.cell_mut(row) {
+                *c = Cell::default();
+            }
         }
     }
 
@@ -1416,6 +1432,19 @@ mod tests {
             .map(|c| c.trigger.unwrap().slice)
             .collect();
         assert_eq!(slices, vec![1, 2]);
+
+        // Cut empties the rows and pastes them back.
+        e.go_to(0, 0);
+        e.apply(Action::SelectDown);
+        e.apply(Action::Cut);
+        assert!(
+            e.pattern().tracks[0].cells[..2]
+                .iter()
+                .all(|c| *c == Cell::default())
+        );
+        e.go_to(0, 4);
+        e.apply(Action::Paste);
+        assert_eq!(e.pattern().tracks[0].cells[5].trigger.unwrap().slice, 2);
     }
 
     #[test]
