@@ -15,14 +15,15 @@ use eframe::epaint::CubicBezierShape;
 use super::color;
 use crate::rack::{DeviceId, Jack, Kind, Rack, Signal};
 
-const PANEL_HEIGHT: f32 = 76.0;
+const PANEL_HEIGHT: f32 = 106.0;
 /// Jack centers, from the top of the panel. Labels go above them, because
 /// cables hang down.
-const JACK_Y: f32 = 44.0;
+const JACK_Y: f32 = 60.0;
+/// Knob centers, from the top of the panel.
+const KNOB_Y: f32 = 46.0;
 const PANEL_GAP: f32 = 6.0;
 const MARGIN: f32 = 8.0;
 const ADD_BAR: f32 = 30.0;
-const KNOB_CELL: f32 = 66.0;
 const JACK_RADIUS: f32 = 7.0;
 const JACK_CELL: f32 = 46.0;
 /// How close the pointer must be to a jack to grab or drop on it.
@@ -122,6 +123,7 @@ fn display_order(rack: &Rack) -> Vec<DeviceId> {
 }
 
 fn layout(rack: &Rack, area: Rect, scroll: f32, font: &FontId, ui: &egui::Ui) -> Layout {
+    let small_w = ui.fonts_mut(|f| f.glyph_width(&FontId::monospace(11.0), '0'));
     let mut adds = Vec::new();
     let mut x = area.left() + MARGIN;
     for kind in Kind::ADDABLE {
@@ -155,22 +157,23 @@ fn layout(rack: &Rack, area: Rect, scroll: f32, font: &FontId, ui: &egui::Ui) ->
                 Rect::from_min_size(panel.left_bottom() + vec2(10.0, -22.0), vec2(56.0, 16.0)),
             ));
         }
-        for p in 0..d.kind.params().len() {
-            let c = pos2(
-                panel.left() + 150.0 + (p as f32 + 0.5) * KNOB_CELL,
-                panel.top() + 28.0,
-            );
-            l.knobs.push((id, p, c));
+        // Knobs get cells as wide as they need: switches have labels
+        // around them.
+        let mut x = panel.left() + 150.0;
+        for (p, spec) in d.kind.params().iter().enumerate() {
+            let w = super::knob::width(spec, small_w);
+            l.knobs
+                .push((id, p, pos2(x + w / 2.0, panel.top() + KNOB_Y)));
+            x += w;
         }
         // Jacks start after the knobs, inputs then outputs. Different
         // devices end up with jacks at different x, so cables between them
         // don't all run down the same line.
         let (ins, outs) = (d.kind.inputs(), d.kind.outputs());
-        let n = d.kind.params().len();
-        let knobs_end = if n == 0 {
+        let knobs_end = if d.kind.params().is_empty() {
             190.0
         } else {
-            150.0 + n as f32 * KNOB_CELL + 50.0
+            x - panel.left() + 50.0
         };
         let x0 = panel.left() + knobs_end;
         let y = panel.top() + JACK_Y;

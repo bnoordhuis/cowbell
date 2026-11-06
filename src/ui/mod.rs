@@ -34,8 +34,6 @@ use crate::tutorial::{self, Facts, Focus, Tutorial};
 const SENSITIVITY: f32 = 0.6;
 /// How close, in points, the pointer must be to grab a slice marker.
 const MARKER_HIT: f32 = 6.0;
-/// Width of each knob in the synth panel.
-const SYNTH_KNOB_CELL: f32 = 76.0;
 
 mod color {
     use eframe::egui::Color32;
@@ -1119,13 +1117,17 @@ impl App {
         );
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
         let specs = patch.kind.params();
-        let center = |i: usize| {
-            pos2(
-                rect.left() + 16.0 + (i as f32 + 0.5) * SYNTH_KNOB_CELL,
-                rect.top() + 34.0,
-            )
-        };
-        let knob_at = |pos: Pos2| (0..specs.len()).find(|&i| center(i).distance(pos) <= knob::HIT);
+        let small_w = ui.fonts_mut(|f| f.glyph_width(&small, '0'));
+        let mut x = rect.left() + 16.0;
+        let centers: Vec<Pos2> = specs
+            .iter()
+            .map(|spec| {
+                let w = knob::width(spec, small_w);
+                x += w;
+                pos2(x - w / 2.0, rect.top() + 44.0)
+            })
+            .collect();
+        let knob_at = |pos: Pos2| (0..specs.len()).find(|&i| centers[i].distance(pos) <= knob::HIT);
         let shift = ui.input(|i| i.modifiers.shift);
 
         if response.drag_started()
@@ -1184,7 +1186,7 @@ impl App {
         for (i, spec) in specs.iter().enumerate() {
             let automated = self.editor.song.automation(self.editor.cursor.track)
                 == Some(Target::Synth { param: i });
-            knob::draw(&p, center(i), spec, patch.params[i], &small, automated);
+            knob::draw(&p, centers[i], spec, patch.params[i], &small, automated);
         }
     }
 
