@@ -11,6 +11,7 @@ mod palette;
 mod rack;
 #[cfg(feature = "screenshot")]
 mod screenshot;
+mod steps;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -143,12 +144,28 @@ struct Prompt {
 pub enum View {
     Tracker,
     Rack,
+    /// The step grid: the cursor's track as a drum machine or piano roll.
+    Steps,
 }
 
-fn key_act(key: Key, m: Modifiers) -> Option<Act> {
+fn key_act(key: Key, m: Modifiers, view: View) -> Option<Act> {
     use Action::*;
     let edit = |a| Some(Act::Edit(a));
     let bpm_step = if m.shift { 10.0 } else { 1.0 };
+    // In the step grid time runs left to right: the arrows step through
+    // rows, and up and down move the hit to another lane.
+    let plain = !(m.command || m.alt);
+    if view == View::Steps && plain {
+        match key {
+            Key::ArrowLeft if m.shift => return edit(SelectUp),
+            Key::ArrowRight if m.shift => return edit(SelectDown),
+            Key::ArrowLeft => return edit(Up),
+            Key::ArrowRight => return edit(Down),
+            Key::ArrowUp if !m.shift => return edit(Nudge(1)),
+            Key::ArrowDown if !m.shift => return edit(Nudge(-1)),
+            _ => {}
+        }
+    }
     match key {
         Key::ArrowUp if m.alt => Some(Act::Bpm(bpm_step)),
         Key::ArrowDown if m.alt => Some(Act::Bpm(-bpm_step)),
@@ -215,6 +232,7 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
         Key::Escape => Some(Act::Escape),
         Key::F1 => Some(Act::View(View::Tracker)),
         Key::F2 => Some(Act::View(View::Rack)),
+        Key::F3 => Some(Act::View(View::Steps)),
         _ => None,
     }
 }
@@ -292,6 +310,7 @@ struct App {
     scroll: usize,
     view: View,
     rack_view: rack::RackView,
+    step_view: steps::StepView,
     sample_rate: u32,
     /// The rack version the engine's graph was built from.
     rack_version: u64,
@@ -342,13 +361,13 @@ impl App {
         let sample_rate = output.as_ref().map_or(48_000, |o| o.sample_rate);
         let rack_version = editor.song.rack.version;
         #[cfg(feature = "screenshot")]
-        let view = if std::env::var("COWBELL_VIEW").as_deref() == Ok("rack") {
-            View::Rack
-        } else {
-            View::Tracker
+        let view = match std::env::var("COWBELL_VIEW").as_deref() {
+            Ok("rack") => View::Rack,
+            Ok("tracker") => View::Tracker,
+            _ => View::Steps,
         };
         #[cfg(not(feature = "screenshot"))]
-        let view = View::Tracker;
+        let view = View::Steps;
         #[allow(unused_mut)]
         let mut app = App {
             editor,
@@ -361,6 +380,7 @@ impl App {
             scroll: 0,
             view,
             rack_view: rack::RackView::default(),
+            step_view: steps::StepView::default(),
             sample_rate,
             rack_version,
             path,
@@ -621,11 +641,11 @@ impl App {
                     pressed: true,
                     modifiers,
                     ..
-                } => key_act(key, modifiers),
+                } => key_act(key, modifiers, self.view),
                 // Text arrives alongside its key event; skip it for shortcuts
                 // and for space, which is play/stop.
                 egui::Event::Text(text)
-                    if self.view == View::Tracker && !modifiers.command && !modifiers.alt =>
+                    if self.view != View::Rack && !modifiers.command && !modifiers.alt =>
                 {
                     for c in text.chars().filter(|c| !c.is_whitespace()) {
                         self.editor.apply(Action::Char(c));
@@ -659,7 +679,7 @@ impl App {
         for msg in msgs {
             match msg {
                 midi::Msg::NoteOn { note, velocity } => {
-                    let enter = self.view == View::Tracker
+                    let enter = self.view != View::Rack
                         && self.prompt.is_none()
                         && self.palette.is_none()
                         && !self.controller.is_playing();
@@ -897,7 +917,14 @@ impl App {
             Act::Edit(a)
                 if self.view == View::Rack && !matches!(a, Action::Undo | Action::Redo) => {}
             Act::Edit(a) => self.editor.apply(a),
-            Act::View(v) => self.view = v,
+            Act::View(v) => {
+                self.view = v;
+                if v == View::Steps {
+                    // The grid edits by the slice field.
+                    let (t, r) = (self.editor.cursor.track, self.editor.cursor.row);
+                    self.editor.select(t, r);
+                }
+            }
             Act::PlayToggle => {
                 let c = self.editor.cursor;
                 let cmd = if self.controller.is_playing() {
@@ -998,7 +1025,11 @@ impl App {
             x = rect.right() + gap;
         };
         put("cowbell".into(), color::ACCENT, 18.0);
-        for (view, label) in [(View::Tracker, "F1 tracker"), (View::Rack, "F2 rack")] {
+        for (view, label) in [
+            (View::Tracker, "F1 tracker"),
+            (View::Rack, "F2 rack"),
+            (View::Steps, "F3 steps"),
+        ] {
             let c = if self.view == view {
                 color::TEXT
             } else {
@@ -1611,20 +1642,36 @@ impl App {
         );
 
         // The essentials; ? lists everything else.
-        let hints = [
-            ("?", "all commands"),
-            ("F12", "tutorial"),
-            ("space", "play/stop"),
-            ("0-f", "enter"),
-            ("ORVPBSC", "effect"),
-            ("shift+↕", "select"),
-            ("ctrl+z/y", "undo/redo"),
-            ("ctrl+s", "save"),
-            ("ctrl+e", "export wav"),
-        ];
+        let hints: &[(&str, &str)] = if self.view == View::Steps {
+            &[
+                ("?", "all commands"),
+                ("F12", "tutorial"),
+                ("click", "add/remove"),
+                ("drag", "paint"),
+                ("right-click", "roll"),
+                ("wheel", "velocity"),
+                ("tab", "track"),
+                ("← →", "step"),
+                ("↑ ↓", "move hit"),
+                ("space", "play/stop"),
+                ("ctrl+z/y", "undo/redo"),
+            ]
+        } else {
+            &[
+                ("?", "all commands"),
+                ("F12", "tutorial"),
+                ("space", "play/stop"),
+                ("0-f", "enter"),
+                ("ORVPBSC", "effect"),
+                ("shift+↕", "select"),
+                ("ctrl+z/y", "undo/redo"),
+                ("ctrl+s", "save"),
+                ("ctrl+e", "export wav"),
+            ]
+        };
         let mut x = r.left() + 8.0;
         let mut y = r.top() + 24.0;
-        for (key, what) in hints {
+        for &(key, what) in hints {
             let width = (key.chars().count() + what.chars().count()) as f32 * self.char_width + 5.0;
             if x + width > r.right() - 8.0 {
                 x = r.left() + 8.0;
@@ -1767,6 +1814,32 @@ impl eframe::App for App {
                     _ => {}
                 }
             }
+            View::Steps => {
+                egui::Panel::top("slicer")
+                    .exact_size(130.0)
+                    .frame(frame(color::BG))
+                    .show(ui, |ui| self.instrument_panel(ui));
+                egui::Panel::bottom("status")
+                    .exact_size(64.0)
+                    .frame(frame(color::PANEL))
+                    .show(ui, |ui| self.status(ui));
+                if self.tutorial.is_some() {
+                    egui::Panel::bottom("tutorial")
+                        .exact_size(84.0)
+                        .frame(frame(color::CURSOR_ROW))
+                        .show(ui, |ui| self.tutorial_strip(ui));
+                }
+                let pos = self.controller.position();
+                let playhead = (self.controller.is_playing()
+                    && pos.order == self.editor.cursor.order)
+                    .then_some(pos.row);
+                egui::CentralPanel::default()
+                    .frame(frame(color::BG))
+                    .show(ui, |ui| self.step_view.show(ui, &mut self.editor, playhead));
+                if ui.input(|i| i.pointer.any_down()) || playhead.is_some() {
+                    ctx.request_repaint();
+                }
+            }
             View::Rack => {
                 egui::Panel::bottom("rack-status")
                     .exact_size(48.0)
@@ -1857,7 +1930,7 @@ mod tests {
             (Key::V, Action::Paste),
         ] {
             assert!(
-                matches!(key_act(key, ctrl), Some(Act::Edit(a)) if a == want),
+                matches!(key_act(key, ctrl, View::Tracker), Some(Act::Edit(a)) if a == want),
                 "{key:?}"
             );
         }

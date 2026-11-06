@@ -67,6 +67,12 @@ pub fn commands() -> Vec<Command> {
             Act::View(View::Rack),
         ),
         cmd(
+            "Step grid: the track as a drum machine or piano roll",
+            "F3",
+            "steps sequencer pads beat view",
+            Act::View(View::Steps),
+        ),
+        cmd(
             "Tutorial on or off",
             "F12",
             "help learn lesson guide",
@@ -267,6 +273,11 @@ pub fn commands() -> Vec<Command> {
             "MIDI keyboard: plays notes, or slices from C-2 up on sample tracks; enters them while stopped",
             "midi",
             "keyboard controller pads record jam",
+        ),
+        info(
+            "Step grid: click add/remove · drag paint · right-click roll · wheel velocity · ↑↓ move hit",
+            "mouse",
+            "steps pads drum machine piano roll",
         ),
         info(
             "Slicer: click hear · ctrl+click enter · shift+click add · drag move · right-click remove",

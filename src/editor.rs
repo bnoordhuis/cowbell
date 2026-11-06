@@ -120,6 +120,9 @@ pub enum Action {
     /// Lengthen or shorten the pattern by this many rows.
     Length(isize),
     EditStep(isize),
+    /// Move the hit under the cursor this many slices (notes on synth
+    /// tracks) up or down. The step grid's up and down arrows.
+    Nudge(isize),
 }
 
 impl Fx {
@@ -539,6 +542,7 @@ impl Editor {
             Action::EditStep(d) => {
                 self.edit_step = (self.edit_step as isize + d).clamp(0, 16) as usize
             }
+            Action::Nudge(d) => self.nudge(d),
         }
         // Moving without shift drops the selection; editing keeps it so you
         // can, say, roll and then clear the same rows.
@@ -708,6 +712,55 @@ impl Editor {
         self.last_slice = slice;
         self.audition = Some((self.instrument(), slice));
         self.step_down();
+    }
+
+    fn nudge(&mut self, delta: isize) {
+        let Some(t) = self.cell().trigger else {
+            return;
+        };
+        let (lo, hi) = if self.on_synth() {
+            (LOWEST_NOTE as isize, HIGHEST_NOTE as isize)
+        } else {
+            match self.track_sample() {
+                Some((_, s)) => (0, s.slices.len().max(1) as isize - 1),
+                None => return,
+            }
+        };
+        let slice = (t.slice as isize + delta).clamp(lo, hi) as u16;
+        if slice == t.slice {
+            return;
+        }
+        let row = self.cursor.row;
+        self.snapshot();
+        self.cell_mut(row).unwrap().trigger = Some(Trigger { slice, ..t });
+        self.audition = Some((self.instrument(), slice));
+    }
+
+    /// Put the cursor on a cell, for the step grid: it edits by the slice
+    /// field, so typing enters slices or notes.
+    pub fn select(&mut self, track: usize, row: usize) {
+        self.cursor.track = track;
+        self.cursor.row = row;
+        self.cursor.field = Field::Slice;
+        self.cursor.digit = 0;
+        self.anchor = None;
+        self.typing_in = None;
+        self.clamp_cursor();
+    }
+
+    /// Replace a track's cells in the current pattern, for mouse gestures
+    /// in the step grid. This doesn't record undo: [`Editor::capture`]
+    /// before the gesture and [`Editor::record`] it after.
+    pub fn set_track_cells(&mut self, track: usize, cells: &[Cell]) {
+        let p = self.pattern_index();
+        if let Some(t) = self.song.patterns[p].tracks.get_mut(track)
+            && t.cells.len() == cells.len()
+            && t.cells != cells
+        {
+            t.cells.copy_from_slice(cells);
+            self.typing_in = None;
+            self.changed();
+        }
     }
 
     fn advance_after_entry(&mut self) {
@@ -1453,6 +1506,39 @@ mod tests {
         assert!(cells[4..12].iter().all(|c| c.trigger.unwrap().slice == 3));
         assert_eq!(cells[11].fx[0], Some(Fx::Retrig(6)));
         assert_eq!(cells[12], Cell::default());
+    }
+
+    #[test]
+    fn nudge_moves_the_hit_and_stays_in_range() {
+        let mut e = editor_with(vec![0, 3, 6]);
+        e.apply(Action::EnterSlice(1));
+        e.apply(Action::Up);
+        e.apply(Action::Nudge(1));
+        assert_eq!(e.cell().trigger.unwrap().slice, 2);
+        e.apply(Action::Nudge(1));
+        assert_eq!(e.cell().trigger.unwrap().slice, 2, "no slice 03");
+        e.apply(Action::Nudge(-5));
+        assert_eq!(e.cell().trigger.unwrap().slice, 0);
+        e.apply(Action::Undo);
+        assert_eq!(e.cell().trigger.unwrap().slice, 2);
+        // An empty cell has nothing to move.
+        e.apply(Action::Down);
+        e.apply(Action::Nudge(1));
+        assert_eq!(e.cell().trigger, None);
+    }
+
+    #[test]
+    fn track_cells_change_without_an_undo_step() {
+        let mut e = editor();
+        let before = e.capture();
+        let mut cells = e.pattern().tracks[0].cells.clone();
+        cells[3] = Cell::hit(2, 0x40);
+        let rev = e.revision;
+        e.set_track_cells(0, &cells);
+        assert!(e.revision > rev && !e.can_undo());
+        e.record(before);
+        e.apply(Action::Undo);
+        assert_eq!(e.pattern().tracks[0].cells[3], Cell::default());
     }
 
     #[test]
