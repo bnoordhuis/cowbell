@@ -22,13 +22,7 @@ pub struct Screenshot {
 impl Screenshot {
     pub fn from_env(editor: &mut Editor) -> Option<Self> {
         let path = std::env::var("COWBELL_SCREENSHOT").ok()?;
-        if let Ok(keys) = std::env::var("COWBELL_KEYS") {
-            for action in parse_keys(&keys) {
-                editor.apply(action);
-            }
-            // Don't make a noise for slices typed by the script.
-            editor.audition = None;
-        }
+        apply_keys(editor);
         Some(Screenshot {
             path,
             frames: 0,
@@ -71,6 +65,17 @@ fn write_ppm(path: &str, image: &egui::ColorImage) -> std::io::Result<()> {
     std::fs::write(path, out)
 }
 
+/// Run the `COWBELL_KEYS` script, if any, on `editor`.
+pub fn apply_keys(editor: &mut Editor) {
+    if let Ok(keys) = std::env::var("COWBELL_KEYS") {
+        for action in parse_keys(&keys) {
+            editor.apply(action);
+        }
+        // Don't make a noise for slices typed by the script.
+        editor.audition = None;
+    }
+}
+
 fn parse_keys(script: &str) -> Vec<Action> {
     let mut actions = Vec::new();
     let mut rest = script;
@@ -90,6 +95,8 @@ fn parse_keys(script: &str) -> Vec<Action> {
                 "ctrl-left" => Action::PrevOrder,
                 "roll" => Action::Roll,
                 "bounce" => Action::Bounce,
+                "variations" => Action::Variations,
+                "interpolate" => Action::Interpolate,
                 "addtrack" => Action::AddTrack,
                 "acid" => Action::AddSynth(crate::synthvoice::SynthKind::Acid),
                 "fm" => Action::AddSynth(crate::synthvoice::SynthKind::Fm),

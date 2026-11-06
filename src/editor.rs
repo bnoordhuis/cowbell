@@ -8,7 +8,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::pattern::{Cell, Fx, Instrument, MAX_FX, Pattern, Song, Trigger};
+use crate::pattern::{Cell, Fx, Instrument, MAX_FX, Pattern, Song, Target, Trigger};
 use crate::rack::Rack;
 use crate::sample::Sample;
 use crate::synthvoice::{SynthKind, SynthPatch};
@@ -94,6 +94,12 @@ pub enum Action {
     Octave(isize),
     /// Put a new synth on the cursor's track.
     AddSynth(SynthKind),
+    /// Fill the selection's effect or velocity column between its first
+    /// and last value.
+    Interpolate,
+    /// Add variations of the current pattern after it in the order list,
+    /// varying the cursor's track (its selection, if any).
+    Variations,
     /// Cycle the instrument of the cursor's track.
     NextInstrument,
     PrevInstrument,
@@ -126,6 +132,8 @@ impl Fx {
             Fx::Stutter(_) => 'S',
             Fx::Cut(_) => 'C',
             Fx::Glide(_) => 'G',
+            Fx::Chord(_) => 'H',
+            Fx::Knob(_) => 'K',
         }
     }
 
@@ -136,7 +144,9 @@ impl Fx {
             | Fx::Crush(n)
             | Fx::Stutter(n)
             | Fx::Cut(n)
-            | Fx::Glide(n) => n,
+            | Fx::Glide(n)
+            | Fx::Chord(n)
+            | Fx::Knob(n) => n,
             Fx::Pitch(n) => n as u8,
             Fx::Reverse => 1,
         }
@@ -152,6 +162,8 @@ impl Fx {
             'S' => Fx::Stutter(param),
             'C' => Fx::Cut(param),
             'G' => Fx::Glide(param),
+            'H' => Fx::Chord(param),
+            'K' => Fx::Knob(param),
             _ => return None,
         })
     }
@@ -167,6 +179,11 @@ impl Fx {
             Fx::Stutter(n) => format!("loop the first {n} ms"),
             Fx::Cut(n) => format!("cut after {n}/16 of the row"),
             Fx::Glide(n) => format!("glide over {} ms", n as u32 * 4),
+            Fx::Knob(n) => format!("automated knob to {:.0}%", n as f32 / 2.55),
+            Fx::Chord(n) => {
+                let notes: Vec<String> = Fx::chord_intervals(n).map(|i| format!("+{i}")).collect();
+                format!("chord: root {}", notes.join(" "))
+            }
         }
     }
 }
@@ -178,6 +195,7 @@ impl Fx {
 pub struct Snapshot {
     patterns: Vec<Pattern>,
     order: Vec<usize>,
+    automation: Vec<Option<Target>>,
     rack: Rack,
     instruments: Vec<Instrument>,
 }
@@ -194,6 +212,8 @@ pub struct Editor {
     pub last_note: u8,
     /// The octave note keys enter on synth tracks; 4 is middle C.
     pub octave: u8,
+    /// Seed for the next set of variations.
+    pub seed: u32,
     /// Set when the song changed and the engine needs the new version.
     pub dirty: bool,
     /// Counts changes, so the UI can tell whether there are unsaved ones.
@@ -256,6 +276,7 @@ impl Editor {
             last_velocity: 0x7f,
             last_note: 60,
             octave: 4,
+            seed: 0x5eed,
             dirty: false,
             revision: 0,
             audition: None,
@@ -312,6 +333,7 @@ impl Editor {
         Snapshot {
             patterns: self.song.patterns.clone(),
             order: self.song.order.clone(),
+            automation: self.song.automation.clone(),
             rack: self.song.rack.clone(),
             instruments: self.song.instruments.clone(),
         }
@@ -500,6 +522,8 @@ impl Editor {
             Action::Resolution(d) => self.step_resolution(d),
             Action::Length(d) => self.change_length(d),
             Action::AddSynth(kind) => self.add_synth(kind),
+            Action::Interpolate => self.interpolate(),
+            Action::Variations => self.variations(),
             Action::Octave(d) => {
                 self.octave = (self.octave as isize + d).clamp(0, 8) as u8;
                 self.message = Some(format!("octave {}", self.octave));
@@ -929,6 +953,119 @@ impl Editor {
         self.song.instruments[instrument] = Instrument::Synth(Arc::new(patch));
     }
 
+    /// Make `target` the knob the cursor's track automates with `K`, or
+    /// clear it.
+    pub fn set_automation(&mut self, target: Option<Target>) {
+        let t = self.cursor.track;
+        if self.song.automation(t) == target {
+            return;
+        }
+        self.snapshot();
+        if self.song.automation.len() <= t {
+            self.song.automation.resize(t + 1, None);
+        }
+        self.song.automation[t] = target;
+    }
+
+    fn variations(&mut self) {
+        use crate::variations::{Rng, STRENGTHS, vary};
+        let rows = self.selection().unwrap_or(0..self.pattern().rows);
+        let (t, synth) = (self.cursor.track, self.on_synth());
+        let mut rng = Rng::new(self.seed);
+        self.seed = self
+            .seed
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        let base = self.pattern().clone();
+        let made: Vec<Pattern> = STRENGTHS
+            .iter()
+            .map(|&s| vary(&base, t, rows.clone(), synth, s, &mut rng))
+            .collect();
+        self.snapshot();
+        for (k, p) in made.into_iter().enumerate() {
+            self.song.patterns.push(p);
+            let index = self.song.patterns.len() - 1;
+            self.song.order.insert(self.cursor.order + 1 + k, index);
+        }
+        self.message = Some(format!(
+            "{} variations after this slot, mild to wild: enter plays from here, ctrl+delete drops one, ctrl+g makes more",
+            STRENGTHS.len()
+        ));
+    }
+
+    fn interpolate(&mut self) {
+        let Some(rows) = self.selection() else {
+            self.message =
+                Some("select rows first (shift+↑↓), then ctrl+k fills between the ends".into());
+            return;
+        };
+        let field = self.cursor.field;
+        let p = self.pattern_index();
+        let t = self.cursor.track;
+        let cells = &self.song.patterns[p].tracks[t].cells[rows.clone()];
+        let lerp = |a: f32, b: f32, x: f32| (a + (b - a) * x).round();
+        let mut new: Vec<Cell> = cells.to_vec();
+        match field {
+            Field::Velocity => {
+                let hits: Vec<usize> = (0..cells.len())
+                    .filter(|&i| cells[i].trigger.is_some())
+                    .collect();
+                let (Some(&a), Some(&b)) = (hits.first(), hits.last()) else {
+                    return;
+                };
+                if a == b {
+                    return;
+                }
+                let (va, vb) = (
+                    cells[a].trigger.unwrap().velocity as f32,
+                    cells[b].trigger.unwrap().velocity as f32,
+                );
+                for &i in &hits {
+                    let v = lerp(va, vb, (i - a) as f32 / (b - a) as f32);
+                    new[i].trigger.as_mut().unwrap().velocity = v as u8;
+                }
+            }
+            Field::Fx(k) => {
+                let set: Vec<usize> = (0..cells.len())
+                    .filter(|&i| cells[i].fx[k].is_some())
+                    .collect();
+                let (Some(&a), Some(&b)) = (set.first(), set.last()) else {
+                    self.message =
+                        Some("put a value at both ends of the selection to fill between".into());
+                    return;
+                };
+                let (fa, fb) = (cells[a].fx[k].unwrap(), cells[b].fx[k].unwrap());
+                if a == b || fa.letter() != fb.letter() {
+                    self.message = Some("both ends need the same effect".into());
+                    return;
+                }
+                // Pitch is signed; everything else is 0..=FF.
+                let signed = matches!(fa, Fx::Pitch(_));
+                let value = |f: Fx| {
+                    if signed {
+                        f.param() as i8 as f32
+                    } else {
+                        f.param() as f32
+                    }
+                };
+                for (i, cell) in new.iter_mut().enumerate().take(b + 1).skip(a) {
+                    let v = lerp(value(fa), value(fb), (i - a) as f32 / (b - a) as f32);
+                    let param = if signed { v as i8 as u8 } else { v as u8 };
+                    cell.fx[k] = Fx::from_letter(fa.letter(), param);
+                }
+            }
+            Field::Slice => {
+                self.message = Some("put the cursor in the velocity or an effect column".into());
+                return;
+            }
+        }
+        if new == cells {
+            return;
+        }
+        self.snapshot();
+        self.song.patterns[p].tracks[t].cells[rows].copy_from_slice(&new);
+    }
+
     /// Use another tuning for synths.
     pub fn set_tuning(&mut self, tuning: crate::tuning::Tuning) {
         self.song.tuning = tuning;
@@ -1135,6 +1272,7 @@ impl Editor {
         to.push(Snapshot {
             patterns: std::mem::replace(&mut self.song.patterns, snap.patterns),
             order: std::mem::replace(&mut self.song.order, snap.order),
+            automation: std::mem::replace(&mut self.song.automation, snap.automation),
             rack: std::mem::replace(&mut self.song.rack, snap.rack),
             instruments: std::mem::replace(&mut self.song.instruments, snap.instruments),
         });
@@ -1162,6 +1300,7 @@ mod tests {
             order: vec![0],
             rack: crate::rack::Rack::simple(2),
             tuning: Default::default(),
+            automation: Vec::new(),
         })
     }
 
@@ -1490,6 +1629,108 @@ mod tests {
         e.apply(Action::Undo);
         e.apply(Action::Undo);
         assert_eq!(e.pattern().tracks[0].cells[15].trigger.unwrap().slice, 7);
+    }
+
+    #[test]
+    fn interpolate_fills_an_effect_column() {
+        let mut e = editor();
+        e.cursor.field = Field::Fx(0);
+        type_str(&mut e, "k00");
+        e.go_to(0, 4);
+        e.cursor.field = Field::Fx(0);
+        type_str(&mut e, "k80");
+        e.go_to(0, 0);
+        for _ in 0..4 {
+            e.apply(Action::SelectDown);
+        }
+        e.cursor.field = Field::Fx(0);
+        e.apply(Action::Interpolate);
+        let ks: Vec<_> = e.pattern().tracks[0].cells[..6]
+            .iter()
+            .map(|c| c.fx[0])
+            .collect();
+        let want = [0x00, 0x20, 0x40, 0x60, 0x80].map(|n| Some(Fx::Knob(n)));
+        assert_eq!(ks[..5], want);
+        assert_eq!(ks[5], None);
+        e.apply(Action::Undo);
+        assert_eq!(e.pattern().tracks[0].cells[2].fx[0], None);
+    }
+
+    #[test]
+    fn interpolate_signed_pitch_and_velocity() {
+        let mut e = editor();
+        e.cursor.field = Field::Fx(0);
+        type_str(&mut e, "pf4"); // -12
+        e.go_to(0, 2);
+        e.cursor.field = Field::Fx(0);
+        type_str(&mut e, "p0c"); // +12
+        e.go_to(0, 0);
+        e.apply(Action::SelectDown);
+        e.apply(Action::SelectDown);
+        e.cursor.field = Field::Fx(0);
+        e.apply(Action::Interpolate);
+        assert_eq!(e.pattern().tracks[0].cells[1].fx[0], Some(Fx::Pitch(0)));
+
+        let mut e = editor();
+        e.last_velocity = 0x10;
+        type_str(&mut e, "01");
+        e.go_to(0, 1);
+        type_str(&mut e, "01");
+        e.go_to(0, 3);
+        e.last_velocity = 0x70;
+        e.cursor.field = Field::Slice;
+        type_str(&mut e, "01");
+        e.go_to(0, 3);
+        e.cursor.field = Field::Velocity;
+        type_str(&mut e, "70");
+        e.go_to(0, 0);
+        for _ in 0..3 {
+            e.apply(Action::SelectDown);
+        }
+        e.cursor.field = Field::Velocity;
+        e.apply(Action::Interpolate);
+        let v: Vec<_> = e.pattern().tracks[0].cells[..4]
+            .iter()
+            .map(|c| c.trigger.map(|t| t.velocity))
+            .collect();
+        assert_eq!(
+            v,
+            vec![Some(0x10), Some(0x30), None, Some(0x70)],
+            "only cells with notes"
+        );
+    }
+
+    #[test]
+    fn automation_target_undoes() {
+        let mut e = editor();
+        e.cursor.track = 1;
+        e.set_automation(Some(Target::Synth { param: 3 }));
+        assert_eq!(e.song.automation(1), Some(Target::Synth { param: 3 }));
+        assert_eq!(e.song.automation(0), None);
+        e.apply(Action::Undo);
+        assert_eq!(e.song.automation(1), None);
+    }
+
+    #[test]
+    fn variations_go_after_the_slot_and_undo() {
+        let mut e = editor();
+        type_str(&mut e, "00010203");
+        e.go_to(0, 0);
+        e.apply(Action::Variations);
+        assert_eq!(e.song.order, vec![0, 1, 2, 3, 4]);
+        assert_eq!(e.cursor.order, 0, "stays on the original");
+        let original = e.song.patterns[0].tracks[1].cells.clone();
+        assert!(
+            e.song.patterns[1..]
+                .iter()
+                .all(|p| p.tracks[1].cells == original),
+            "other tracks untouched"
+        );
+        let seed = e.seed;
+        e.apply(Action::Undo);
+        assert_eq!(e.song.order, vec![0]);
+        assert_eq!(e.song.patterns.len(), 1);
+        assert_eq!(e.seed, seed, "a new seed next time, even after undo");
     }
 
     #[test]

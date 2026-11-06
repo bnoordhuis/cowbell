@@ -6,6 +6,7 @@
 //! this module only maps keys to editor actions and draws the result.
 
 mod knob;
+mod palette;
 mod rack;
 #[cfg(feature = "screenshot")]
 mod screenshot;
@@ -21,11 +22,12 @@ use crate::audio::{self, Output};
 use crate::editor::{Action, Editor, Field};
 use crate::engine::{Command, Controller, Engine, Position};
 use crate::graph::Graph;
-use crate::pattern::{Cell, Instrument, Song};
+use crate::pattern::{Cell, Fx, Instrument, Song, Target};
 use crate::project;
 use crate::sample::Sample;
 use crate::synthvoice::SynthKind;
 use crate::tuning::{Tuning, note_name};
+use crate::tutorial::{self, Facts, Focus, Tutorial};
 
 /// Default slice detection sensitivity for loaded samples.
 const SENSITIVITY: f32 = 0.6;
@@ -94,6 +96,7 @@ pub fn run(song: Song, path: Option<PathBuf>) -> Result<(), String> {
 }
 
 /// What a key press does, beyond editing.
+#[derive(Clone, Copy, Debug)]
 enum Act {
     Edit(Action),
     PlayToggle,
@@ -106,10 +109,15 @@ enum Act {
     Open,
     LoadSample,
     LoadTuning,
+    Export,
     AddSynth(SynthKind),
     Sensitivity(f32),
     /// Change the pattern length by whole beats.
     LengthBeats(isize),
+    Palette,
+    Tutorial,
+    /// Esc: skip a tutorial step.
+    Escape,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +126,7 @@ enum PromptKind {
     Open,
     LoadSample,
     LoadTuning,
+    Export,
 }
 
 /// A one-line text prompt in the status bar, for file names.
@@ -183,6 +192,9 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
         Key::O if m.command => Some(Act::Open),
         Key::B if m.command => edit(Bounce),
         Key::L if m.command && m.shift => Some(Act::LoadTuning),
+        Key::E if m.command => Some(Act::Export),
+        Key::K if m.command => edit(Interpolate),
+        Key::G if m.command => edit(Variations),
         Key::L if m.command => Some(Act::LoadSample),
         Key::F5 => Some(Act::AddSynth(SynthKind::Acid)),
         Key::F6 => Some(Act::AddSynth(SynthKind::Fm)),
@@ -190,6 +202,9 @@ fn key_act(key: Key, m: Modifiers) -> Option<Act> {
         Key::I if m.command => edit(NextInstrument),
         Key::OpenBracket => Some(Act::Sensitivity(-0.1)),
         Key::CloseBracket => Some(Act::Sensitivity(0.1)),
+        Key::P if m.command => Some(Act::Palette),
+        Key::F12 => Some(Act::Tutorial),
+        Key::Escape => Some(Act::Escape),
         Key::F1 => Some(Act::View(View::Tracker)),
         Key::F2 => Some(Act::View(View::Rack)),
         _ => None,
@@ -288,6 +303,12 @@ struct App {
     /// A synth knob being dragged: (instrument, param, start y, start knob
     /// position, moved yet).
     synth_drag: Option<(usize, usize, f32, f32, bool)>,
+    palette: Option<palette::Palette>,
+    tutorial: Option<Tutorial>,
+    /// What the tutorial's current step has seen happen.
+    tutorial_facts: Facts,
+    /// Set after warning that starting the tutorial replaces unsaved work.
+    tutorial_armed: bool,
     #[cfg(feature = "screenshot")]
     screenshot: Option<screenshot::Screenshot>,
 }
@@ -314,7 +335,8 @@ impl App {
         };
         #[cfg(not(feature = "screenshot"))]
         let view = View::Tracker;
-        App {
+        #[allow(unused_mut)]
+        let mut app = App {
             editor,
             controller,
             output,
@@ -335,8 +357,38 @@ impl App {
             sensitivity: SENSITIVITY,
             marker_drag: None,
             synth_drag: None,
+            palette: None,
+            tutorial: None,
+            tutorial_facts: Facts::default(),
+            tutorial_armed: false,
             #[cfg(feature = "screenshot")]
             screenshot,
+        };
+        #[cfg(feature = "screenshot")]
+        app.screenshot_setup();
+        app
+    }
+
+    /// Dev only: `COWBELL_TUTORIAL=n` starts the tutorial n steps in, and
+    /// `COWBELL_PALETTE=query` opens the command palette with a search.
+    #[cfg(feature = "screenshot")]
+    fn screenshot_setup(&mut self) {
+        if self.screenshot.is_none() {
+            return;
+        }
+        if let Some(n) = std::env::var("COWBELL_TUTORIAL").ok().and_then(|n| n.parse::<usize>().ok()) {
+            // The script may have edited the demo song; replace it anyway.
+            self.tutorial_armed = true;
+            self.toggle_tutorial();
+            for _ in 0..n {
+                self.run(Act::Escape);
+            }
+            screenshot::apply_keys(&mut self.editor);
+        }
+        if let Ok(q) = std::env::var("COWBELL_PALETTE") {
+            let mut p = palette::Palette::new();
+            p.query = q;
+            self.palette = Some(p);
         }
     }
 
@@ -422,6 +474,7 @@ impl App {
                     PromptKind::Open => self.open(path),
                     PromptKind::LoadSample => self.load_sample(typed_path(&prompt.text)),
                     PromptKind::LoadTuning => self.load_tuning(typed_path(&prompt.text)),
+                    PromptKind::Export => self.export(typed_path(&prompt.text)),
                 }
             }
             _ => {}
@@ -452,9 +505,59 @@ impl App {
         }
     }
 
+    fn export(&mut self, path: PathBuf) {
+        self.editor.message = Some(match crate::export::export_wav(&self.editor.song, &path) {
+            Ok(seconds) => format!("exported {seconds:.1}s to {}", path.display()),
+            Err(e) => format!("couldn't export: {e}"),
+        });
+    }
+
+    /// Toggle `target` as the cursor track's automation target.
+    fn bind_automation(&mut self, target: Target) {
+        let t = self.editor.cursor.track;
+        let track = self
+            .editor
+            .pattern()
+            .tracks
+            .get(t)
+            .map_or_else(String::new, |t| t.name.clone());
+        if self.editor.song.automation(t) == Some(target) {
+            self.editor.set_automation(None);
+            self.editor.message = Some(format!("{track}: K effects turn nothing now"));
+        } else {
+            self.editor.set_automation(Some(target));
+            let name = self.target_name(target).unwrap_or_default();
+            self.editor.message = Some(format!(
+                "{track}: K effects turn {name}; put Kxx in an effect column"
+            ));
+        }
+    }
+
+    /// A target's knob, by device and name, for messages; and its value
+    /// for a `K` parameter.
+    fn target_name(&self, target: Target) -> Option<String> {
+        self.target_spec(target)
+            .map(|(device, spec)| format!("{device} {}", spec.name))
+    }
+
+    fn target_spec(&self, target: Target) -> Option<(String, &'static crate::rack::ParamSpec)> {
+        match target {
+            Target::Rack { device, param } => {
+                let d = self.editor.song.rack.device(device)?;
+                Some((d.kind.name().to_owned(), d.kind.params().get(param)?))
+            }
+            Target::Synth { param } => {
+                let (_, p) = self.editor.track_synth()?;
+                Some((p.name.clone(), p.kind.params().get(param)?))
+            }
+        }
+    }
+
     fn ask(&mut self, kind: PromptKind) {
         let text = match (&self.path, kind) {
             (_, PromptKind::LoadSample | PromptKind::LoadTuning) => String::new(),
+            (Some(p), PromptKind::Export) => p.with_extension("wav").display().to_string(),
+            (None, PromptKind::Export) => "untitled.wav".into(),
             (Some(p), _) => p.display().to_string(),
             (None, PromptKind::SaveAs) => format!("untitled.{}", project::EXTENSION),
             (None, PromptKind::Open) => String::new(),
@@ -467,6 +570,15 @@ impl App {
         for event in events {
             if self.prompt.is_some() {
                 self.prompt_input(&event);
+                continue;
+            }
+            if self.palette.is_some() {
+                self.palette_input(&event);
+                continue;
+            }
+            // ? opens the command palette, in any view.
+            if matches!(&event, egui::Event::Text(t) if t == "?") {
+                self.palette = Some(palette::Palette::new());
                 continue;
             }
             if matches!(event, egui::Event::Key { pressed: true, .. }) {
@@ -497,65 +609,215 @@ impl App {
                 egui::Event::Paste(_) => Some(Act::Edit(Action::Paste)),
                 _ => None,
             };
-            match act {
-                // The rack view is for the mouse; editing keys stay with the
-                // tracker so they can't change a pattern you can't see. Undo
-                // and redo work in both, over one shared history.
-                Some(Act::Edit(a))
-                    if self.view == View::Rack && !matches!(a, Action::Undo | Action::Redo) => {}
-                Some(Act::Edit(a)) => self.editor.apply(a),
-                Some(Act::View(v)) => self.view = v,
-                Some(Act::PlayToggle) => {
-                    let c = self.editor.cursor;
-                    let cmd = if self.controller.is_playing() {
-                        Command::Stop
-                    } else {
-                        Command::PlayFrom(Position {
-                            order: c.order,
-                            row: c.row,
-                        })
-                    };
-                    let _ = self.controller.send(cmd);
+            if let Some(act) = act {
+                self.run(act);
+            }
+        }
+    }
+
+    fn palette_input(&mut self, event: &egui::Event) {
+        let Some(p) = &mut self.palette else { return };
+        match event {
+            egui::Event::Text(t) => {
+                p.query.extend(t.chars().filter(|c| !c.is_control()));
+                p.selected = 0;
+            }
+            egui::Event::Key {
+                key, pressed: true, ..
+            } => match key {
+                Key::Backspace => {
+                    p.query.pop();
+                    p.selected = 0;
                 }
-                Some(Act::PlayPattern) => {
-                    let order = self.editor.cursor.order;
-                    let _ = self
-                        .controller
-                        .send(Command::PlayFrom(Position { order, row: 0 }));
-                }
-                Some(Act::ToggleFollow) => self.follow = !self.follow,
-                Some(Act::Bpm(d)) => {
-                    let bpm = (self.editor.song.bpm + d).clamp(20.0, 400.0);
-                    self.editor.song.bpm = bpm;
-                    self.editor.changed();
-                    let _ = self.controller.send(Command::SetBpm(bpm));
-                }
-                Some(Act::Save) => match self.path.clone() {
-                    Some(path) => self.save(path),
-                    None => self.ask(PromptKind::SaveAs),
-                },
-                Some(Act::SaveAs) => self.ask(PromptKind::SaveAs),
-                Some(Act::Open) => self.ask(PromptKind::Open),
-                Some(Act::LoadSample) => self.ask(PromptKind::LoadSample),
-                Some(Act::LengthBeats(_)) if self.view == View::Rack => {}
-                Some(Act::LengthBeats(d)) => {
-                    let rpb = self.editor.pattern().rows_per_beat as isize;
-                    self.editor.apply(Action::Length(d * rpb));
-                }
-                Some(Act::Sensitivity(_) | Act::AddSynth(_)) if self.view == View::Rack => {}
-                Some(Act::LoadTuning) => self.ask(PromptKind::LoadTuning),
-                Some(Act::AddSynth(kind)) => self.editor.apply(Action::AddSynth(kind)),
-                // On synth tracks the same keys move the octave.
-                Some(Act::Sensitivity(d)) if self.editor.on_synth() => {
-                    self.editor.apply(Action::Octave(d.signum() as isize))
-                }
-                Some(Act::Sensitivity(d)) => {
-                    self.sensitivity = (self.sensitivity + d).clamp(0.0, 1.0);
-                    if let Some((instrument, _)) = self.editor.track_sample() {
-                        self.editor.redetect(instrument, self.sensitivity);
+                Key::ArrowDown => p.move_selection(1),
+                Key::ArrowUp => p.move_selection(-1),
+                Key::Escape => self.palette = None,
+                Key::Enter => {
+                    let act = p.chosen();
+                    self.palette = None;
+                    if let Some(act) = act {
+                        self.run(act);
                     }
                 }
-                None => {}
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn toggle_tutorial(&mut self) {
+        if self.tutorial.take().is_some() {
+            self.editor.message = Some("tutorial closed; F12 starts it again".into());
+            return;
+        }
+        if self.unsaved() && !self.tutorial_armed {
+            self.tutorial_armed = true;
+            self.editor.message =
+                Some("couldn't start: the tutorial replaces this song. ctrl+s to save it, or F12 again to go ahead".into());
+            return;
+        }
+        let song = tutorial::song();
+        let _ = self.controller.send(Command::Stop);
+        self.editor = Editor::new(song.clone());
+        let _ = self
+            .controller
+            .send(Command::SwapSong(Box::new(song.clone())));
+        self.rack_version = self.editor.song.rack.version.wrapping_add(1);
+        self.saved_revision = self.editor.revision;
+        self.path = None;
+        self.view = View::Tracker;
+        self.scroll = 0;
+        self.tutorial = Some(Tutorial::new(&song));
+        self.tutorial_facts = Facts::default();
+        self.tutorial_armed = false;
+    }
+
+    fn update_tutorial(&mut self) {
+        let Some(t) = &mut self.tutorial else { return };
+        let playing = self.controller.is_playing();
+        let f = &mut self.tutorial_facts;
+        f.playing = playing;
+        f.played |= playing;
+        f.rack_view = self.view == View::Rack;
+        f.palette_open = self.palette.is_some();
+        if t.update(&self.editor, *f) {
+            *f = Facts::default();
+        }
+    }
+
+    fn tutorial_strip(&self, ui: &mut egui::Ui) {
+        let Some(t) = &self.tutorial else { return };
+        let r = ui.max_rect();
+        let p = ui.painter();
+        let font = Self::font();
+        let (title, text, keys) = match t.current() {
+            Some((lesson, step)) => (
+                format!(
+                    "tutorial · lesson {}/{}: {} · step {}/{}",
+                    t.lesson + 1,
+                    t.lesson_count(),
+                    lesson.title,
+                    t.step + 1,
+                    lesson.steps.len()
+                ),
+                step.text,
+                step.keys,
+            ),
+            None => (
+                "tutorial · done".to_owned(),
+                "That's every lesson so far. Keep playing with this song, or F12 to close and ctrl+o to open your own.",
+                "F12",
+            ),
+        };
+        p.text(
+            r.left_top() + vec2(8.0, 6.0),
+            Align2::LEFT_TOP,
+            title,
+            font.clone(),
+            color::ACCENT,
+        );
+        p.text(
+            r.right_top() + vec2(-8.0, 6.0),
+            Align2::RIGHT_TOP,
+            "esc skip step · F12 close",
+            font.clone(),
+            color::DIM,
+        );
+        let galley = p.layout(text.to_owned(), font.clone(), color::TEXT, r.width() - 16.0);
+        let h = galley.size().y;
+        p.galley(r.left_top() + vec2(8.0, 26.0), galley, color::TEXT);
+        let k = p.text(
+            r.left_top() + vec2(8.0, 30.0 + h),
+            Align2::LEFT_TOP,
+            "keys:",
+            font.clone(),
+            color::MUTED,
+        );
+        p.text(
+            k.right_top() + vec2(8.0, 0.0),
+            Align2::LEFT_TOP,
+            keys,
+            font,
+            color::ACCENT,
+        );
+    }
+
+    /// What the tutorial's current step wants you to look at.
+    fn tutorial_focus(&self) -> Focus {
+        self.tutorial
+            .as_ref()
+            .and_then(|t| t.current())
+            .map_or(Focus::None, |(_, s)| s.focus)
+    }
+
+    /// Do what a key (or the command palette) asked for.
+    fn run(&mut self, act: Act) {
+        match act {
+            Act::Palette => self.palette = Some(palette::Palette::new()),
+            Act::Tutorial => self.toggle_tutorial(),
+            Act::Escape => {
+                if let Some(t) = &mut self.tutorial {
+                    t.skip(&self.editor.song);
+                    self.tutorial_facts = Facts::default();
+                }
+            }
+            // The rack view is for the mouse; editing keys stay with the
+            // tracker so they can't change a pattern you can't see. Undo
+            // and redo work in both, over one shared history.
+            Act::Edit(a)
+                if self.view == View::Rack && !matches!(a, Action::Undo | Action::Redo) => {}
+            Act::Edit(a) => self.editor.apply(a),
+            Act::View(v) => self.view = v,
+            Act::PlayToggle => {
+                let c = self.editor.cursor;
+                let cmd = if self.controller.is_playing() {
+                    Command::Stop
+                } else {
+                    Command::PlayFrom(Position {
+                        order: c.order,
+                        row: c.row,
+                    })
+                };
+                let _ = self.controller.send(cmd);
+            }
+            Act::PlayPattern => {
+                let order = self.editor.cursor.order;
+                let _ = self
+                    .controller
+                    .send(Command::PlayFrom(Position { order, row: 0 }));
+            }
+            Act::ToggleFollow => self.follow = !self.follow,
+            Act::Bpm(d) => {
+                let bpm = (self.editor.song.bpm + d).clamp(20.0, 400.0);
+                self.editor.song.bpm = bpm;
+                self.editor.changed();
+                let _ = self.controller.send(Command::SetBpm(bpm));
+            }
+            Act::Save => match self.path.clone() {
+                Some(path) => self.save(path),
+                None => self.ask(PromptKind::SaveAs),
+            },
+            Act::SaveAs => self.ask(PromptKind::SaveAs),
+            Act::Open => self.ask(PromptKind::Open),
+            Act::LoadSample => self.ask(PromptKind::LoadSample),
+            Act::LengthBeats(_) if self.view == View::Rack => {}
+            Act::LengthBeats(d) => {
+                let rpb = self.editor.pattern().rows_per_beat as isize;
+                self.editor.apply(Action::Length(d * rpb));
+            }
+            Act::Sensitivity(_) | Act::AddSynth(_) if self.view == View::Rack => {}
+            Act::LoadTuning => self.ask(PromptKind::LoadTuning),
+            Act::Export => self.ask(PromptKind::Export),
+            Act::AddSynth(kind) => self.editor.apply(Action::AddSynth(kind)),
+            // On synth tracks the same keys move the octave.
+            Act::Sensitivity(d) if self.editor.on_synth() => {
+                self.editor.apply(Action::Octave(d.signum() as isize))
+            }
+            Act::Sensitivity(d) => {
+                self.sensitivity = (self.sensitivity + d).clamp(0.0, 1.0);
+                if let Some((instrument, _)) = self.editor.track_sample() {
+                    self.editor.redetect(instrument, self.sensitivity);
+                }
             }
         }
     }
@@ -575,6 +837,7 @@ impl App {
             }
         }
         if let Some((instrument, slice)) = self.editor.audition.take() {
+            self.tutorial_facts.auditioned = true;
             let _ = self.controller.send(Command::Audition {
                 instrument,
                 slice,
@@ -767,12 +1030,20 @@ impl App {
             self.editor
                 .set_synth_param(instrument, i, specs[i].default, true);
         }
+        if response.secondary_clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(i) = knob_at(pos)
+        {
+            self.bind_automation(Target::Synth { param: i });
+        }
 
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 4.0, color::PANEL);
         let patch = self.editor.track_synth().map_or(patch, |(_, p)| p.clone());
         for (i, spec) in specs.iter().enumerate() {
-            knob::draw(&p, center(i), spec, patch.params[i], &small);
+            let automated = self.editor.song.automation(self.editor.cursor.track)
+                == Some(Target::Synth { param: i });
+            knob::draw(&p, center(i), spec, patch.params[i], &small, automated);
         }
     }
 
@@ -1032,6 +1303,19 @@ impl App {
             }
         }
 
+        // The cell a tutorial step is about.
+        if let Focus::Cell { track, row } = self.tutorial_focus() {
+            let i = row as isize - first;
+            if (0..visible).contains(&i) && track < pattern.tracks.len() {
+                let y = top + i as f32 * ROW_HEIGHT;
+                let r = Rect::from_min_size(
+                    pos2(track_x(track) - cw * 0.5, y),
+                    vec2(cw * (TRACK_CHARS as f32 + 1.0), ROW_HEIGHT),
+                );
+                p.rect_stroke(r, 2.0, Stroke::new(2.0, color::ACCENT), egui::StrokeKind::Outside);
+            }
+        }
+
         // The cursor digit, drawn last so it sits on top.
         let c = e.cursor;
         let i = c.row as isize - first;
@@ -1066,6 +1350,7 @@ impl App {
                 PromptKind::Open => "open",
                 PromptKind::LoadSample => "load sample (WAV) onto this track",
                 PromptKind::LoadTuning => "load tuning (Scala .scl) for synths",
+                PromptKind::Export => "export the song to WAV",
             };
             return Some((
                 format!("{what}: {}▏   enter to confirm, esc to cancel", prompt.text),
@@ -1129,7 +1414,24 @@ impl App {
             )),
             None => words.push("empty".into()),
         }
-        words.extend(cell.fx().map(|fx| fx.describe()));
+        // A K effect is described by the knob it turns, when there is one.
+        let target = e
+            .song
+            .automation(e.cursor.track)
+            .and_then(|t| self.target_spec(t));
+        words.extend(cell.fx().map(|fx| match (fx, &target) {
+            (Fx::Knob(n), Some((device, spec))) => {
+                format!(
+                    "{device} {} → {}",
+                    spec.name,
+                    spec.format(spec.from_knob(n as f32 / 255.0))
+                )
+            }
+            (Fx::Knob(_), None) => {
+                "K does nothing yet: right-click a knob to pick what it turns".into()
+            }
+            _ => fx.describe(),
+        }));
         let (text, c) = self.notice().unwrap_or((words.join(" · "), color::TEXT));
         p.text(
             r.left_top() + vec2(8.0, 4.0),
@@ -1139,29 +1441,17 @@ impl App {
             c,
         );
 
+        // The essentials; ? lists everything else.
         let hints = [
+            ("?", "all commands"),
+            ("F12", "tutorial"),
+            ("space", "play/stop"),
             ("0-f", "enter"),
             ("ORVPBSC", "effect"),
-            ("space", "play/stop"),
             ("shift+↕", "select"),
-            ("ctrl+r", "roll"),
             ("ctrl+z/y", "undo/redo"),
-            ("ctrl+b", "bounce"),
-            ("ctrl+c/v", "copy/paste"),
-            ("ctrl+←→", "order"),
-            ("ctrl+↕", "step"),
-            ("alt+↕", "bpm"),
-            ("ctrl+t", "add track"),
             ("ctrl+s", "save"),
-            ("ctrl+o", "open"),
-            ("ctrl+l", "load sample"),
-            ("F5/F6", "acid/fm synth"),
-            ("ctrl+shift+l", "tuning"),
-            ("ctrl+i", "next sample"),
-            ("ctrl+n/d", "new/copy pattern"),
-            ("ctrl+shift+←→", "slot plays"),
-            ("ctrl+shift+↕", "rows/beat"),
-            ("alt+←→", "length"),
+            ("ctrl+e", "export wav"),
         ];
         let mut x = r.left() + 8.0;
         let mut y = r.top() + 24.0;
@@ -1265,30 +1555,59 @@ impl eframe::App for App {
             );
         }
 
+        self.update_tutorial();
         let frame = |fill| egui::Frame::new().fill(fill);
-        egui::Panel::top("transport")
+        let mut focus_rect = None;
+        let focus = self.tutorial_focus();
+        let transport = egui::Panel::top("transport")
             .exact_size(30.0)
             .frame(frame(color::BG))
-            .show(ui, |ui| self.transport(ui));
+            .show(ui, |ui| self.transport(ui))
+            .response
+            .rect;
+        if focus == Focus::Transport {
+            focus_rect = Some(transport);
+        }
         match self.view {
             View::Tracker => {
-                egui::Panel::top("slicer")
+                let slicer = egui::Panel::top("slicer")
                     .exact_size(130.0)
                     .frame(frame(color::BG))
-                    .show(ui, |ui| self.instrument_panel(ui));
+                    .show(ui, |ui| self.instrument_panel(ui))
+                    .response
+                    .rect;
                 egui::Panel::bottom("status")
                     .exact_size(64.0)
                     .frame(frame(color::PANEL))
                     .show(ui, |ui| self.status(ui));
-                egui::CentralPanel::default()
+                if self.tutorial.is_some() {
+                    egui::Panel::bottom("tutorial")
+                        .exact_size(84.0)
+                        .frame(frame(color::CURSOR_ROW))
+                        .show(ui, |ui| self.tutorial_strip(ui));
+                }
+                let grid = egui::CentralPanel::default()
                     .frame(frame(color::BG))
-                    .show(ui, |ui| self.grid(ui));
+                    .show(ui, |ui| self.grid(ui))
+                    .response
+                    .rect;
+                match focus {
+                    Focus::Slicer => focus_rect = Some(slicer),
+                    Focus::Grid => focus_rect = Some(grid),
+                    _ => {}
+                }
             }
             View::Rack => {
                 egui::Panel::bottom("rack-status")
                     .exact_size(48.0)
                     .frame(frame(color::PANEL))
                     .show(ui, |ui| self.rack_status(ui));
+                if self.tutorial.is_some() {
+                    egui::Panel::bottom("tutorial")
+                        .exact_size(84.0)
+                        .frame(frame(color::CURSOR_ROW))
+                        .show(ui, |ui| self.tutorial_strip(ui));
+                }
                 egui::CentralPanel::default()
                     .frame(frame(color::BG))
                     .show(ui, |ui| {
@@ -1299,7 +1618,18 @@ impl eframe::App for App {
                             .iter()
                             .map(|t| t.name.clone())
                             .collect();
-                        let out = self.rack_view.show(ui, &mut self.editor.song.rack, &names);
+                        let t = self.editor.cursor.track;
+                        let automated = match self.editor.song.automation(t) {
+                            Some(Target::Rack { device, param }) => Some((device, param)),
+                            _ => None,
+                        };
+                        let out =
+                            self.rack_view
+                                .show(ui, &mut self.editor.song.rack, &names, automated);
+                        if let Some((device, param)) = out.bind {
+                            let target = Target::Rack { device, param };
+                            self.bind_automation(target);
+                        }
                         for (device, param, value) in out.params {
                             let _ = self.controller.send(Command::SetParam {
                                 device,
@@ -1318,7 +1648,23 @@ impl eframe::App for App {
             }
         }
 
-        if self.controller.is_playing() {
+        let overlay = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("focus"),
+        ));
+        if let Some(r) = focus_rect {
+            overlay.rect_stroke(
+                r.shrink(2.0),
+                4.0,
+                Stroke::new(2.0, color::ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if let Some(p) = &self.palette {
+            p.draw(&ctx, &Self::font());
+        }
+
+        if self.controller.is_playing() || self.tutorial.is_some() {
             ctx.request_repaint();
         }
         #[cfg(feature = "screenshot")]

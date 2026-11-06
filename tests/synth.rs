@@ -21,6 +21,7 @@ fn sine_song(tuning: Tuning) -> Song {
         order: vec![0],
         rack: Rack::simple(1),
         tuning,
+        automation: Vec::new(),
     }
 }
 
@@ -149,4 +150,79 @@ fn synths_and_tuning_survive_save_and_load() {
         song.patterns[0].tracks[0].cells[0]
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Strength of frequency `f` in `out` (single-bin DFT).
+fn magnitude(out: &[f32], f: f64) -> f64 {
+    let w = std::f64::consts::TAU * f / RATE as f64;
+    let (mut re, mut im) = (0.0, 0.0);
+    for (n, &s) in out.iter().enumerate() {
+        re += s as f64 * (w * n as f64).cos();
+        im -= s as f64 * (w * n as f64).sin();
+    }
+    (re * re + im * im).sqrt() / out.len() as f64
+}
+
+#[test]
+fn chord_effect_plays_all_its_notes() {
+    let mut song = sine_song(Tuning::default());
+    song.patterns[0].tracks[0].cells[0] = Cell::hit(57, 127).with_fx(Fx::Chord(0x47));
+    let out = render(song, RATE as usize);
+    let t = Tuning::default();
+    let out = &out[4800..];
+    let [root, third, fifth, second] = [57, 61, 64, 59].map(|n| magnitude(out, t.freq(n)));
+    assert!(
+        root > 0.05 && third > 0.05 && fifth > 0.05,
+        "{root} {third} {fifth}"
+    );
+    assert!(second < root / 20.0, "no note a whole step up: {second}");
+}
+
+#[test]
+fn knob_effects_automate_rack_and_synth_knobs() {
+    use cowbell::engine::{Command, Position};
+    use cowbell::pattern::Target;
+
+    // Master volume to zero from row 2 (a quarter second in).
+    let mut song = sine_song(Tuning::default());
+    let master = song
+        .rack
+        .devices
+        .iter()
+        .find(|d| d.kind == cowbell::rack::Kind::Master)
+        .unwrap()
+        .id;
+    song.automation = vec![Some(Target::Rack {
+        device: master,
+        param: 0,
+    })];
+    song.patterns[0].tracks[0].cells[0] = Cell::hit(60, 127);
+    song.patterns[0].tracks[0].cells[2] = Cell::default().with_fx(Fx::Knob(0));
+    let (mut engine, mut c) = Engine::new(RATE, song.clone());
+    engine.play();
+    let mut out = vec![0.0; 2 * RATE as usize / 2];
+    engine.process(&mut out);
+    let quarter = RATE as usize / 4;
+    assert!(
+        out[..2 * quarter].iter().any(|s| s.abs() > 0.1),
+        "sounds before"
+    );
+    assert!(
+        out[2 * quarter + 2..].iter().all(|&s| s == 0.0),
+        "silent after"
+    );
+    // Playing again starts from the rack's own setting.
+    assert!(
+        c.send(Command::PlayFrom(Position { order: 0, row: 0 }))
+            .is_ok()
+    );
+    let mut again = vec![0.0; 2 * 4800];
+    engine.process(&mut again);
+    assert!(again.iter().any(|s| s.abs() > 0.1), "volume restored");
+
+    // The synth's own volume knob (FM param 9).
+    song.automation = vec![Some(Target::Synth { param: 9 })];
+    let out = render(song, RATE as usize / 2);
+    assert!(out[..quarter].iter().any(|s| s.abs() > 0.1));
+    assert!(out[quarter + 1..].iter().all(|&s| s == 0.0));
 }

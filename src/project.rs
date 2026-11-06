@@ -16,7 +16,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::MAX_TRACKS;
-use crate::pattern::{Cell, Instrument, Pattern, Song, Track};
+use crate::pattern::{Cell, Instrument, Pattern, Song, Target, Track};
 use crate::rack::Rack;
 use crate::sample::Sample;
 use crate::synthvoice::{SynthKind, SynthPatch};
@@ -35,6 +35,9 @@ struct ProjectFile {
     rack: Rack,
     #[serde(default)]
     tuning: Tuning,
+    /// Per track: the knob its `K` effects turn.
+    #[serde(default)]
+    automation: Vec<Option<Target>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -172,6 +175,7 @@ pub fn save(song: &Song, path: &Path) -> Result<(), String> {
         order: song.order.clone(),
         rack: song.rack.clone(),
         tuning: song.tuning.clone(),
+        automation: song.automation.clone(),
     };
     // One cell per line, arrays on one line: compact, and diffs show which
     // cells changed.
@@ -278,6 +282,7 @@ pub fn load(path: &Path) -> Result<Song, String> {
         order,
         rack,
         tuning: file.tuning,
+        automation: file.automation,
     })
 }
 

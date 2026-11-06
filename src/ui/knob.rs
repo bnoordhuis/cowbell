@@ -15,10 +15,32 @@ pub const FINE_DRAG_RANGE: f32 = 600.0;
 const EDGE: egui::Color32 = egui::Color32::from_rgb(0x3a, 0x3b, 0x40);
 
 /// Draw a knob at `c` showing `value`, with its name and value below.
-pub fn draw(p: &egui::Painter, c: Pos2, spec: &ParamSpec, value: f32, font: &FontId) {
+/// `automated` marks the knob the cursor's track turns with `K` effects.
+pub fn draw(
+    p: &egui::Painter,
+    c: Pos2,
+    spec: &ParamSpec,
+    value: f32,
+    font: &FontId,
+    automated: bool,
+) {
     let k = spec.to_knob(value);
     p.circle_filled(c, RADIUS, color::BG);
-    p.circle_stroke(c, RADIUS, Stroke::new(1.0, EDGE));
+    let edge = if automated {
+        Stroke::new(2.0, color::ACCENT)
+    } else {
+        Stroke::new(1.0, EDGE)
+    };
+    p.circle_stroke(c, RADIUS, edge);
+    if automated {
+        p.text(
+            c + vec2(RADIUS, -RADIUS),
+            Align2::CENTER_CENTER,
+            "K",
+            font.clone(),
+            color::ACCENT,
+        );
+    }
     // 270 degree sweep, from bottom-left to bottom-right.
     let angle = |k: f32| (135.0 + 270.0 * k).to_radians();
     let point = |k: f32, r: f32| c + vec2(angle(k).cos(), angle(k).sin()) * r;

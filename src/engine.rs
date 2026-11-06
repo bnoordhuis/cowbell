@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::graph::{BLOCK, Graph};
-use crate::pattern::{Fx, Instrument, Song, Trigger};
+use crate::pattern::{Fx, Instrument, Song, Target, Trigger};
 use crate::rack::DeviceId;
-use crate::synthvoice::SynthVoice;
+use crate::synthvoice::{MAX_CHORD, SynthTrack};
 use crate::voice::Voice;
 
 pub const MAX_TRACKS: usize = 16;
@@ -65,6 +65,9 @@ pub struct Engine {
     out_rate: f64,
     song: Box<Song>,
     playing: bool,
+    /// Whether the song starts over after the last order slot. Off for
+    /// exporting, where the sequencer stops and notes ring out.
+    looping: bool,
     pos: Position,
     /// Output frames until the next row starts. Fractional, so rows land on
     /// the right frame even when a row isn't a whole number of frames long.
@@ -73,8 +76,8 @@ pub struct Engine {
     /// Per track, the sound a voice was making when it was stolen or
     /// retriggered, fading out under the new note. Only used with declick.
     tails: [Voice; MAX_TRACKS],
-    /// One synth voice per track, plus one for auditioning.
-    synths: [SynthVoice; MAX_TRACKS + 1],
+    /// Synth voices per track, plus some for auditioning.
+    synths: [SynthTrack; MAX_TRACKS + 1],
     graph: Box<Graph>,
     /// The audition voice skips the graph and goes straight to the output.
     audition: Vec<[f32; 2]>,
@@ -144,6 +147,7 @@ impl Engine {
             out_rate: out_rate as f64,
             song: Box::new(song),
             playing: false,
+            looping: true,
             pos: Position { order: 0, row: 0 },
             row_clock: 0.0,
             voices: Default::default(),
@@ -163,6 +167,15 @@ impl Engine {
             shared_playing,
         };
         (engine, controller)
+    }
+
+    /// Play the order list once instead of looping it.
+    pub fn set_looping(&mut self, looping: bool) {
+        self.looping = looping;
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing
     }
 
     pub fn play(&mut self) {
@@ -230,7 +243,7 @@ impl Engine {
                     Some(Instrument::Synth(_)) => {
                         let freq = self.song.tuning.freq(slice.min(127) as u8);
                         let synth = &mut self.synths[AUDITION];
-                        synth.note_on(instrument, freq, velocity, 0.0, self.out_rate);
+                        synth.note_on(instrument, &[freq], velocity, 0.0, self.out_rate);
                         synth.note_off_in(0.3 * self.out_rate);
                     }
                     None => {}
@@ -242,15 +255,9 @@ impl Engine {
                     // keep playing if the new song has the very same sample.
                     // Synths read their patch fresh every frame, so they only
                     // need their instrument to still be a synth.
-                    for synth in self.synths.iter_mut().filter(|v| v.is_active()) {
-                        if !self
-                            .song
-                            .instruments
-                            .get(synth.instrument())
-                            .is_some_and(|i| i.is_synth())
-                        {
-                            synth.stop();
-                        }
+                    let instruments = &self.song.instruments;
+                    for synth in &mut self.synths {
+                        synth.retain(|i| instruments.get(i).is_some_and(|i| i.is_synth()));
                     }
                     let voices = self.voices.iter_mut().chain(self.tails.iter_mut());
                     for voice in voices.filter(|v| v.is_active()) {
@@ -286,10 +293,17 @@ impl Engine {
         }
     }
 
+    /// Silence everything and undo automation: rack knobs go back to where
+    /// the rack has them, synth knobs to their patches (in `SynthTrack::stop`).
     fn stop_voices(&mut self) {
         self.voices.iter_mut().for_each(Voice::stop);
         self.tails.iter_mut().for_each(Voice::stop);
-        self.synths.iter_mut().for_each(SynthVoice::stop);
+        self.synths.iter_mut().for_each(SynthTrack::stop);
+        for d in &self.song.rack.devices {
+            for (param, &value) in d.params.iter().enumerate() {
+                self.graph.set_param(d.id, param, value);
+            }
+        }
     }
 
     fn discard(&mut self, garbage: Garbage) {
@@ -325,6 +339,31 @@ impl Engine {
                 Fx::Cut(n) => Some(fpr * n as f64 / 16.0),
                 _ => None,
             });
+            let knob = cell.fx().find_map(|f| match f {
+                Fx::Knob(n) => Some(n as f32 / 255.0),
+                _ => None,
+            });
+            match (knob, self.song.automation(t)) {
+                (Some(k), Some(Target::Rack { device, param })) => {
+                    let spec = self
+                        .song
+                        .rack
+                        .device(device)
+                        .and_then(|d| d.kind.params().get(param));
+                    if let Some(spec) = spec {
+                        self.graph.set_param(device, param, spec.from_knob(k));
+                    }
+                }
+                (Some(k), Some(Target::Synth { param })) => {
+                    if let Some(Instrument::Synth(patch)) =
+                        self.song.instruments.get(track.instrument)
+                        && let Some(spec) = patch.kind.params().get(param)
+                    {
+                        synth.set_override(param, spec.from_knob(k));
+                    }
+                }
+                _ => {}
+            }
             let sample = match self.song.instruments.get(track.instrument) {
                 Some(Instrument::Sampler(sample)) => sample,
                 Some(Instrument::Synth(_)) => {
@@ -335,10 +374,26 @@ impl Engine {
                             Fx::Glide(n) => Some(n as f32 * 4.0),
                             _ => None,
                         });
-                        let freq = self.song.tuning.freq(trigger.slice.min(127) as u8);
+                        // The root, plus any chord notes, each through the tuning.
+                        let root = trigger.slice.min(127) as u8;
+                        let chord = cell.fx().find_map(|f| match f {
+                            Fx::Chord(n) => Some(n),
+                            _ => None,
+                        });
+                        let mut freqs = [0.0; MAX_CHORD];
+                        let mut n = 0;
+                        let notes = std::iter::once(0)
+                            .chain(chord.into_iter().flat_map(Fx::chord_intervals));
+                        for interval in notes.take(MAX_CHORD) {
+                            freqs[n] = self
+                                .song
+                                .tuning
+                                .freq(root.saturating_add(interval).min(127));
+                            n += 1;
+                        }
                         synth.note_on(
                             track.instrument,
-                            freq,
+                            &freqs[..n],
                             trigger.velocity,
                             glide.unwrap_or(0.0),
                             self.out_rate,
@@ -386,6 +441,10 @@ impl Engine {
             self.pos.order += 1;
             if self.pos.order >= self.song.order.len() {
                 self.pos.order = 0;
+                if !self.looping {
+                    // Stop sequencing; voices keep ringing.
+                    self.set_playing(false);
+                }
             }
         }
     }
@@ -416,7 +475,7 @@ impl Engine {
         self.graph.begin(frames);
         for i in 0..frames {
             if self.playing {
-                while self.row_clock <= 0.0 {
+                while self.playing && self.row_clock <= 0.0 {
                     self.fire_row();
                     self.shared_pos.store(pack(self.pos), Ordering::Relaxed);
                     self.advance_row();
@@ -452,9 +511,11 @@ impl Engine {
                     frame = [frame[0] + v[0], frame[1] + v[1]];
                 }
                 let synth = &mut self.synths[t];
-                if synth.is_active()
-                    && let Some(Instrument::Synth(patch)) = instruments.get(synth.instrument())
-                {
+                if synth.is_active() {
+                    let patch = |i: usize| match instruments.get(i) {
+                        Some(Instrument::Synth(p)) => Some(&**p),
+                        _ => None,
+                    };
                     let s = synth.next_frame(patch, self.out_rate);
                     frame = [frame[0] + s[0], frame[1] + s[1]];
                 }

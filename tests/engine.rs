@@ -25,6 +25,7 @@ fn one_track_song(sample: Sample, bpm: f64, rpb: u32, beats: u32) -> Song {
         order: vec![0],
         rack: Rack::simple(1),
         tuning: Default::default(),
+        automation: Vec::new(),
     }
 }
 

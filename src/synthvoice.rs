@@ -109,10 +109,6 @@ impl SynthPatch {
             *v = spec.clamp(*v);
         }
     }
-
-    fn p(&self, i: usize) -> f32 {
-        self.params.get(i).copied().unwrap_or(0.0)
-    }
 }
 
 /// Per-frame multiplier for an envelope that falls by 60 dB (to
@@ -135,6 +131,21 @@ fn poly_blep(t: f64, dt: f64) -> f64 {
         0.0
     }
 }
+
+/// A synth kind and its knob values, as voices read them.
+pub struct Params<'a> {
+    pub kind: SynthKind,
+    pub values: &'a [f32],
+}
+
+impl Params<'_> {
+    fn p(&self, i: usize) -> f32 {
+        self.values.get(i).copied().unwrap_or(0.0)
+    }
+}
+
+/// Most knobs a synth has.
+pub const MAX_PARAMS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum Stage {
@@ -227,6 +238,18 @@ impl SynthVoice {
     }
 
     pub fn next_frame(&mut self, patch: &SynthPatch, rate: f64) -> [f32; 2] {
+        self.next_frame_with(
+            &Params {
+                kind: patch.kind,
+                values: &patch.params,
+            },
+            rate,
+        )
+    }
+
+    /// Render with these knob values, which may differ from the patch's
+    /// (automation changes them without touching the patch).
+    pub fn next_frame_with(&mut self, patch: &Params, rate: f64) -> [f32; 2] {
         if !self.active {
             return [0.0; 2];
         }
@@ -261,7 +284,7 @@ impl SynthVoice {
         [s; 2]
     }
 
-    fn acid(&mut self, patch: &SynthPatch, rate: f64) -> f32 {
+    fn acid(&mut self, patch: &Params, rate: f64) -> f32 {
         use acid::*;
         let dt = (self.freq / rate).min(0.5);
         let t = self.phase;
@@ -305,7 +328,7 @@ impl SynthVoice {
         out * self.amp * level
     }
 
-    fn fm(&mut self, patch: &SynthPatch, rate: f64) -> f32 {
+    fn fm(&mut self, patch: &Params, rate: f64) -> f32 {
         use fm::*;
         let ratio = (patch.p(RATIO) * 2.0).round() as f64 / 2.0;
         let carrier = self.freq * ((patch.p(DETUNE) as f64) / 1200.0).exp2();
@@ -334,6 +357,174 @@ impl SynthVoice {
             Stage::Off => self.amp = 0.0,
         }
         out * self.amp * patch.p(VOLUME) * self.velocity * self.velocity
+    }
+}
+
+/// Voices per synth track: room for a three-note chord plus the release
+/// of the one before.
+pub const POLYPHONY: usize = 4;
+/// Most notes one cell can start: the root and two chord notes.
+pub const MAX_CHORD: usize = 3;
+
+/// A synth track's voices. A new note starts on a free voice while the
+/// previous one releases, so tails overlap instead of being cut short.
+#[derive(Clone, Debug)]
+pub struct SynthTrack {
+    voices: [SynthVoice; POLYPHONY],
+    /// The voices playing the current note or chord, root first.
+    held: [Option<usize>; MAX_CHORD],
+    /// Knob values set by automation, overriding the patch's; NaN where
+    /// there's none.
+    overrides: [f32; MAX_PARAMS],
+}
+
+impl Default for SynthTrack {
+    fn default() -> Self {
+        SynthTrack {
+            voices: Default::default(),
+            held: [None; MAX_CHORD],
+            overrides: [f32::NAN; MAX_PARAMS],
+        }
+    }
+}
+
+impl SynthTrack {
+    pub fn is_active(&self) -> bool {
+        self.voices.iter().any(SynthVoice::is_active)
+    }
+
+    pub fn active_voices(&self) -> usize {
+        self.voices.iter().filter(|v| v.is_active()).count()
+    }
+
+    /// Stop all voices and forget automation.
+    pub fn stop(&mut self) {
+        self.voices.iter_mut().for_each(SynthVoice::stop);
+        self.held = [None; MAX_CHORD];
+        self.overrides = [f32::NAN; MAX_PARAMS];
+    }
+
+    /// Set knob `param` from automation, until the next stop.
+    pub fn set_override(&mut self, param: usize, value: f32) {
+        if let Some(o) = self.overrides.get_mut(param) {
+            *o = value;
+        }
+    }
+
+    /// Stop voices whose instrument `keep` says no to.
+    pub fn retain(&mut self, keep: impl Fn(usize) -> bool) {
+        for v in self
+            .voices
+            .iter_mut()
+            .filter(|v| v.is_active() && !keep(v.instrument))
+        {
+            v.stop();
+        }
+    }
+
+    pub fn take_hit(&mut self) -> bool {
+        self.voices
+            .iter_mut()
+            .fold(false, |hit, v| v.take_hit() | hit)
+    }
+
+    /// Play a note or chord, root first. With `glide_ms` and notes held,
+    /// the held voices slide to the new notes instead of starting over.
+    pub fn note_on(
+        &mut self,
+        instrument: usize,
+        freqs: &[f64],
+        velocity: u8,
+        glide_ms: f32,
+        rate: f64,
+    ) {
+        let freqs = &freqs[..freqs.len().min(MAX_CHORD)];
+        let held = self.held;
+        let mut next = [None; MAX_CHORD];
+        if glide_ms > 0.0 && held.iter().any(Option::is_some) {
+            for (k, &f) in freqs.iter().enumerate() {
+                // Slide a held voice; a chord note with none starts fresh.
+                let v = match held[k] {
+                    Some(v) if self.voices[v].is_active() => v,
+                    _ => self.free_voice(&held, &next),
+                };
+                self.voices[v].note_on(instrument, f, velocity, glide_ms, rate);
+                next[k] = Some(v);
+            }
+            for v in held.iter().skip(freqs.len()).flatten() {
+                self.voices[*v].note_off_in(0.0);
+            }
+        } else {
+            for v in held.iter().flatten() {
+                self.voices[*v].note_off_in(0.0);
+            }
+            for (k, &f) in freqs.iter().enumerate() {
+                let v = self.free_voice(&[None; MAX_CHORD], &next);
+                self.voices[v].note_on(instrument, f, velocity, 0.0, rate);
+                next[k] = Some(v);
+            }
+        }
+        self.held = next;
+    }
+
+    /// A voice to start a note on: a silent one if there is one, otherwise
+    /// the quietest one not in `keep` or `taken`, which starts over.
+    fn free_voice(
+        &mut self,
+        keep: &[Option<usize>; MAX_CHORD],
+        taken: &[Option<usize>; MAX_CHORD],
+    ) -> usize {
+        let open = |i: &usize| !taken.contains(&Some(*i)) && !keep.contains(&Some(*i));
+        if let Some(i) = (0..POLYPHONY)
+            .filter(open)
+            .find(|&i| !self.voices[i].is_active())
+        {
+            return i;
+        }
+        let i = (0..POLYPHONY)
+            .filter(open)
+            .min_by(|&a, &b| self.voices[a].amp.total_cmp(&self.voices[b].amp))
+            .unwrap_or(0);
+        self.voices[i] = SynthVoice::default();
+        i
+    }
+
+    /// Release the held notes after `frames` output frames.
+    pub fn note_off_in(&mut self, frames: f64) {
+        for v in self.held.iter().flatten() {
+            self.voices[*v].note_off_in(frames);
+        }
+    }
+
+    /// Render one frame of all voices. `patch` looks up an instrument's
+    /// synth patch.
+    pub fn next_frame<'a>(
+        &mut self,
+        patch: impl Fn(usize) -> Option<&'a SynthPatch>,
+        rate: f64,
+    ) -> [f32; 2] {
+        let mut out = [0.0f32; 2];
+        let mut values = [0.0f32; MAX_PARAMS];
+        for v in self.voices.iter_mut().filter(|v| v.is_active()) {
+            let Some(p) = patch(v.instrument) else {
+                v.stop();
+                continue;
+            };
+            let n = p.params.len().min(MAX_PARAMS);
+            for (i, value) in values[..n].iter_mut().enumerate() {
+                let o = self.overrides[i];
+                *value = if o.is_nan() { p.params[i] } else { o };
+            }
+            let s = v.next_frame_with(
+                &Params {
+                    kind: p.kind,
+                    values: &values[..n],
+                },
+                rate,
+            );
+            out = [out[0] + s[0], out[1] + s[1]];
+        }
+        out
     }
 }
 
@@ -416,6 +607,61 @@ mod tests {
                 "{kind:?} peak {peak}"
             );
         }
+    }
+
+    #[test]
+    fn chords_use_a_voice_per_note() {
+        let patch = SynthPatch::new(SynthKind::Fm, "t");
+        let mut t = SynthTrack::default();
+        t.note_on(0, &[220.0, 277.2, 329.6], 100, 0.0, RATE);
+        assert_eq!(t.active_voices(), 3);
+        for _ in 0..1000 {
+            t.next_frame(|_| Some(&patch), RATE);
+        }
+        // A new note: the chord releases while the note starts.
+        t.note_on(0, &[110.0], 100, 0.0, RATE);
+        assert_eq!(
+            t.active_voices(),
+            4,
+            "the chord's releases overlap the new note"
+        );
+        t.note_off_in(0.0);
+        for _ in 0..48_000 * 4 {
+            t.next_frame(|_| Some(&patch), RATE);
+        }
+        assert!(!t.is_active());
+    }
+
+    #[test]
+    fn a_fifth_chord_note_steals_the_quietest_voice() {
+        let patch = SynthPatch::new(SynthKind::Fm, "t");
+        let mut t = SynthTrack::default();
+        t.note_on(0, &[100.0, 200.0, 300.0], 100, 0.0, RATE);
+        t.next_frame(|_| Some(&patch), RATE);
+        t.note_on(0, &[400.0, 500.0], 100, 0.0, RATE);
+        assert_eq!(t.active_voices(), POLYPHONY);
+        let held: Vec<f64> = t
+            .held
+            .iter()
+            .flatten()
+            .map(|&v| t.voices[v].target)
+            .collect();
+        assert_eq!(held, vec![400.0, 500.0]);
+    }
+
+    #[test]
+    fn chords_glide_note_for_note() {
+        let patch = SynthPatch::new(SynthKind::Acid, "t");
+        let mut t = SynthTrack::default();
+        t.note_on(0, &[100.0, 150.0], 100, 0.0, RATE);
+        t.next_frame(|_| Some(&patch), RATE);
+        t.note_on(0, &[200.0, 300.0], 100, 20.0, RATE);
+        assert_eq!(t.active_voices(), 2, "slid, not restarted");
+        for _ in 0..2000 {
+            t.next_frame(|_| Some(&patch), RATE);
+        }
+        let freqs: Vec<f64> = t.held.iter().flatten().map(|&v| t.voices[v].freq).collect();
+        assert_eq!(freqs, vec![200.0, 300.0]);
     }
 
     #[test]

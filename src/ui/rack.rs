@@ -226,10 +226,21 @@ pub struct Output {
     /// Set when a gesture that changed the rack has finished: the rack as it
     /// was before, for undo. A whole knob drag or cable move is one step.
     pub undo: Option<Rack>,
+    /// A knob that was right-clicked: make it the cursor track's
+    /// automation target (or unmake it).
+    pub bind: Option<(DeviceId, usize)>,
 }
 
 impl RackView {
-    pub fn show(&mut self, ui: &mut egui::Ui, rack: &mut Rack, track_names: &[String]) -> Output {
+    /// `automated` is the knob the cursor's track automates, to mark it.
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        rack: &mut Rack,
+        track_names: &[String],
+        automated: Option<(DeviceId, usize)>,
+    ) -> Output {
+        let mut bind = None;
         let area = ui.max_rect();
         let font = FontId::monospace(13.0);
         let small = FontId::monospace(11.0);
@@ -333,6 +344,11 @@ impl RackView {
             self.drag = None;
             undo = self.before.take().filter(|b| !b.same_patch(rack));
         }
+        if response.secondary_clicked()
+            && let Some(p) = pointer
+        {
+            bind = l.knob_at(p);
+        }
         if response.double_clicked()
             && let Some(p) = pointer
             && let Some((device, param)) = l.knob_at(p)
@@ -426,7 +442,15 @@ impl RackView {
         }
         for &(id, param, c) in &l.knobs {
             let d = rack.device(id).unwrap();
-            super::knob::draw(p, c, &d.kind.params()[param], d.params[param], &small);
+            let marked = automated == Some((id, param));
+            super::knob::draw(
+                p,
+                c,
+                &d.kind.params()[param],
+                d.params[param],
+                &small,
+                marked,
+            );
         }
         for &(jack, is_input, signal, c) in &l.jacks {
             let d = rack.device(jack.device).unwrap();
@@ -484,6 +508,7 @@ impl RackView {
         Output {
             params: changes,
             undo,
+            bind,
         }
     }
 }
@@ -523,7 +548,7 @@ mod tests {
             let (view, rack, changes) = (&mut self.view, &mut self.rack, &mut self.changes);
             let mut undos = 0;
             let mut full = self.ctx.run_ui(input, |ui| {
-                let out = view.show(ui, rack, &[]);
+                let out = view.show(ui, rack, &[], None);
                 changes.extend(out.params);
                 undos += out.undo.is_some() as usize;
             });

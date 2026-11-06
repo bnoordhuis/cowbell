@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use cowbell::engine::Engine;
@@ -10,7 +10,10 @@ usage:
   cowbell [PROJECT.cowbell] [--break FILE.wav]
                                            open the tracker, and the project
                                            if it exists
-  cowbell render [--break FILE.wav] [--seconds N] OUT.wav
+  cowbell render [PROJECT.cowbell] [--seconds N] OUT.wav
+                                           export the project (or the demo)
+                                           once through, with its tail;
+                                           --seconds renders a fixed length
   cowbell play   [--break FILE.wav]        (needs --features live)
 
 Plays the demo song. --break slices your own break instead of the built-in one.";
@@ -19,7 +22,8 @@ struct Args {
     command: String,
     brk: Option<PathBuf>,
     seconds: f64,
-    out: Option<PathBuf>,
+    /// File arguments, in order.
+    files: Vec<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -28,7 +32,7 @@ fn parse_args() -> Result<Args, String> {
         command: String::from("ui"),
         brk: None,
         seconds: 0.0,
-        out: None,
+        files: Vec::new(),
     };
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -39,10 +43,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "-h" | "--help" => args.command = "help".into(),
             _ if arg.starts_with("--") => return Err(format!("unknown option {arg}")),
-            "render" | "play" | "help" if args.command == "ui" && args.out.is_none() => {
+            "render" | "play" | "help" if args.command == "ui" && args.files.is_empty() => {
                 args.command = arg
             }
-            _ => args.out = Some(arg.into()),
+            _ => args.files.push(arg.into()),
         }
     }
     Ok(args)
@@ -61,47 +65,33 @@ fn load_break(path: Option<&PathBuf>) -> Result<Sample, String> {
     }
 }
 
-fn render(args: &Args) -> Result<(), String> {
-    const RATE: u32 = 48_000;
-    let out = args.out.as_ref().ok_or("render needs an output file")?;
-    let song = demo::song(load_break(args.brk.as_ref())?);
-    let seconds = if args.seconds > 0.0 {
-        args.seconds
-    } else {
-        // Once through the order list.
-        let beats: f64 = song
-            .order
-            .iter()
-            .map(|&p| {
-                let p = &song.patterns[p];
-                p.rows as f64 / p.rows_per_beat as f64
-            })
-            .sum();
-        beats * 60.0 / song.bpm
-    };
-    let (mut engine, _controller) = Engine::new(RATE, song);
-    engine.play();
+fn is_project(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e == cowbell::project::EXTENSION)
+}
 
-    let spec = hound::WavSpec {
-        channels: 2,
-        sample_rate: RATE,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
+fn render(args: &Args) -> Result<(), String> {
+    let (song, out) = match args.files.as_slice() {
+        [project, out] if is_project(project) => (cowbell::project::load(project)?, out),
+        [out] if !is_project(out) => (demo::song(load_break(args.brk.as_ref())?), out),
+        _ => return Err("render needs [PROJECT.cowbell] OUT.wav".into()),
     };
-    let err = |e: hound::Error| format!("{}: {e}", out.display());
-    let mut writer = hound::WavWriter::create(out, spec).map_err(err)?;
-    let mut left = (seconds * RATE as f64).round() as usize;
-    let mut buf = vec![0.0f32; 2 * 512];
-    while left > 0 {
-        let n = left.min(512);
-        engine.process(&mut buf[..2 * n]);
-        for &s in &buf[..2 * n] {
-            writer.write_sample(s).map_err(err)?;
-        }
-        left -= n;
+    if args.seconds > 0.0 {
+        // A fixed length, looping the song if it's shorter.
+        const RATE: u32 = cowbell::export::RATE;
+        let (mut engine, _controller) = Engine::new(RATE, song);
+        engine.play();
+        let mut buf = vec![0.0f32; 2 * (args.seconds * RATE as f64).round() as usize];
+        engine.process(&mut buf);
+        let frames = buf.as_chunks::<2>().0.to_vec();
+        Sample::new("render", RATE, frames)
+            .save_wav(out)
+            .map_err(|e| format!("{}: {e}", out.display()))?;
+        eprintln!("wrote {:.2}s to {}", args.seconds, out.display());
+    } else {
+        let seconds = cowbell::export::export_wav(&song, out)?;
+        eprintln!("wrote {seconds:.2}s to {}", out.display());
     }
-    writer.finalize().map_err(err)?;
-    eprintln!("wrote {:.2}s to {}", seconds, out.display());
     Ok(())
 }
 
@@ -134,11 +124,12 @@ fn play(_: &Args) -> Result<(), String> {
 fn ui(args: &Args) -> Result<(), String> {
     // An existing project opens; a new path is where the demo song will be
     // saved.
-    let song = match &args.out {
+    let project = args.files.first();
+    let song = match project {
         Some(path) if path.exists() => cowbell::project::load(path)?,
         _ => demo::song(load_break(args.brk.as_ref())?),
     };
-    cowbell::ui::run(song, args.out.clone())
+    cowbell::ui::run(song, project.cloned())
 }
 
 #[cfg(not(feature = "ui"))]

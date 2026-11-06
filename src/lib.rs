@@ -6,6 +6,7 @@ pub mod bounce;
 pub mod demo;
 pub mod editor;
 pub mod engine;
+pub mod export;
 pub mod graph;
 pub mod pattern;
 pub mod project;
@@ -15,6 +16,8 @@ pub mod synth;
 pub mod synthvoice;
 pub mod transform;
 pub mod tuning;
+pub mod tutorial;
 #[cfg(feature = "ui")]
 pub mod ui;
+pub mod variations;
 pub mod voice;

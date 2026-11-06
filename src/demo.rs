@@ -80,6 +80,7 @@ pub fn song(brk: Sample) -> Song {
         order: vec![0, 1, 0, 1],
         rack: rack(),
         tuning: Default::default(),
+        automation: Vec::new(),
     }
 }
 

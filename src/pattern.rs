@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::rack::Rack;
+use crate::rack::{DeviceId, Rack};
 use crate::sample::Sample;
 use crate::synthvoice::SynthPatch;
 use crate::tuning::Tuning;
@@ -35,6 +35,28 @@ pub enum Fx {
     /// Synths: slide from the held note to this one over `n` × 4 ms,
     /// without restarting the envelopes.
     Glide(u8),
+    /// Synths: also play the notes `x` and `y` semitones above, for
+    /// `n = 0xXY`. `H47` is a major chord; a 0 nibble adds nothing.
+    Chord(u8),
+    /// Set the track's automation target (see [`Target`]) to `n/FF` of
+    /// its range.
+    Knob(u8),
+}
+
+/// The knob a track's `Knob` effects turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Target {
+    /// A knob in the rack.
+    Rack { device: DeviceId, param: usize },
+    /// A knob of the synth the track plays.
+    Synth { param: usize },
+}
+
+impl Fx {
+    /// The semitones a `Chord` adds above the root.
+    pub fn chord_intervals(n: u8) -> impl Iterator<Item = u8> {
+        [n >> 4, n & 0x0f].into_iter().filter(|&i| i > 0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,4 +158,12 @@ pub struct Song {
     pub rack: Rack,
     /// Which frequency each note plays, for synths.
     pub tuning: Tuning,
+    /// Per track (by column): the knob its `Knob` effects turn.
+    pub automation: Vec<Option<Target>>,
+}
+
+impl Song {
+    pub fn automation(&self, track: usize) -> Option<Target> {
+        self.automation.get(track).copied().flatten()
+    }
 }
