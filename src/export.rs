@@ -1,10 +1,10 @@
-//! Export a song to a WAV file: once through the order list, then until
-//! the last notes and echoes have died out.
+//! Export a song to a WAV file: once through, then until the last notes and
+//! echoes have died out.
 
 use std::path::Path;
 
 use crate::engine::Engine;
-use crate::pattern::Song;
+use crate::song::Song;
 
 pub const RATE: u32 = 48_000;
 /// Longest tail after the song ends, for releases and delay echoes.
@@ -13,15 +13,10 @@ const MAX_TAIL_S: f64 = 10.0;
 const QUIET_S: f64 = 0.5;
 const SILENCE: f32 = 1e-4;
 
-/// Length of one pass through the order list, in seconds.
+/// Length of the song, to the end of the bar its last clip ends in, in
+/// seconds.
 pub fn song_seconds(song: &Song) -> f64 {
-    let beats: f64 = song
-        .order
-        .iter()
-        .filter_map(|&p| song.patterns.get(p))
-        .map(|p| p.rows as f64 / p.rows_per_beat.max(1) as f64)
-        .sum();
-    beats * 60.0 / song.bpm.max(1.0)
+    song.end() as f64 * song.tick_seconds()
 }
 
 /// Render the song once, with its tail, as stereo frames at [`RATE`].

@@ -1,16 +1,12 @@
 //! Dev-only screenshots, for checking the UI without a person at the screen.
 //!
 //! `COWBELL_SCREENSHOT=out.ppm` saves the window as a binary PPM and exits.
-//! `COWBELL_KEYS` is a key script run first, to set up what's on screen:
-//! plain characters are typed, and `<name>` is a key, e.g.
-//! `<ctrl-right><down><down>03<sdown><sdown><roll>`.
+//! `COWBELL_VIEW=rack` shows the rack instead of the arrangement.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui;
-
-use crate::editor::{Action, Editor};
 
 pub struct Screenshot {
     path: String,
@@ -20,9 +16,8 @@ pub struct Screenshot {
 }
 
 impl Screenshot {
-    pub fn from_env(editor: &mut Editor) -> Option<Self> {
+    pub fn from_env() -> Option<Self> {
         let path = std::env::var("COWBELL_SCREENSHOT").ok()?;
-        apply_keys(editor);
         Some(Screenshot {
             path,
             frames: 0,
@@ -63,59 +58,4 @@ fn write_ppm(path: &str, image: &egui::ColorImage) -> std::io::Result<()> {
         out.extend_from_slice(&[p.r(), p.g(), p.b()]);
     }
     std::fs::write(path, out)
-}
-
-/// Run the `COWBELL_KEYS` script, if any, on `editor`.
-pub fn apply_keys(editor: &mut Editor) {
-    if let Ok(keys) = std::env::var("COWBELL_KEYS") {
-        for action in parse_keys(&keys) {
-            editor.apply(action);
-        }
-        // Don't make a noise for slices typed by the script.
-        editor.audition = None;
-    }
-}
-
-fn parse_keys(script: &str) -> Vec<Action> {
-    let mut actions = Vec::new();
-    let mut rest = script;
-    while let Some(c) = rest.chars().next() {
-        if c == '<'
-            && let Some(end) = rest.find('>')
-        {
-            let action = match &rest[1..end] {
-                "up" => Action::Up,
-                "down" => Action::Down,
-                "left" => Action::Left,
-                "right" => Action::Right,
-                "sup" => Action::SelectUp,
-                "sdown" => Action::SelectDown,
-                "tab" => Action::NextTrack,
-                "ctrl-right" => Action::NextOrder,
-                "ctrl-left" => Action::PrevOrder,
-                "roll" => Action::Roll,
-                "bounce" => Action::Bounce,
-                "variations" => Action::Variations,
-                "interpolate" => Action::Interpolate,
-                "addtrack" => Action::AddTrack,
-                "acid" => Action::AddSynth(crate::synthvoice::SynthKind::Acid),
-                "fm" => Action::AddSynth(crate::synthvoice::SynthKind::Fm),
-                "undo" => Action::Undo,
-                "redo" => Action::Redo,
-                "del" => Action::Clear,
-                "pgdn" => Action::PageDown,
-                other => {
-                    eprintln!("COWBELL_KEYS: unknown key <{other}>");
-                    rest = &rest[end + 1..];
-                    continue;
-                }
-            };
-            actions.push(action);
-            rest = &rest[end + 1..];
-        } else {
-            actions.push(Action::Char(c));
-            rest = &rest[c.len_utf8()..];
-        }
-    }
-    actions
 }

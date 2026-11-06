@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use crate::pattern::{Cell, Fx, Instrument, Pattern, Song};
 use crate::rack::{Jack, Kind, Rack};
 use crate::sample::Sample;
+use crate::song::{Cell, Clip, Fx, Instrument, Song, TICKS_PER_BEAT, Track};
 use crate::transform::Roll;
 
 pub const BPM: f64 = 172.0;
@@ -14,11 +14,11 @@ pub fn song(brk: Sample) -> Song {
     let n = brk.slices.len().max(1) as u16;
     let s = |i: u16| i % n;
     let instruments = vec![Instrument::Sampler(Arc::new(brk))];
-    let tracks = [("brk", 0), ("snr", 0)];
+    let beat = |b: u64| b * TICKS_PER_BEAT;
 
-    // Pattern 0: two bars in 16ths. The break mostly as recorded, with a few
-    // hits edited.
-    let mut p0 = Pattern::new(4, 8, &tracks);
+    // A: two bars in 16ths. The break mostly as recorded, with a few hits
+    // edited.
+    let mut a = Clip::beats(0, 4, 8);
     let straight = [
         (0, 0),
         (2, 1),
@@ -41,7 +41,7 @@ pub fn song(brk: Sample) -> Song {
         (30, 18),
         (31, 19),
     ];
-    let brk = &mut p0.tracks[0].cells;
+    let brk = &mut a.cells;
     for (row, slice) in straight {
         brk[row] = Cell::hit(s(slice), 110);
     }
@@ -52,10 +52,11 @@ pub fn song(brk: Sample) -> Song {
     brk[24] = Cell::hit(s(12), 120).with_fx(Fx::Crush(4));
     brk[29] = Cell::default().with_fx(Fx::Cut(4));
 
-    // Pattern 1: one bar in 32nds. Chopped up, with a stutter and a roll that
-    // speeds up and pitches up into the next bar.
-    let mut p1 = Pattern::new(8, 4, &tracks);
-    let brk = &mut p1.tracks[0].cells;
+    // B: one bar in 32nds. Chopped up, with a stutter, and on the snare
+    // track a roll that speeds up and pitches up into the next bar.
+    let mut b = Clip::beats(0, 8, 4);
+    let mut roll = Clip::beats(0, 8, 4);
+    let brk = &mut b.cells;
     brk[0] = Cell::hit(s(0), 120);
     brk[4] = Cell::hit(s(5), 100).with_fx(Fx::Retrig(3));
     brk[6] = Cell::hit(s(2), 110);
@@ -71,17 +72,24 @@ pub fn song(brk: Sample) -> Song {
         velocity: (70, 120),
         curve: 2.0,
     }
-    .apply(&mut p1.tracks[1], 20..32);
+    .apply(&mut roll.cells, 20..32);
 
-    Song {
-        bpm: BPM,
-        instruments,
-        patterns: vec![p0, p1],
-        order: vec![0, 1, 0, 1],
-        rack: rack(),
-        tuning: Default::default(),
-        automation: Vec::new(),
-    }
+    // A B A B.
+    let at = |clip: &Clip, start: u64| Clip {
+        start: beat(start),
+        ..clip.clone()
+    };
+    let brk = Track::new("brk", 0)
+        .with_clip(at(&a, 0))
+        .with_clip(at(&b, 8))
+        .with_clip(at(&a, 12))
+        .with_clip(at(&b, 20));
+    let snr = Track::new("snr", 0)
+        .with_clip(at(&roll, 8))
+        .with_clip(at(&roll, 20));
+    let mut song = Song::new(BPM, instruments, vec![brk, snr]);
+    song.rack = rack();
+    song
 }
 
 /// brk -> crusher -> mixer 1

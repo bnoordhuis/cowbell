@@ -3,7 +3,7 @@
 
 use std::ops::Range;
 
-use crate::pattern::{Cell, Fx, Track};
+use crate::song::{Cell, Fx};
 
 /// A snare roll: one trigger per row, with the retrigger count, pitch and
 /// velocity swept from start to end.
@@ -19,8 +19,8 @@ pub struct Roll {
 }
 
 impl Roll {
-    pub fn apply(&self, track: &mut Track, rows: Range<usize>) {
-        let rows = rows.start.min(track.cells.len())..rows.end.min(track.cells.len());
+    pub fn apply(&self, cells: &mut [Cell], rows: Range<usize>) {
+        let rows = rows.start.min(cells.len())..rows.end.min(cells.len());
         let n = rows.len();
         for (i, row) in rows.enumerate() {
             let t = if n > 1 {
@@ -37,7 +37,7 @@ impl Roll {
             if pitch != 0 {
                 cell = cell.with_fx(Fx::Pitch(pitch));
             }
-            track.cells[row] = cell;
+            cells[row] = cell;
         }
     }
 }

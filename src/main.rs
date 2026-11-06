@@ -8,7 +8,7 @@ use cowbell::{demo, synth};
 const USAGE: &str = "\
 usage:
   cowbell [PROJECT.cowbell] [--break FILE.wav]
-                                           open the tracker, and the project
+                                           open the window, and the project
                                            if it exists
   cowbell render [PROJECT.cowbell] [--seconds N] OUT.wav
                                            export the project (or the demo)

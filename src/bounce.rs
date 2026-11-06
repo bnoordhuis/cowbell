@@ -1,23 +1,23 @@
-//! Bounce: render rows of a pattern, through the rack, to a new sample, and
-//! slice it on row boundaries so it can be re-sequenced.
+//! Bounce: render a stretch of the song, through the rack, to a new sample,
+//! and slice it on row boundaries so it can be re-sequenced.
 //!
 //! Slice starts are moved back to the start of the row a hit falls in. A
 //! slice then always starts exactly where the engine starts a row, so
 //! triggering each slice on its row plays the bounce back sample for sample.
 
-use std::ops::Range;
+use std::sync::Arc;
 
-use crate::engine::{Command, Engine, Position, frames_per_row};
-use crate::pattern::Song;
+use crate::engine::{Command, Engine, MAX_TRACKS, frames_per_tick};
 use crate::sample::Sample;
+use crate::song::{Cell, Clip, Instrument, Song, TICKS_PER_BEAT, Tick, Track};
 
 /// Bounces are rendered at this rate; voices resample on playback.
 pub const RATE: u32 = 48_000;
 
-/// The frame each row starts on, relative to the first, for `n` rows (plus
-/// one entry for the end). Mirrors the engine's arithmetic exactly, so the
-/// result matches where it really fires rows.
-pub fn row_starts(n: usize, fpr: f64) -> Vec<usize> {
+/// The frame each of `n` ticks starts on, relative to the first, plus one
+/// entry for the end. Mirrors the engine's clock exactly, so the result
+/// matches where it really fires rows.
+pub fn tick_starts(n: usize, fpt: f64) -> Vec<usize> {
     let mut starts = Vec::with_capacity(n + 1);
     let (mut clock, mut frame) = (0.0f64, 0usize);
     for _ in 0..=n {
@@ -26,7 +26,7 @@ pub fn row_starts(n: usize, fpr: f64) -> Vec<usize> {
             frame += 1;
         }
         starts.push(frame);
-        clock += fpr;
+        clock += fpt;
     }
     starts
 }
@@ -38,22 +38,18 @@ pub struct Bounce {
     pub slice_rows: Vec<usize>,
 }
 
-/// Render `rows` of the pattern at `order` and slice the result.
-pub fn bounce(song: &Song, order: usize, rows: Range<usize>, name: &str) -> Bounce {
-    let rpb = song
-        .order
-        .get(order)
-        .and_then(|&p| song.patterns.get(p))
-        .map_or(4, |p| p.rows_per_beat);
-    let fpr = frames_per_row(RATE as f64, song.bpm, rpb);
-    let starts = row_starts(rows.len(), fpr);
+/// Render `rows` rows of a `rows_per_beat` grid from `start`, and slice the
+/// result on that grid.
+pub fn bounce(song: &Song, start: Tick, rows: usize, rows_per_beat: u32, name: &str) -> Bounce {
+    let tpr = (TICKS_PER_BEAT / rows_per_beat.max(1) as Tick) as usize;
+    let ticks = tick_starts(rows * tpr, frames_per_tick(RATE as f64, song.bpm));
+    let starts: Vec<usize> = ticks.iter().step_by(tpr).copied().collect();
     let len = *starts.last().unwrap();
 
     let (mut engine, mut controller) = Engine::new(RATE, song.clone());
-    let _ = controller.send(Command::PlayFrom(Position {
-        order,
-        row: rows.start,
-    }));
+    // Straight through, whatever the loop range says.
+    engine.set_looping(false);
+    let _ = controller.send(Command::PlayFrom(start));
     let mut buf = vec![0.0f32; 2 * len];
     for block in buf.chunks_mut(2 * 1024) {
         engine.process(block);
@@ -62,7 +58,7 @@ pub fn bounce(song: &Song, order: usize, rows: Range<usize>, name: &str) -> Boun
 
     let mut sample = Sample::new(name, RATE, frames);
     // Hits closer than a row apart can't get a row each anyway.
-    let row_ms = (fpr / RATE as f64 * 1000.0) as f32;
+    let row_ms = ((starts[1] - starts[0]) as f64 / RATE as f64 * 1000.0) as f32;
     sample.detect_slices(0.6, row_ms.min(60.0));
     let mut slice_rows: Vec<usize> = sample
         .slices
@@ -72,9 +68,47 @@ pub fn bounce(song: &Song, order: usize, rows: Range<usize>, name: &str) -> Boun
     slice_rows.push(0);
     slice_rows.sort_unstable();
     slice_rows.dedup();
-    slice_rows.retain(|&r| r < rows.len());
+    slice_rows.retain(|&r| r < rows);
     sample.slices = slice_rows.iter().map(|&r| starts[r]).collect();
     Bounce { sample, slice_rows }
+}
+
+/// Replace a stretch of the song with its bounce: the audio goes to a new
+/// sample, played by a new track with a clip of its slices, and the cells it
+/// replaces are cleared. Returns the new track.
+pub fn bounce_to_track(
+    song: &mut Song,
+    start: Tick,
+    rows: usize,
+    rows_per_beat: u32,
+) -> Result<usize, String> {
+    let t = song.tracks.len();
+    if t >= MAX_TRACKS {
+        return Err(format!("can't bounce: already {t} tracks"));
+    }
+    let n = song.instruments.len();
+    let b = bounce(song, start, rows, rows_per_beat, &format!("bounce{n}"));
+
+    let mut clip = Clip::new(start, rows_per_beat, rows);
+    let end = clip.end();
+    for (slice, &r) in b.slice_rows.iter().enumerate() {
+        clip.cells[r] = Cell::hit(slice as u16, 0x7f);
+    }
+    for track in &mut song.tracks {
+        for c in &mut track.clips {
+            for row in 0..c.cells.len() {
+                if (start..end).contains(&c.row_tick(row)) {
+                    c.cells[row] = Cell::default();
+                }
+            }
+        }
+    }
+    song.instruments
+        .push(Instrument::Sampler(Arc::new(b.sample)));
+    song.tracks
+        .push(Track::new(&format!("b{n}"), n).with_clip(clip));
+    song.rack.add_track(t);
+    Ok(t)
 }
 
 #[cfg(test)]
@@ -82,10 +116,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn row_starts_match_whole_frames() {
-        assert_eq!(row_starts(3, 100.0), vec![0, 100, 200, 300]);
-        // 2.5 frames per row: rows start on the first frame at or after
+    fn tick_starts_match_whole_frames() {
+        assert_eq!(tick_starts(3, 100.0), vec![0, 100, 200, 300]);
+        // 2.5 frames per tick: ticks start on the first frame at or after
         // each boundary.
-        assert_eq!(row_starts(4, 2.5), vec![0, 3, 5, 8, 10]);
+        assert_eq!(tick_starts(4, 2.5), vec![0, 3, 5, 8, 10]);
     }
 }

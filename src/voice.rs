@@ -10,8 +10,8 @@
 //! (see [`Voice::steal_into`]) that fades it while the new note starts at
 //! full level. Attacks are never faded.
 
-use crate::pattern::{Fx, Trigger};
 use crate::sample::Sample;
+use crate::song::{Fx, Trigger};
 
 /// Length of a declick fade.
 pub const FADE_MS: f64 = 1.5;

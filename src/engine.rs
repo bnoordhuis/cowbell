@@ -1,5 +1,6 @@
-//! The audio engine: a sample-accurate row scheduler driving one voice per
-//! track, with the track outputs running through the rack's [`Graph`].
+//! The audio engine: a sample-accurate tick clock firing each track's clip
+//! rows, driving one voice per track, with the track outputs running through
+//! the rack's [`Graph`].
 //!
 //! The engine lives on the audio thread. Everything else talks to it through
 //! a [`Controller`], over lock-free queues. The engine never allocates or
@@ -12,8 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::graph::{BLOCK, Graph};
-use crate::pattern::{Fx, Instrument, Song, Target, Trigger};
 use crate::rack::DeviceId;
+use crate::song::{Cell, Fx, Instrument, Song, TICKS_PER_BEAT, Target, Tick, Trigger};
 use crate::synthvoice::{MAX_CHORD, SynthTrack};
 use crate::voice::Voice;
 
@@ -22,10 +23,14 @@ pub const MAX_TRACKS: usize = 16;
 const AUDITION: usize = MAX_TRACKS;
 
 pub enum Command {
+    /// Play from where the playhead is.
     Play,
-    /// Start playing at this row.
-    PlayFrom(Position),
+    /// Start playing at this tick.
+    PlayFrom(Tick),
+    /// Stop sequencing. The playhead stays where it is.
     Stop,
+    /// Move the playhead, playing or not.
+    Locate(Tick),
     /// Preview a slice or synth note, independent of the song. A held
     /// synth note rings until [`Command::Release`]; otherwise it's short.
     Audition {
@@ -37,9 +42,9 @@ pub enum Command {
     /// Release held audition notes.
     Release,
     SetBpm(f64),
-    /// Replace the song. Playback continues from the same order position and
-    /// row, as far as the new song has them. Notes keep ringing if their
-    /// sample is the same in the new song.
+    /// Replace the song. Playback continues from the same tick, if the new
+    /// song is that long. Notes keep ringing if their sample is the same in
+    /// the new song.
     SwapSong(Box<Song>),
     /// Replace the device graph, after the rack was re-patched. Filter,
     /// delay and LFO state carries over to devices that are still there.
@@ -58,24 +63,18 @@ pub enum Garbage {
     Graph(#[allow(dead_code)] Box<Graph>),
 }
 
-/// Where the engine is: `(order index, row)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Position {
-    pub order: usize,
-    pub row: usize,
-}
-
 pub struct Engine {
     out_rate: f64,
     song: Box<Song>,
     playing: bool,
-    /// Whether the song starts over after the last order slot. Off for
-    /// exporting, where the sequencer stops and notes ring out.
+    /// Whether the song starts over at the end, and the loop range loops.
+    /// Off for exporting, where the sequencer stops and notes ring out.
     looping: bool,
-    pos: Position,
-    /// Output frames until the next row starts. Fractional, so rows land on
-    /// the right frame even when a row isn't a whole number of frames long.
-    row_clock: f64,
+    /// The next tick to fire.
+    pos: Tick,
+    /// Output frames until the next tick. Fractional, so ticks land on the
+    /// right frame even when a tick isn't a whole number of frames long.
+    tick_clock: f64,
     voices: [Voice; MAX_TRACKS + 1],
     /// Per track, the sound a voice was making when it was stolen or
     /// retriggered, fading out under the new note. Only used with declick.
@@ -113,9 +112,9 @@ impl Controller {
         while self.trash.pop().is_ok() {}
     }
 
-    /// The row being played, for drawing the playhead.
-    pub fn position(&self) -> Position {
-        unpack(self.shared_pos.load(Ordering::Relaxed))
+    /// The tick last played (or located to), for drawing the playhead.
+    pub fn position(&self) -> Tick {
+        self.shared_pos.load(Ordering::Relaxed)
     }
 
     pub fn is_playing(&self) -> bool {
@@ -129,15 +128,9 @@ pub fn frames_per_row(out_rate: f64, bpm: f64, rows_per_beat: u32) -> f64 {
     out_rate * 60.0 / (bpm.max(1.0) * rows_per_beat.max(1) as f64)
 }
 
-fn pack(p: Position) -> u64 {
-    (p.order as u64) << 32 | p.row as u64 & 0xffff_ffff
-}
-
-fn unpack(v: u64) -> Position {
-    Position {
-        order: (v >> 32) as usize,
-        row: (v & 0xffff_ffff) as usize,
-    }
+/// Output frames per tick. Shared with [`crate::bounce`] too.
+pub fn frames_per_tick(out_rate: f64, bpm: f64) -> f64 {
+    out_rate * 60.0 / (bpm.max(1.0) * TICKS_PER_BEAT as f64)
 }
 
 impl Engine {
@@ -152,8 +145,8 @@ impl Engine {
             song: Box::new(song),
             playing: false,
             looping: true,
-            pos: Position { order: 0, row: 0 },
-            row_clock: 0.0,
+            pos: 0,
+            tick_clock: 0.0,
             voices: Default::default(),
             tails: Default::default(),
             synths: Default::default(),
@@ -173,7 +166,7 @@ impl Engine {
         (engine, controller)
     }
 
-    /// Play the order list once instead of looping it.
+    /// Play the song once instead of looping it, ignoring the loop range.
     pub fn set_looping(&mut self, looping: bool) {
         self.looping = looping;
     }
@@ -191,40 +184,32 @@ impl Engine {
         self.shared_playing.store(playing, Ordering::Relaxed);
     }
 
-    pub fn position(&self) -> Position {
+    pub fn position(&self) -> Tick {
         self.pos
     }
 
-    fn frames_per_row(&self) -> f64 {
-        let pattern = self
-            .song
-            .order
-            .get(self.pos.order)
-            .and_then(|&p| self.song.patterns.get(p));
-        frames_per_row(
-            self.out_rate,
-            self.song.bpm,
-            pattern.map_or(4, |p| p.rows_per_beat),
-        )
+    fn locate(&mut self, tick: Tick) {
+        self.pos = if tick < self.song.end() { tick } else { 0 };
+        self.tick_clock = 0.0;
+        self.shared_pos.store(self.pos, Ordering::Relaxed);
     }
 
     fn handle_commands(&mut self) {
         while let Ok(cmd) = self.commands.pop() {
             match cmd {
                 Command::Play => self.set_playing(true),
-                Command::PlayFrom(pos) => {
-                    self.pos = pos;
-                    if self.pos.order >= self.song.order.len() {
-                        self.pos = Position { order: 0, row: 0 };
-                    }
-                    self.row_clock = 0.0;
+                Command::PlayFrom(tick) => {
+                    self.locate(tick);
                     self.stop_voices();
                     self.set_playing(true);
                 }
+                Command::Locate(tick) => {
+                    self.locate(tick);
+                    self.stop_voices();
+                }
                 Command::Stop => {
                     self.set_playing(false);
-                    self.pos = Position { order: 0, row: 0 };
-                    self.row_clock = 0.0;
+                    self.tick_clock = 0.0;
                     self.stop_voices();
                 }
                 Command::Release => self.synths[AUDITION].note_off_in(0.0),
@@ -236,7 +221,9 @@ impl Engine {
                 } => match self.song.instruments.get(instrument) {
                     Some(Instrument::Sampler(sample)) => {
                         let trigger = Trigger { slice, velocity };
-                        let fpr = self.frames_per_row();
+                        // Effects are timed by rows; auditions have none, so
+                        // any row length will do.
+                        let fpr = frames_per_row(self.out_rate, self.song.bpm, 4);
                         self.voices[AUDITION].trigger(
                             instrument,
                             sample,
@@ -282,8 +269,8 @@ impl Engine {
                             voice.stop();
                         }
                     }
-                    if self.pos.order >= self.song.order.len() {
-                        self.pos = Position { order: 0, row: 0 };
+                    if self.pos >= self.song.end() {
+                        self.locate(0);
                     }
                     self.discard(Garbage::Song(old));
                 }
@@ -323,136 +310,129 @@ impl Engine {
         }
     }
 
-    /// Fire the cells of the current row.
-    fn fire_row(&mut self) {
-        let Some(pattern) = self
-            .song
-            .order
-            .get(self.pos.order)
-            .and_then(|&p| self.song.patterns.get(p))
-        else {
-            return;
-        };
-        let fpr = self.frames_per_row();
-        let voices = self
-            .voices
-            .iter_mut()
-            .zip(self.tails.iter_mut())
-            .zip(self.synths.iter_mut());
-        for (t, (track, ((voice, tail), synth))) in pattern.tracks.iter().zip(voices).enumerate() {
-            let Some(cell) = track.cells.get(self.pos.row) else {
+    /// Fire every track's row that starts on the current tick.
+    fn fire_tick(&mut self) {
+        let tracks = self.song.tracks.len().min(MAX_TRACKS);
+        for t in 0..tracks {
+            let track = &self.song.tracks[t];
+            let Some(clip) = track.clip_at(self.pos) else {
                 continue;
             };
-            let cut = cell.fx().find_map(|f| match f {
-                Fx::Cut(n) => Some(fpr * n as f64 / 16.0),
-                _ => None,
-            });
-            let knob = cell.fx().find_map(|f| match f {
-                Fx::Knob(n) => Some(n as f32 / 255.0),
-                _ => None,
-            });
-            match (knob, self.song.automation(t)) {
-                (Some(k), Some(Target::Rack { device, param })) => {
-                    let spec = self
-                        .song
-                        .rack
-                        .device(device)
-                        .and_then(|d| d.kind.params().get(param));
-                    if let Some(spec) = spec {
-                        self.graph.set_param(device, param, spec.from_knob(k));
-                    }
-                }
-                (Some(k), Some(Target::Synth { param })) => {
-                    if let Some(Instrument::Synth(patch)) =
-                        self.song.instruments.get(track.instrument)
-                        && let Some(spec) = patch.kind.params().get(param)
-                    {
-                        synth.set_override(param, spec.from_knob(k));
-                    }
-                }
-                _ => {}
-            }
-            let sample = match self.song.instruments.get(track.instrument) {
-                Some(Instrument::Sampler(sample)) => sample,
-                Some(Instrument::Synth(_)) => {
-                    if let Some(trigger) = cell.trigger {
-                        // The track switched from a sample: that stops.
-                        voice.stop();
-                        let glide = cell.fx().find_map(|f| match f {
-                            Fx::Glide(n) => Some(n as f32 * 4.0),
-                            _ => None,
-                        });
-                        // The root, plus any chord notes, each through the tuning.
-                        let root = trigger.slice.min(127) as u8;
-                        let chord = cell.fx().find_map(|f| match f {
-                            Fx::Chord(n) => Some(n),
-                            _ => None,
-                        });
-                        let mut freqs = [0.0; MAX_CHORD];
-                        let mut n = 0;
-                        let notes = std::iter::once(0)
-                            .chain(chord.into_iter().flat_map(Fx::chord_intervals));
-                        for interval in notes.take(MAX_CHORD) {
-                            freqs[n] = self
-                                .song
-                                .tuning
-                                .freq(root.saturating_add(interval).min(127));
-                            n += 1;
-                        }
-                        synth.note_on(
-                            track.instrument,
-                            &freqs[..n],
-                            trigger.velocity,
-                            glide.unwrap_or(0.0),
-                            self.out_rate,
-                        );
-                    }
-                    if let Some(frames) = cut {
-                        synth.note_off_in(frames);
-                    }
-                    continue;
-                }
-                None => continue,
+            let Some(row) = clip.row_at(self.pos) else {
+                continue;
             };
-            if cell.trigger.is_some() && synth.is_active() {
-                // The track switched from a synth: let it ring out.
-                synth.note_off_in(0.0);
-            }
-            if let Some(trigger) = cell.trigger {
-                if self.graph.track_declick(t) {
-                    voice.steal_into(tail);
-                }
-                voice.trigger(
-                    track.instrument,
-                    sample,
-                    trigger,
-                    cell.fx(),
-                    self.out_rate,
-                    fpr,
-                );
-            } else if let Some(frames) = cut {
-                voice.schedule_cut(frames);
-            }
+            let fpr = frames_per_row(self.out_rate, self.song.bpm, clip.rows_per_beat);
+            let (cell, instrument) = (clip.cells[row], track.instrument);
+            self.fire_cell(t, instrument, cell, fpr);
         }
     }
 
-    fn advance_row(&mut self) {
-        let rows = self
-            .song
-            .order
-            .get(self.pos.order)
-            .and_then(|&p| self.song.patterns.get(p))
-            .map_or(0, |p| p.rows);
-        self.pos.row += 1;
-        if self.pos.row >= rows {
-            self.pos.row = 0;
-            self.pos.order += 1;
-            if self.pos.order >= self.song.order.len() {
-                self.pos.order = 0;
-                if !self.looping {
-                    // Stop sequencing; voices keep ringing.
-                    self.set_playing(false);
+    /// Fire one cell on track `t`, `fpr` frames per row.
+    fn fire_cell(&mut self, t: usize, instrument: usize, cell: Cell, fpr: f64) {
+        let voice = &mut self.voices[t];
+        let tail = &mut self.tails[t];
+        let synth = &mut self.synths[t];
+        let cut = cell.fx().find_map(|f| match f {
+            Fx::Cut(n) => Some(fpr * n as f64 / 16.0),
+            _ => None,
+        });
+        let knob = cell.fx().find_map(|f| match f {
+            Fx::Knob(n) => Some(n as f32 / 255.0),
+            _ => None,
+        });
+        match (knob, self.song.automation(t)) {
+            (Some(k), Some(Target::Rack { device, param })) => {
+                let spec = self
+                    .song
+                    .rack
+                    .device(device)
+                    .and_then(|d| d.kind.params().get(param));
+                if let Some(spec) = spec {
+                    self.graph.set_param(device, param, spec.from_knob(k));
                 }
+            }
+            (Some(k), Some(Target::Synth { param })) => {
+                if let Some(Instrument::Synth(patch)) = self.song.instruments.get(instrument)
+                    && let Some(spec) = patch.kind.params().get(param)
+                {
+                    synth.set_override(param, spec.from_knob(k));
+                }
+            }
+            _ => {}
+        }
+        let sample = match self.song.instruments.get(instrument) {
+            Some(Instrument::Sampler(sample)) => sample,
+            Some(Instrument::Synth(_)) => {
+                if let Some(trigger) = cell.trigger {
+                    // The track switched from a sample: that stops.
+                    voice.stop();
+                    let glide = cell.fx().find_map(|f| match f {
+                        Fx::Glide(n) => Some(n as f32 * 4.0),
+                        _ => None,
+                    });
+                    // The root, plus any chord notes, each through the tuning.
+                    let root = trigger.slice.min(127) as u8;
+                    let chord = cell.fx().find_map(|f| match f {
+                        Fx::Chord(n) => Some(n),
+                        _ => None,
+                    });
+                    let mut freqs = [0.0; MAX_CHORD];
+                    let mut n = 0;
+                    let notes =
+                        std::iter::once(0).chain(chord.into_iter().flat_map(Fx::chord_intervals));
+                    for interval in notes.take(MAX_CHORD) {
+                        freqs[n] = self
+                            .song
+                            .tuning
+                            .freq(root.saturating_add(interval).min(127));
+                        n += 1;
+                    }
+                    synth.note_on(
+                        instrument,
+                        &freqs[..n],
+                        trigger.velocity,
+                        glide.unwrap_or(0.0),
+                        self.out_rate,
+                    );
+                }
+                if let Some(frames) = cut {
+                    synth.note_off_in(frames);
+                }
+                return;
+            }
+            None => return,
+        };
+        if cell.trigger.is_some() && synth.is_active() {
+            // The track switched from a synth: let it ring out.
+            synth.note_off_in(0.0);
+        }
+        if let Some(trigger) = cell.trigger {
+            if self.graph.track_declick(t) {
+                voice.steal_into(tail);
+            }
+            voice.trigger(instrument, sample, trigger, cell.fx(), self.out_rate, fpr);
+        } else if let Some(frames) = cut {
+            voice.schedule_cut(frames);
+        }
+    }
+
+    /// Step to the next tick: around the loop range, or back to the start
+    /// at the end of the song (or stop there when not looping).
+    fn advance_tick(&mut self) {
+        self.pos += 1;
+        if self.looping
+            && let Some(range) = &self.song.loop_range
+            && self.pos == range.end
+            && range.start < range.end
+        {
+            self.pos = range.start;
+            return;
+        }
+        if self.pos >= self.song.end() {
+            self.pos = 0;
+            if !self.looping {
+                // Stop sequencing; voices keep ringing.
+                self.set_playing(false);
             }
         }
     }
@@ -481,15 +461,20 @@ impl Engine {
     /// inputs.
     fn render_tracks(&mut self, frames: usize) {
         self.graph.begin(frames);
+        let mut audible = [false; MAX_TRACKS];
+        for (t, a) in audible.iter_mut().enumerate() {
+            *a = self.song.audible(t);
+        }
+        let fpt = frames_per_tick(self.out_rate, self.song.bpm);
         for i in 0..frames {
             if self.playing {
-                while self.playing && self.row_clock <= 0.0 {
-                    self.fire_row();
-                    self.shared_pos.store(pack(self.pos), Ordering::Relaxed);
-                    self.advance_row();
-                    self.row_clock += self.frames_per_row();
+                while self.playing && self.tick_clock <= 0.0 {
+                    self.fire_tick();
+                    self.shared_pos.store(self.pos, Ordering::Relaxed);
+                    self.advance_tick();
+                    self.tick_clock += fpt;
                 }
-                self.row_clock -= 1.0;
+                self.tick_clock -= 1.0;
             }
             for (t, voice) in self.voices.iter_mut().enumerate() {
                 let tail = self.tails.get_mut(t);
@@ -530,8 +515,12 @@ impl Engine {
                 let hit = voice.take_hit() | synth.take_hit();
                 if t == AUDITION {
                     self.audition[i] = frame;
-                } else {
+                } else if audible[t] {
                     self.graph.write_track(t, i, frame, hit);
+                } else {
+                    // Muted: the voices run on, unheard, so unmuting
+                    // mid-note picks the note up where it is.
+                    self.graph.write_track(t, i, [0.0; 2], false);
                 }
             }
         }

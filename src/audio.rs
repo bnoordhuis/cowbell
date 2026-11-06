@@ -4,7 +4,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
 use crate::engine::{Controller, Engine};
-use crate::pattern::Song;
+use crate::song::Song;
 
 /// Largest block the engine renders at once; the callback splits bigger ones.
 const MAX_BLOCK: usize = 4096;

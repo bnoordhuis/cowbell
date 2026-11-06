@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use cowbell::engine::{Command, Engine};
-use cowbell::pattern::{Cell, Fx, Instrument, Pattern, Song};
 use cowbell::rack::Rack;
 use cowbell::sample::Sample;
+use cowbell::song::{Cell, Clip, Fx, Instrument, Song, Track};
 use cowbell::transform::Roll;
 use cowbell::{demo, synth};
 
@@ -18,15 +18,12 @@ fn click(len: usize) -> Sample {
 }
 
 fn one_track_song(sample: Sample, bpm: f64, rpb: u32, beats: u32) -> Song {
-    Song {
+    let track = Track::new("t", 0).with_clip(Clip::beats(0, rpb, beats));
+    Song::new(
         bpm,
-        instruments: vec![Instrument::Sampler(Arc::new(sample))],
-        patterns: vec![Pattern::new(rpb, beats, &[("t", 0)])],
-        order: vec![0],
-        rack: Rack::simple(1),
-        tuning: Default::default(),
-        automation: Vec::new(),
-    }
+        vec![Instrument::Sampler(Arc::new(sample))],
+        vec![track],
+    )
 }
 
 fn render(song: Song, frames: usize) -> Vec<f32> {
@@ -55,19 +52,21 @@ fn rows_land_on_exact_frames() {
     // 120 bpm, 4 rows/beat: 6000 frames per row.
     let mut song = one_track_song(click(10), 120.0, 4, 1);
     for row in 0..4 {
-        song.patterns[0].tracks[0].cells[row] = Cell::hit(0, 127);
+        song.tracks[0].clips[0].cells[row] = Cell::hit(0, 127);
     }
     assert_eq!(onsets(&render(song, 24_000)), vec![0, 6000, 12_000, 18_000]);
 }
 
 #[test]
 fn fractional_row_length_does_not_drift() {
-    // 7 rows/beat at 173 bpm: 2378.03... frames per row.
-    let mut song = one_track_song(click(10), 173.0, 7, 4);
-    song.patterns[0].tracks[0].cells.fill(Cell::hit(0, 127));
-    let fpr = RATE as f64 * 60.0 / (173.0 * 7.0);
-    let got = onsets(&render(song, 28 * 2378));
-    assert_eq!(got.len(), 28);
+    // 4 rows/beat at 173 bpm: 4161.85... frames per row, and 86.7...
+    // frames per tick.
+    let mut song = one_track_song(click(10), 173.0, 4, 4);
+    song.tracks[0].clips[0].cells.fill(Cell::hit(0, 127));
+    let fpr = RATE as f64 * 60.0 / (173.0 * 4.0);
+    // Stop just short of the loop back to row 0.
+    let got = onsets(&render(song, (16.0 * fpr) as usize));
+    assert_eq!(got.len(), 16);
     for (i, &f) in got.iter().enumerate() {
         assert!((f as f64 - i as f64 * fpr).abs() <= 1.0, "row {i} at {f}");
     }
@@ -76,7 +75,7 @@ fn fractional_row_length_does_not_drift() {
 #[test]
 fn retrigger_splits_row_evenly() {
     let mut song = one_track_song(click(10), 120.0, 4, 1);
-    song.patterns[0].tracks[0].cells[0] = Cell::hit(0, 127).with_fx(Fx::Retrig(4));
+    song.tracks[0].clips[0].cells[0] = Cell::hit(0, 127).with_fx(Fx::Retrig(4));
     assert_eq!(onsets(&render(song, 6000)), vec![0, 1500, 3000, 4500]);
 }
 
@@ -84,7 +83,7 @@ fn retrigger_splits_row_evenly() {
 fn cut_stops_note() {
     let sample = Sample::new("dc", RATE, vec![[0.5, 0.5]; 48_000]);
     let mut song = one_track_song(sample, 120.0, 4, 1);
-    song.patterns[0].tracks[0].cells[0] = Cell::hit(0, 127).with_fx(Fx::Cut(8));
+    song.tracks[0].clips[0].cells[0] = Cell::hit(0, 127).with_fx(Fx::Cut(8));
     let out = render(song, 6000);
     let sounding = onsets(&out);
     assert_eq!(sounding.len(), 3000, "half a row");
@@ -94,7 +93,7 @@ fn cut_stops_note() {
 fn reverse_plays_backwards() {
     let frames = (0..100).map(|i| [i as f32 / 100.0; 2]).collect();
     let mut song = one_track_song(Sample::new("ramp", RATE, frames), 120.0, 4, 1);
-    song.patterns[0].tracks[0].cells[0] = Cell::hit(0, 127).with_fx(Fx::Reverse);
+    song.tracks[0].clips[0].cells[0] = Cell::hit(0, 127).with_fx(Fx::Reverse);
     let out = render(song, 10);
     assert!((out[0] - 0.99).abs() < 1e-6);
     assert!(out[2] < out[0]);
@@ -113,7 +112,7 @@ fn slicer_finds_demo_break_hits() {
 
 #[test]
 fn roll_sweeps_hits_and_pitch() {
-    let mut p = Pattern::new(4, 2, &[("snr", 0)]);
+    let mut cells = vec![Cell::default(); 8];
     Roll {
         slice: 3,
         hits: (1, 8),
@@ -121,8 +120,7 @@ fn roll_sweeps_hits_and_pitch() {
         velocity: (60, 120),
         curve: 1.0,
     }
-    .apply(&mut p.tracks[0], 0..8);
-    let cells = &p.tracks[0].cells;
+    .apply(&mut cells, 0..8);
     assert_eq!(cells[0].fx().next(), Some(Fx::Retrig(1)));
     assert_eq!(
         cells[7].fx().collect::<Vec<_>>(),
@@ -171,7 +169,7 @@ fn demo_song_renders_without_clipping_or_nans() {
 fn dc_song() -> Song {
     let sample = Sample::new("dc", RATE, vec![[0.5, 0.5]; 48_000]);
     let mut song = one_track_song(sample, 120.0, 4, 8);
-    song.patterns[0].tracks[0].cells[0] = Cell::hit(0, 127);
+    song.tracks[0].clips[0].cells[0] = Cell::hit(0, 127);
     song
 }
 
@@ -184,7 +182,7 @@ fn edit_keeps_ringing_notes() {
     engine.process(&mut buf);
     // Same sample, edited pattern: the note keeps sounding.
     let mut edited = song.clone();
-    edited.patterns[0].tracks[0].cells[3] = Cell::hit(0, 64);
+    edited.tracks[0].clips[0].cells[3] = Cell::hit(0, 64);
     assert!(controller.send(Command::SwapSong(Box::new(edited))).is_ok());
     engine.process(&mut buf);
     assert!(buf.iter().all(|&s| s != 0.0));
@@ -219,9 +217,9 @@ fn audition_plays_while_stopped() {
 #[test]
 fn play_from_starts_at_row() {
     let mut song = one_track_song(click(10), 120.0, 4, 1);
-    song.patterns[0].tracks[0].cells[2] = Cell::hit(0, 127);
+    song.tracks[0].clips[0].cells[2] = Cell::hit(0, 127);
     let (mut engine, mut controller) = Engine::new(RATE, song);
-    let pos = cowbell::engine::Position { order: 0, row: 2 };
+    let pos = 2 * 48;
     assert!(controller.send(Command::PlayFrom(pos)).is_ok());
     let mut buf = vec![0.0; 2 * 100];
     engine.process(&mut buf);
@@ -305,7 +303,7 @@ fn biggest_step(out: &[f32]) -> f32 {
 fn cut_song(declick: bool) -> Song {
     let sample = Sample::new("dc", RATE, vec![[0.5, 0.5]; 48_000]);
     let mut song = one_track_song(sample, 120.0, 4, 1);
-    song.patterns[0].tracks[0].cells[0] = Cell::hit(0, 127).with_fx(Fx::Cut(8));
+    song.tracks[0].clips[0].cells[0] = Cell::hit(0, 127).with_fx(Fx::Cut(8));
     set_declick(&mut song, declick);
     song
 }
@@ -341,7 +339,7 @@ fn cut_of_ringing_note_fades() {
     // A cut with no trigger, on the next row: the note started long ago.
     for declick in [false, true] {
         let mut song = dc_song();
-        song.patterns[0].tracks[0].cells[1] = Cell::default().with_fx(Fx::Cut(0));
+        song.tracks[0].clips[0].cells[1] = Cell::default().with_fx(Fx::Cut(0));
         set_declick(&mut song, declick);
         let out = left(&render(song, 12_000));
         assert!(out[..6000].iter().all(|&s| s == 0.5));
@@ -365,8 +363,8 @@ fn two_level_song(declick: bool) -> Song {
     let mut sample = Sample::new("levels", RATE, frames);
     sample.slices = vec![0, 48_000];
     let mut song = one_track_song(sample, 120.0, 4, 1);
-    song.patterns[0].tracks[0].cells[0] = Cell::hit(0, 127);
-    song.patterns[0].tracks[0].cells[1] = Cell::hit(1, 127);
+    song.tracks[0].clips[0].cells[0] = Cell::hit(0, 127);
+    song.tracks[0].clips[0].cells[1] = Cell::hit(1, 127);
     set_declick(&mut song, declick);
     song
 }
@@ -393,7 +391,7 @@ fn steal_without_declick_is_a_hard_edge() {
 fn ramp_retrig_song(declick: bool) -> Song {
     let frames = (0..48_000).map(|i| [i as f32 / 48_000.0; 2]).collect();
     let mut song = one_track_song(Sample::new("ramp", RATE, frames), 120.0, 4, 1);
-    song.patterns[0].tracks[0].cells[0] = Cell::hit(0, 127).with_fx(Fx::Retrig(2));
+    song.tracks[0].clips[0].cells[0] = Cell::hit(0, 127).with_fx(Fx::Retrig(2));
     set_declick(&mut song, declick);
     song
 }
@@ -424,9 +422,12 @@ fn back_to_back_slices_join_exactly_with_declick() {
     // A fractional row length, with slices cut where the engine starts
     // rows: each slice has played its last frame when the next one steals
     // the voice, so there is nothing to fade and the joins are exact.
-    let (bpm, rpb, rows) = (173.0, 7, 14);
-    let fpr = cowbell::engine::frames_per_row(RATE as f64, bpm, rpb);
-    let starts = cowbell::bounce::row_starts(rows, fpr);
+    let (bpm, rpb, rows) = (173.0, 4, 8);
+    let fpt = cowbell::engine::frames_per_tick(RATE as f64, bpm);
+    let starts: Vec<usize> = cowbell::bounce::tick_starts(rows * 48, fpt)
+        .into_iter()
+        .step_by(48)
+        .collect();
     let len = *starts.last().unwrap();
     let frames: Vec<[f32; 2]> = (0..len)
         .map(|i| {
@@ -438,7 +439,7 @@ fn back_to_back_slices_join_exactly_with_declick() {
     sample.slices = starts[..rows].to_vec();
     let mut song = one_track_song(sample, bpm, rpb, 2);
     for r in 0..rows {
-        song.patterns[0].tracks[0].cells[r] = Cell::hit(r as u16, 127);
+        song.tracks[0].clips[0].cells[r] = Cell::hit(r as u16, 127);
     }
     set_declick(&mut song, true);
     let out = render(song, len);
@@ -462,4 +463,82 @@ fn declick_param_can_be_turned_off_while_playing() {
     let out = left(&out);
     assert_eq!(out[5999], 0.5);
     assert_eq!(out[6000], -0.5, "hard edge");
+}
+
+#[test]
+fn clips_play_where_they_start_on_their_own_grid() {
+    // 120 bpm: 125 frames per tick, 24_000 per beat. A 4-row clip in beat 0
+    // and a 2-rows-per-beat clip from beat 2 on a second track.
+    let mut song = one_track_song(click(10), 120.0, 4, 1);
+    song.tracks[0].clips[0].cells[1] = Cell::hit(0, 127);
+    let mut b = Clip::beats(2 * 192, 2, 1);
+    b.cells[0] = Cell::hit(0, 127);
+    b.cells[1] = Cell::hit(0, 127);
+    song.tracks.push(Track::new("b", 0).with_clip(b));
+    song.rack = Rack::simple(2);
+    assert_eq!(
+        onsets(&render(song, 4 * 24_000)),
+        vec![6000, 48_000, 60_000]
+    );
+}
+
+#[test]
+fn loop_range_repeats_its_stretch() {
+    // Hits on beats 0 and 1 of a two-beat clip; loop beat 1 only.
+    let mut song = one_track_song(click(10), 120.0, 1, 2);
+    song.tracks[0].clips[0].cells.fill(Cell::hit(0, 127));
+    song.loop_range = Some(192..384);
+    let (mut engine, mut c) = Engine::new(RATE, song);
+    assert!(c.send(Command::PlayFrom(192)).is_ok());
+    let mut out = vec![0.0; 2 * 3 * 24_000];
+    engine.process(&mut out);
+    assert_eq!(onsets(&out), vec![0, 24_000, 48_000]);
+    // Export ignores it and stops at the end.
+    let mut song = one_track_song(click(10), 120.0, 1, 2);
+    song.tracks[0].clips[0].cells.fill(Cell::hit(0, 127));
+    song.loop_range = Some(192..384);
+    let (mut engine, _c) = Engine::new(RATE, song);
+    engine.set_looping(false);
+    engine.play();
+    let mut out = vec![0.0; 2 * 8 * 24_000];
+    engine.process(&mut out);
+    assert_eq!(onsets(&out), vec![0, 24_000]);
+}
+
+#[test]
+fn mute_and_solo_silence_tracks() {
+    let mut song = dc_song();
+    song.tracks.push(Track::new("b", 0));
+    song.rack = Rack::simple(2);
+    song.tracks[0].mute = true;
+    assert!(render(song.clone(), 1000).iter().all(|&s| s == 0.0));
+    song.tracks[0].mute = false;
+    song.tracks[1].solo = true;
+    assert!(render(song.clone(), 1000).iter().all(|&s| s == 0.0));
+    song.tracks[0].solo = true;
+    assert!(render(song, 1000).iter().all(|&s| s != 0.0));
+}
+
+#[test]
+fn stop_keeps_the_playhead_and_locate_moves_it() {
+    let mut song = one_track_song(click(10), 120.0, 4, 4);
+    song.tracks[0].clips[0].cells.fill(Cell::hit(0, 127));
+    let (mut engine, mut c) = Engine::new(RATE, song);
+    engine.play();
+    let mut buf = vec![0.0; 2 * 13_000];
+    engine.process(&mut buf);
+    assert!(c.send(Command::Stop).is_ok());
+    engine.process(&mut buf);
+    assert!(!c.is_playing());
+    assert_eq!(c.position(), 13_000 / 125 - 1, "the last tick played");
+    assert!(c.send(Command::Locate(10 * 48)).is_ok());
+    engine.process(&mut buf[..2]);
+    assert_eq!(c.position(), 10 * 48);
+    assert!(c.send(Command::Play).is_ok());
+    let mut out = vec![0.0; 2 * 100];
+    engine.process(&mut out);
+    assert_eq!(onsets(&out), vec![0], "row 10 plays right away");
+    assert!(c.send(Command::Locate(1 << 40)).is_ok());
+    engine.process(&mut buf[..2]);
+    assert_eq!(c.position(), 0, "past the end goes back to the start");
 }

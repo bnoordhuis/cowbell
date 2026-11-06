@@ -1,7 +1,7 @@
 //! Project files.
 //!
-//! A project is a RON text file (`song.cowbell`) holding the patterns, the
-//! order list, the rack and the instrument list. Samples are referenced by
+//! A project is a RON text file (`song.cowbell`) holding the tracks and
+//! their clips, the rack and the instrument list. Samples are referenced by
 //! path, relative to the project file where possible. Samples that don't
 //! come from a file (the demo break, bounces) are written as WAVs into a
 //! folder next to the project, `song.samples/`.
@@ -16,28 +16,26 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::MAX_TRACKS;
-use crate::pattern::{Cell, Instrument, Pattern, Song, Target, Track};
 use crate::rack::Rack;
 use crate::sample::Sample;
+use crate::song::{Cell, Clip, Instrument, Song, Target, Tick, Track, nearest_resolution};
 use crate::synthvoice::{SynthKind, SynthPatch};
 use crate::tuning::Tuning;
 
 pub const EXTENSION: &str = "cowbell";
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct ProjectFile {
     format: u32,
     bpm: f64,
     instruments: Vec<InstrumentFile>,
-    patterns: Vec<PatternFile>,
-    order: Vec<usize>,
+    tracks: Vec<TrackFile>,
+    #[serde(default)]
+    loop_range: Option<(Tick, Tick)>,
     rack: Rack,
     #[serde(default)]
     tuning: Tuning,
-    /// Per track: the knob its `K` effects turn.
-    #[serde(default)]
-    automation: Vec<Option<Target>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,16 +58,24 @@ struct SynthFile {
 }
 
 #[derive(Serialize, Deserialize)]
-struct PatternFile {
-    rows_per_beat: u32,
-    rows: usize,
-    tracks: Vec<TrackFile>,
-}
-
-#[derive(Serialize, Deserialize)]
 struct TrackFile {
     name: String,
     instrument: usize,
+    #[serde(default)]
+    mute: bool,
+    #[serde(default)]
+    solo: bool,
+    /// The knob its `K` effects turn.
+    #[serde(default)]
+    automation: Option<Target>,
+    clips: Vec<ClipFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ClipFile {
+    start: Tick,
+    rows_per_beat: u32,
+    rows: usize,
     cells: BTreeMap<usize, Cell>,
 }
 
@@ -143,19 +149,23 @@ pub fn save(song: &Song, path: &Path) -> Result<(), String> {
         });
     }
 
-    let patterns = song
-        .patterns
+    let tracks = song
+        .tracks
         .iter()
-        .map(|p| PatternFile {
-            rows_per_beat: p.rows_per_beat,
-            rows: p.rows,
-            tracks: p
-                .tracks
+        .map(|t| TrackFile {
+            name: t.name.clone(),
+            instrument: t.instrument,
+            mute: t.mute,
+            solo: t.solo,
+            automation: t.automation,
+            clips: t
+                .clips
                 .iter()
-                .map(|t| TrackFile {
-                    name: t.name.clone(),
-                    instrument: t.instrument,
-                    cells: t
+                .map(|c| ClipFile {
+                    start: c.start,
+                    rows_per_beat: c.rows_per_beat,
+                    rows: c.cells.len(),
+                    cells: c
                         .cells
                         .iter()
                         .enumerate()
@@ -171,11 +181,10 @@ pub fn save(song: &Song, path: &Path) -> Result<(), String> {
         format: FORMAT,
         bpm: song.bpm,
         instruments,
-        patterns,
-        order: song.order.clone(),
+        tracks,
+        loop_range: song.loop_range.as_ref().map(|r| (r.start, r.end)),
         rack: song.rack.clone(),
         tuning: song.tuning.clone(),
-        automation: song.automation.clone(),
     };
     // One cell per line, arrays on one line: compact, and diffs show which
     // cells changed.
@@ -236,53 +245,39 @@ pub fn load(path: &Path) -> Result<Song, String> {
         return Err(format!("{name}: no instruments"));
     }
 
-    let mut patterns = Vec::new();
-    for p in file.patterns {
-        let tracks = p
-            .tracks
-            .into_iter()
-            .take(MAX_TRACKS)
-            .map(|t| {
-                let mut cells = vec![Cell::default(); p.rows];
-                for (row, cell) in t.cells {
-                    if let Some(c) = cells.get_mut(row) {
-                        *c = cell;
+    let tracks: Vec<Track> = file
+        .tracks
+        .into_iter()
+        .take(MAX_TRACKS)
+        .map(|t| {
+            let mut track = Track::new(&t.name, t.instrument.min(instruments.len() - 1));
+            track.mute = t.mute;
+            track.solo = t.solo;
+            track.automation = t.automation;
+            for c in t.clips {
+                let mut clip = Clip::new(c.start, nearest_resolution(c.rows_per_beat), c.rows);
+                for (row, cell) in c.cells {
+                    if let Some(slot) = clip.cells.get_mut(row) {
+                        *slot = cell;
                     }
                 }
-                Track {
-                    name: t.name,
-                    instrument: t.instrument.min(instruments.len() - 1),
-                    cells,
-                }
-            })
-            .collect();
-        patterns.push(Pattern {
-            rows_per_beat: p.rows_per_beat.max(1),
-            rows: p.rows,
-            tracks,
-        });
-    }
-    let order: Vec<usize> = file
-        .order
-        .into_iter()
-        .filter(|&i| i < patterns.len())
+                // An overlapping or empty clip can't play; drop it.
+                let _ = track.insert(clip);
+            }
+            track
+        })
         .collect();
-    if order.is_empty() {
-        return Err(format!("{name}: the order list is empty"));
-    }
 
     let mut rack = file.rack;
     rack.repair();
-    let tracks = patterns.iter().map(|p| p.tracks.len()).max().unwrap_or(0);
-    rack.sync_tracks(tracks);
+    rack.sync_tracks(tracks.len());
     Ok(Song {
         bpm: file.bpm.clamp(20.0, 400.0),
         instruments,
-        patterns,
-        order,
+        tracks,
+        loop_range: file.loop_range.filter(|(a, b)| a < b).map(|(a, b)| a..b),
         rack,
         tuning: file.tuning,
-        automation: file.automation,
     })
 }
 
@@ -315,16 +310,14 @@ mod tests {
 
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.bpm, song.bpm);
-        assert_eq!(loaded.order, song.order);
         assert!(loaded.rack.same_patch(&song.rack));
-        for (a, b) in loaded.patterns.iter().zip(&song.patterns) {
-            assert_eq!((a.rows, a.rows_per_beat), (b.rows, b.rows_per_beat));
-            for (ta, tb) in a.tracks.iter().zip(&b.tracks) {
-                assert_eq!(
-                    (&ta.name, ta.instrument, &ta.cells),
-                    (&tb.name, tb.instrument, &tb.cells)
-                );
-            }
+        assert_eq!(loaded.tracks.len(), song.tracks.len());
+        for (a, b) in loaded.tracks.iter().zip(&song.tracks) {
+            assert_eq!(
+                (&a.name, a.instrument, a.mute, a.solo, a.automation),
+                (&b.name, b.instrument, b.mute, b.solo, b.automation)
+            );
+            assert_eq!(a.clips, b.clips);
         }
         assert_eq!(
             frames(&loaded, 0),
@@ -365,10 +358,10 @@ mod tests {
         save(&song, &path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let used = song
-            .patterns
+            .tracks
             .iter()
-            .flat_map(|p| &p.tracks)
-            .flat_map(|t| &t.cells)
+            .flat_map(|t| &t.clips)
+            .flat_map(|c| &c.cells)
             .filter(|c| **c != Cell::default());
         assert_eq!(text.matches("trigger:").count(), used.count());
         // One cell per line.
@@ -377,6 +370,42 @@ mod tests {
                 .any(|l| l.trim() == "29: (trigger: None, fx: (Some(Cut(4)), None)),"),
             "{text}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mixer_state_and_loop_survive() {
+        let dir = temp_dir("mixer");
+        let path = dir.join("song.cowbell");
+        let mut song = demo::song(synth::demo_break(48_000, 172.0));
+        song.tracks[1].mute = true;
+        song.tracks[0].solo = true;
+        song.tracks[0].automation = Some(Target::Synth { param: 2 });
+        song.loop_range = Some(768..1536);
+        save(&song, &path).unwrap();
+        let loaded = load(&path).unwrap();
+        assert!(loaded.tracks[1].mute && loaded.tracks[0].solo);
+        assert_eq!(
+            loaded.tracks[0].automation,
+            Some(Target::Synth { param: 2 })
+        );
+        assert_eq!(loaded.loop_range, Some(768..1536));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn overlapping_clips_are_dropped_on_load() {
+        let dir = temp_dir("overlap");
+        let path = dir.join("song.cowbell");
+        let song = demo::song(synth::demo_break(48_000, 172.0));
+        save(&song, &path).unwrap();
+        // Move the second clip of the first track onto the first.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let second = song.tracks[0].clips[1].start;
+        let text = text.replacen(&format!("start: {second},"), "start: 0,", 1);
+        std::fs::write(&path, text).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.tracks[0].clips.len(), song.tracks[0].clips.len() - 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
