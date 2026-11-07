@@ -710,6 +710,65 @@ impl Rack {
         chain
     }
 
+    /// The effects a track's sound goes through after its own chain: past
+    /// mixers, following the first cable out of each, on to the master.
+    /// Effects on a bus, like a reverb several tracks share.
+    pub fn after_chain(&self, track: usize) -> Vec<DeviceId> {
+        let mut found = Vec::new();
+        let Some(mut at) = self
+            .chain(track)
+            .last()
+            .copied()
+            .or_else(|| self.track_device(track).map(|d| d.id))
+        else {
+            return found;
+        };
+        let mut seen = vec![at];
+        while let Some(next) = self
+            .cable_from(Jack {
+                device: at,
+                port: 0,
+            })
+            .map(|c| c.to)
+        {
+            let Some(d) = self.device(next.device) else {
+                break;
+            };
+            // A side jack, the master, or a loop (which connect refuses)
+            // ends the way.
+            if seen.contains(&d.id) || d.kind == Kind::Master {
+                break;
+            }
+            if d.kind.is_effect() {
+                if next.port != 0 {
+                    break;
+                }
+                found.push(d.id);
+            } else if d.kind != Kind::Mixer {
+                break;
+            }
+            seen.push(d.id);
+            at = d.id;
+        }
+        found
+    }
+
+    /// The tracks heard through `device`, in their chains or after them.
+    pub fn tracks_through(&self, device: DeviceId) -> Vec<usize> {
+        let tracks = self
+            .devices
+            .iter()
+            .filter_map(|d| match d.kind {
+                Kind::Track(t) => Some(t),
+                _ => None,
+            })
+            .max()
+            .map_or(0, |t| t + 1);
+        (0..tracks)
+            .filter(|&t| self.chain(t).contains(&device) || self.after_chain(t).contains(&device))
+            .collect()
+    }
+
     /// The first cable out of an output.
     pub fn cable_from(&self, from: Jack) -> Option<&Cable> {
         self.cables.iter().find(|c| c.from == from)
@@ -981,5 +1040,45 @@ mod tests {
         assert!(rack.track_device(2).is_some());
         rack.sync_tracks(1);
         assert!(rack.track_device(1).is_none());
+    }
+
+    #[test]
+    fn effects_on_a_bus_are_found_after_the_chain() {
+        // Tracks 0 and 1 into a bus mixer, into a reverb, into the mixer.
+        let mut rack = Rack::simple(3);
+        let jack = |device, port| Jack { device, port };
+        let mixer = rack
+            .devices
+            .iter()
+            .find(|d| d.kind == Kind::Mixer)
+            .unwrap()
+            .id;
+        let delay = rack.append_effect(0, Kind::Delay).unwrap();
+        let bus = rack.add(Kind::Mixer);
+        let reverb = rack.add(Kind::Reverb);
+        rack.connect(jack(delay, 0), jack(bus, 0)).unwrap();
+        let t1 = rack.track_device(1).unwrap().id;
+        rack.connect(jack(t1, 0), jack(bus, 1)).unwrap();
+        rack.connect(jack(bus, 0), jack(reverb, 0)).unwrap();
+        rack.disconnect(jack(mixer, 1));
+        rack.connect(jack(reverb, 0), jack(mixer, 0)).unwrap();
+        assert_eq!(rack.chain(0), [delay]);
+        assert_eq!(rack.after_chain(0), [reverb]);
+        assert_eq!(rack.after_chain(1), [reverb]);
+        assert!(rack.after_chain(2).is_empty(), "straight into the mixer");
+        assert_eq!(rack.tracks_through(reverb), [0, 1]);
+        assert_eq!(rack.tracks_through(delay), [0]);
+        // An effect after the mixer is heard on every track.
+        let master = rack
+            .devices
+            .iter()
+            .find(|d| d.kind == Kind::Master)
+            .unwrap()
+            .id;
+        let eq = rack.add(Kind::Eq);
+        rack.connect(jack(mixer, 0), jack(eq, 0)).unwrap();
+        rack.connect(jack(eq, 0), jack(master, 0)).unwrap();
+        assert_eq!(rack.after_chain(2), [eq]);
+        assert_eq!(rack.tracks_through(eq), [0, 1, 2]);
     }
 }

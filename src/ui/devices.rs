@@ -1,7 +1,8 @@
 //! The devices panel: the selected track's sound, in reading order. Its
 //! instrument (a synth's knobs, or the sample it slices), its track device
 //! (declick, volume and pan), then each effect in its chain, and a card to
-//! add another. Cards that don't fit on a row go on the next.
+//! add another, then the effects it goes through on a bus, shared with
+//! other tracks. Cards that don't fit on a row go on the next.
 //!
 //! Drag a knob up or down (shift: fine) or scroll over it; click a switch to
 //! step it; double-click a knob to reset it. Scroll elsewhere to move up and
@@ -112,7 +113,11 @@ impl DevicesView {
             return out;
         };
         let (cards, add) = layout(song, t.instrument, track, area, self.scroll, char_w);
-        let content = add.bottom() + self.scroll - area.top() + PAD;
+        let bottom = cards
+            .iter()
+            .map(|c| c.rect.bottom())
+            .fold(add.bottom(), f32::max);
+        let content = bottom + self.scroll - area.top() + PAD;
         let knob_at = |p: Pos2| {
             cards
                 .iter()
@@ -311,10 +316,18 @@ fn layout(
         x += w + CARD_GAP;
         at
     };
-    let mut card = |title: String,
-                    note: Option<String>,
-                    knobs: Vec<(Knob, &'static ParamSpec, f32)>,
-                    remove: Option<DeviceId>| {
+    // A card for a device (`None`: the add-effect card, whose spot it
+    // returns), placed after the last.
+    type Spec = (
+        String,
+        Option<String>,
+        Vec<(Knob, &'static ParamSpec, f32)>,
+        Option<DeviceId>,
+    );
+    let mut card = |spec: Option<Spec>| -> Rect {
+        let Some((title, note, knobs, remove)) = spec else {
+            return Rect::from_min_size(place(160.0), vec2(160.0, 44.0));
+        };
         let widths: Vec<f32> = knobs.iter().map(|k| knob::width(k.1, char_w)).collect();
         let title_w = title.chars().count() as f32 * 9.0 + 2.0 * PAD + 24.0;
         let note_w = note
@@ -349,6 +362,7 @@ fn layout(
             knobs,
             remove,
         });
+        rect
     };
 
     match song.instruments.get(instrument) {
@@ -361,13 +375,15 @@ fn layout(
                 .enumerate()
                 .map(|(param, (spec, &v))| (Knob::Synth { instrument, param }, spec, v))
                 .collect();
-            card(patch.name.clone(), None, knobs, None);
+            card(Some((patch.name.clone(), None, knobs, None)));
         }
         Some(Instrument::Sampler(sample)) => {
             let note = format!("sample, {} slices", sample.slices.len());
-            card(sample.name.clone(), Some(note), Vec::new(), None);
+            card(Some((sample.name.clone(), Some(note), Vec::new(), None)));
         }
-        None => card("no instrument".into(), None, Vec::new(), None),
+        None => {
+            card(Some(("no instrument".into(), None, Vec::new(), None)));
+        }
     }
     let rack_knobs = |id: DeviceId| {
         let d = song.rack.device(id).unwrap();
@@ -380,13 +396,33 @@ fn layout(
             .collect::<Vec<_>>()
     };
     if let Some(d) = song.rack.track_device(track) {
-        card("track".into(), None, rack_knobs(d.id), None);
+        card(Some(("track".into(), None, rack_knobs(d.id), None)));
     }
     for id in song.rack.chain(track) {
         let name = song.rack.device(id).unwrap().kind.name().to_owned();
-        card(name, None, rack_knobs(id), Some(id));
+        card(Some((name, None, rack_knobs(id), Some(id))));
     }
-    let add = Rect::from_min_size(place(160.0), vec2(160.0, 44.0));
+    // A new effect goes on the end of the track's own chain.
+    let add = card(None);
+    // Then what it goes through on a bus. Those are shared, so they're
+    // taken out in the rack, not here.
+    for id in song.rack.after_chain(track) {
+        let name = song.rack.device(id).unwrap().kind.name();
+        let others: Vec<&str> = song
+            .rack
+            .tracks_through(id)
+            .into_iter()
+            .filter(|&t| t != track)
+            .filter_map(|t| song.tracks.get(t).map(|t| t.name.as_str()))
+            .collect();
+        let title = match others.as_slice() {
+            [] => name.to_owned(),
+            _ if others.len() + 1 >= song.tracks.len() => format!("{name} · every track"),
+            [one] => format!("{name} · shared with {one}"),
+            [rest @ .., last] => format!("{name} · shared with {} and {last}", rest.join(", ")),
+        };
+        card(Some((title, None, rack_knobs(id), None)));
+    }
     (cards, add)
 }
 
