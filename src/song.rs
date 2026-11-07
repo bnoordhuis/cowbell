@@ -362,6 +362,42 @@ impl Song {
         t.insert(clip).ok().map(|i| (track, i))
     }
 
+    /// Change a clip's grid, keeping when its hits play: each lands on the
+    /// nearest row of the new grid (the first one wins if two land on the
+    /// same row). The clip keeps its length, rounded up to whole rows.
+    pub fn set_resolution(&mut self, at: ClipRef, rows_per_beat: u32) -> bool {
+        let Some(clip) = self.clip(at) else {
+            return false;
+        };
+        if !RESOLUTIONS.contains(&rows_per_beat) {
+            return false;
+        }
+        let old_tpr = clip.ticks_per_row();
+        let tpr = TICKS_PER_BEAT / rows_per_beat as Tick;
+        let rows = clip.len().div_ceil(tpr).max(1) as usize;
+        let end = clip.start + rows as Tick * tpr;
+        if !self.tracks[at.0].is_free(clip.start..end, Some(at.1)) {
+            return false;
+        }
+        let mut cells = vec![Cell::default(); rows];
+        let mut taken = vec![false; rows];
+        for (row, cell) in clip.cells.iter().enumerate() {
+            if *cell == Cell::default() {
+                continue;
+            }
+            let tick = row as Tick * old_tpr;
+            let new = ((tick + tpr / 2) / tpr).min(rows as Tick - 1) as usize;
+            if !taken[new] {
+                cells[new] = *cell;
+                taken[new] = true;
+            }
+        }
+        let clip = &mut self.tracks[at.0].clips[at.1];
+        clip.rows_per_beat = rows_per_beat;
+        clip.cells = cells;
+        true
+    }
+
     /// A copy of a clip, straight after it. Fails if there's no room.
     pub fn duplicate_clip(&mut self, at: ClipRef) -> Option<ClipRef> {
         let mut copy = self.clip(at)?.clone();
@@ -550,6 +586,30 @@ mod tests {
         assert_eq!(song.duplicate_clip((0, 1)), None, "the copy is in the way");
         assert!(song.delete_clip((0, 2)));
         assert!(!song.delete_clip((0, 2)));
+    }
+
+    #[test]
+    fn resolution_changes_keep_the_timing() {
+        let mut clip = Clip::beats(0, 4, 2);
+        clip.cells[0] = Cell::hit(1, 100);
+        clip.cells[3] = Cell::hit(2, 100);
+        clip.cells[6] = Cell::hit(3, 100);
+        let mut song = Song::new(120.0, Vec::new(), vec![Track::new("a", 0).with_clip(clip)]);
+        assert!(song.set_resolution((0, 0), 8));
+        let c = &song.tracks[0].clips[0];
+        assert_eq!((c.rows_per_beat, c.cells.len(), c.len()), (8, 16, 384));
+        let hits: Vec<_> = (0..16).filter(|&r| c.cells[r].trigger.is_some()).collect();
+        assert_eq!(hits, vec![0, 6, 12]);
+        // Down to a beat grid: rows 0, 3 and 6 of 16ths are beats 0, 0.75
+        // and 1.5, which round to 0, 1 and 2; the clip stays two beats long
+        // but there are only rows 0 and 1, so the last hit lands on row 1,
+        // where the second already is.
+        assert!(song.set_resolution((0, 0), 1));
+        let c = &song.tracks[0].clips[0];
+        assert_eq!(c.cells.len(), 2);
+        assert_eq!(c.cells[0].trigger.unwrap().slice, 1);
+        assert_eq!(c.cells[1].trigger.unwrap().slice, 2);
+        assert!(!song.set_resolution((0, 0), 5), "not a resolution");
     }
 
     #[test]

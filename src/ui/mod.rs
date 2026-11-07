@@ -3,10 +3,13 @@
 //! status line. Everything is done with the mouse.
 
 mod arrange;
+mod devices;
+mod edit;
 mod knob;
 mod rack;
 #[cfg(feature = "screenshot")]
 mod screenshot;
+mod steps;
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -19,7 +22,7 @@ use crate::engine::{Command, Controller, Engine};
 use crate::graph::Graph;
 use crate::project;
 use crate::song::{Song, TICKS_PER_BAR, TRACK_VOLUME, Target, Tick};
-use arrange::Edit;
+use edit::{Edit, Select, apply};
 
 mod color {
     use eframe::egui::Color32;
@@ -64,6 +67,13 @@ pub fn run(song: Song, path: Option<PathBuf>) -> Result<(), String> {
 enum View {
     Arrange,
     Rack,
+}
+
+/// The bottom panel's tabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tab {
+    Clip,
+    Devices,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,81 +166,6 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, on: bool) -> egui::Response {
     response
 }
 
-/// What to select after an edit.
-#[derive(Debug, PartialEq)]
-enum Select {
-    Keep,
-    Clip(crate::song::ClipRef),
-    Track(usize),
-}
-
-/// Make an arrangement edit on `song`, or say why it can't be done.
-fn apply(song: &mut Song, edit: &Edit) -> Result<Select, String> {
-    /// A new clip: a bar of sixteenths, or what fits.
-    const NEW_RPB: u32 = 4;
-    const NEW_ROWS: usize = 16;
-    let full = || format!("can't: {} tracks is the most", crate::engine::MAX_TRACKS);
-    match *edit {
-        Edit::MoveClip { clip, track, start } => song
-            .move_clip(clip, track, start)
-            .map(Select::Clip)
-            .ok_or_else(|| "no room there".to_owned()),
-        Edit::ResizeClip { clip, rows } => {
-            if song.resize_clip(clip, rows) {
-                Ok(Select::Keep)
-            } else {
-                Err("no room: it would run into the next clip".into())
-            }
-        }
-        Edit::NewClip { track, start } => song
-            .new_clip(track, start, NEW_RPB, NEW_ROWS)
-            .map(Select::Clip)
-            .ok_or_else(|| "no room for a clip there".to_owned()),
-        Edit::DuplicateClip(clip) => song
-            .duplicate_clip(clip)
-            .map(Select::Clip)
-            .ok_or_else(|| "no room for a copy right after it".to_owned()),
-        Edit::DeleteClip(clip) => {
-            song.delete_clip(clip);
-            Ok(Select::Track(clip.0))
-        }
-        Edit::AddTrack(instrument) => {
-            let name = song
-                .instruments
-                .get(instrument)
-                .map_or("track", |i| i.name())
-                .to_owned();
-            song.add_track(&name, instrument)
-                .map(Select::Track)
-                .ok_or_else(full)
-        }
-        Edit::DuplicateTrack(t) => song.duplicate_track(t).map(Select::Track).ok_or_else(full),
-        Edit::DeleteTrack(t) => {
-            song.delete_track(t);
-            // The one that took its place; `select` keeps it in range.
-            Ok(Select::Track(t))
-        }
-        Edit::RenameTrack(t, ref name) => {
-            let track = song.tracks.get_mut(t).ok_or("no such track")?;
-            track.name = name.clone();
-            Ok(Select::Keep)
-        }
-        Edit::Volume(t, v) => song
-            .set_volume(t, v)
-            .map(|_| Select::Keep)
-            .ok_or_else(|| "no such track".to_owned()),
-        Edit::Mute(t) | Edit::Solo(t) => {
-            let track = song.tracks.get_mut(t).ok_or("no such track")?;
-            if matches!(edit, Edit::Mute(_)) {
-                track.mute ^= true;
-            } else {
-                track.solo ^= true;
-            }
-            Ok(Select::Keep)
-        }
-    }
-}
-
 struct App {
     doc: Document,
     controller: Controller,
@@ -247,6 +182,10 @@ struct App {
     view: View,
     arrange: arrange::ArrangeView,
     rack_view: rack::RackView,
+    /// The bottom panel: which tab, and the views on it.
+    tab: Tab,
+    steps: steps::StepView,
+    devices: devices::DevicesView,
     /// Keep the playhead in view while playing.
     follow: bool,
     /// The loop range to bring back when the loop is switched on again.
@@ -282,7 +221,8 @@ impl App {
         };
         #[cfg(not(feature = "screenshot"))]
         let view = View::Arrange;
-        App {
+        #[allow(unused_mut)]
+        let mut app = App {
             doc: Document::new(song),
             controller,
             output,
@@ -294,6 +234,9 @@ impl App {
             view,
             arrange: arrange::ArrangeView::default(),
             rack_view: rack::RackView::default(),
+            tab: Tab::Clip,
+            steps: steps::StepView::default(),
+            devices: devices::DevicesView::default(),
             follow: true,
             loop_memory,
             prompt: None,
@@ -303,6 +246,24 @@ impl App {
             gesture: None,
             #[cfg(feature = "screenshot")]
             screenshot: screenshot::Screenshot::from_env(),
+        };
+        #[cfg(feature = "screenshot")]
+        app.screenshot_setup();
+        app
+    }
+
+    /// Dev only: `COWBELL_SELECT=track,clip` selects a clip, and
+    /// `COWBELL_TAB=devices` shows the devices tab.
+    #[cfg(feature = "screenshot")]
+    fn screenshot_setup(&mut self) {
+        if let Ok(sel) = std::env::var("COWBELL_SELECT")
+            && let Some((t, c)) = sel.split_once(',')
+            && let (Ok(t), Ok(c)) = (t.parse(), c.parse())
+        {
+            self.select(Select::Clip((t, c)));
+        }
+        if std::env::var("COWBELL_TAB").as_deref() == Ok("devices") {
+            self.tab = Tab::Devices;
         }
     }
 
@@ -384,6 +345,7 @@ impl App {
     }
 
     fn undo(&mut self, redo: bool) {
+        self.finish_gesture();
         let done = if redo {
             self.doc.redo()
         } else {
@@ -616,45 +578,59 @@ impl App {
             self.loop_memory = range;
             self.set_loop(true);
         }
-        for edit in out.edits {
-            self.edit(edit);
+        if out.open_clip {
+            self.tab = Tab::Clip;
         }
-        if let Some(edit) = out.live {
-            self.live_edit(edit);
-        }
-        if out.gesture_done
-            && let Some((before, changed)) = self.gesture.take()
-            && changed
-        {
-            self.doc.record(before);
-        }
+        self.changes(out.edits, out.live, false, out.gesture_done);
         if playing || ui.input(|i| i.pointer.any_down()) {
             ui.ctx().request_repaint();
         }
     }
 
-    /// Make an edit from the arrangement as one undo step.
+    /// What a view reports: one-shot edits, then the latest step of a
+    /// gesture. `end_first` ends the previous gesture before anything else;
+    /// `done` ends the gesture after.
+    fn changes(&mut self, edits: Vec<Edit>, live: Option<Edit>, end_first: bool, done: bool) {
+        if end_first {
+            self.finish_gesture();
+        }
+        for edit in edits {
+            self.finish_gesture();
+            self.edit(edit);
+        }
+        if let Some(edit) = live {
+            self.live_edit(edit);
+        }
+        if done {
+            self.finish_gesture();
+        }
+    }
+
+    /// Make the gesture so far one undo step.
+    fn finish_gesture(&mut self) {
+        if let Some((before, changed)) = self.gesture.take()
+            && changed
+        {
+            self.doc.record(before);
+        }
+        self.steps.end_wheel();
+        self.devices.end_wheel();
+    }
+
+    /// Make an edit as one undo step.
     fn edit(&mut self, edit: Edit) {
-        // Mute and solo are mixing, not editing: no undo step.
-        match edit {
-            Edit::Mute(t) | Edit::Solo(t) if t < self.doc.song.tracks.len() => {
-                let track = &mut self.doc.song.tracks[t];
-                if matches!(edit, Edit::Mute(_)) {
-                    track.mute ^= true;
-                } else {
-                    track.solo ^= true;
-                }
+        if edit.is_mixing() {
+            if apply(&mut self.doc.song, &edit).is_ok() {
                 self.doc.changed();
-                return;
             }
-            _ => {}
+            return;
         }
         let before = self.doc.song.clone();
         match apply(&mut self.doc.song, &edit) {
             Ok(select) => {
                 self.doc.record(before);
                 self.select(select);
-                self.volume_to_engine(&edit);
+                self.knob_to_engine(&edit);
             }
             Err(why) => {
                 self.doc.song = before;
@@ -676,7 +652,7 @@ impl App {
             self.doc.song = song;
             self.doc.changed();
             self.select(select);
-            self.volume_to_engine(&edit);
+            self.knob_to_engine(&edit);
         }
     }
 
@@ -702,16 +678,132 @@ impl App {
         }
     }
 
-    /// Volume changes go straight to the engine, like knobs in the rack.
-    fn volume_to_engine(&mut self, edit: &Edit) {
-        if let Edit::Volume(t, value) = *edit
-            && let Some(d) = self.doc.song.rack.track_device(t)
-        {
-            let _ = self.controller.send(Command::SetParam {
-                device: d.id,
-                param: TRACK_VOLUME,
+    /// Rack knob changes go straight to the engine's graph. (Synth knobs
+    /// reach it with the song.)
+    fn knob_to_engine(&mut self, edit: &Edit) {
+        let (device, param, value) = match *edit {
+            Edit::Volume(t, value) => match self.doc.song.rack.track_device(t) {
+                Some(d) => (d.id, TRACK_VOLUME, value),
+                None => return,
+            },
+            Edit::RackParam {
+                device,
+                param,
                 value,
-            });
+            } => (device, param, value),
+            _ => return,
+        };
+        let _ = self.controller.send(Command::SetParam {
+            device,
+            param,
+            value,
+        });
+    }
+
+    /// The bottom panel: the selected clip in the clip editor, or the
+    /// selected track's devices.
+    fn editor_panel(&mut self, ui: &mut egui::Ui) {
+        let song = &self.doc.song;
+        let track = self.arrange.selected_track;
+        let clip = self
+            .arrange
+            .selected_clip
+            .filter(|&c| song.clip(c).is_some());
+        let mut grid = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.selectable_value(&mut self.tab, Tab::Clip, RichText::new("Clip editor").size(15.0));
+            ui.selectable_value(&mut self.tab, Tab::Devices, RichText::new("Devices").size(15.0));
+            ui.add_space(16.0);
+            let name = song.tracks.get(track).map_or("", |t| t.name.as_str());
+            match (self.tab, clip.and_then(|c| song.clip(c).map(|x| (c, x)))) {
+                (Tab::Clip, Some((at, c))) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "{name} · bar {} · {} rows",
+                            arrange::position_text(c.start),
+                            c.cells.len()
+                        ))
+                        .color(color::MUTED),
+                    );
+                    let mut rpb = c.rows_per_beat;
+                    egui::ComboBox::from_id_salt("grid")
+                        .selected_text(format!("{rpb} rows per beat"))
+                        .show_ui(ui, |ui| {
+                            for r in crate::song::RESOLUTIONS {
+                                ui.selectable_value(&mut rpb, r, format!("{r} rows per beat"));
+                            }
+                        });
+                    if rpb != c.rows_per_beat {
+                        grid = Some(Edit::Resolution(at, rpb));
+                    }
+                    ui.add_space(16.0);
+                    ui.label(
+                        RichText::new(
+                            "click or drag to add and remove hits · right-click a hit to roll it · scroll over a hit for velocity · click a lane name to hear it",
+                        )
+                        .color(color::DIM),
+                    );
+                }
+                (Tab::Devices, _) if !name.is_empty() => {
+                    ui.label(RichText::new(format!("{name} · instrument and effects")).color(color::MUTED));
+                    ui.add_space(16.0);
+                    ui.label(
+                        RichText::new("drag or scroll knobs (shift: fine) · click switches · double-click resets")
+                            .color(color::DIM),
+                    );
+                }
+                _ => {}
+            }
+        });
+        if let Some(edit) = grid {
+            self.changes(vec![edit], None, false, false);
+        }
+        ui.separator();
+        let (_, rect) = ui.allocate_space(ui.available_size());
+        let mut content = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        let song = &self.doc.song;
+        match self.tab {
+            Tab::Clip => {
+                let Some(at) = clip else {
+                    content.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new("Select a clip to edit it here, or double-click an empty spot in a lane for a new one.")
+                                .color(color::MUTED),
+                        );
+                    });
+                    return;
+                };
+                let pos = self.controller.position();
+                let c = song.clip(at).unwrap();
+                let playhead = (self.controller.is_playing() && c.span().contains(&pos))
+                    .then(|| ((pos - c.start) / c.ticks_per_row()) as usize);
+                let out = self.steps.show(&mut content, song, at, playhead);
+                if let Some((instrument, slice)) = out.audition {
+                    let _ = self.controller.send(Command::Audition {
+                        instrument,
+                        slice,
+                        velocity: 110,
+                        hold: false,
+                    });
+                }
+                self.changes(out.edits, out.live, out.end_first, out.gesture_done);
+            }
+            Tab::Devices => {
+                if track >= song.tracks.len() {
+                    content.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new("Add a track to see its devices.").color(color::MUTED),
+                        );
+                    });
+                    return;
+                }
+                let out = self.devices.show(&mut content, song, track);
+                self.changes(out.edits, out.live, out.end_first, out.gesture_done);
+            }
+        }
+        if ui.input(|i| i.pointer.any_down()) || self.controller.is_playing() {
+            ui.ctx().request_repaint();
         }
     }
 
@@ -831,6 +923,14 @@ impl eframe::App for App {
             .exact_size(28.0)
             .frame(frame(color::PANEL))
             .show(ui, |ui| self.status(ui));
+        if self.view == View::Arrange {
+            egui::Panel::bottom("editor")
+                .resizable(true)
+                .default_size(330.0)
+                .min_size(160.0)
+                .frame(frame(color::BG).inner_margin(egui::Margin::symmetric(10, 6)))
+                .show(ui, |ui| self.editor_panel(ui));
+        }
         egui::CentralPanel::default()
             .frame(frame(color::BG))
             .show(ui, |ui| match self.view {
@@ -843,75 +943,5 @@ impl eframe::App for App {
         if let Some(s) = &mut self.screenshot {
             s.update(&ctx);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::song::{Clip, Track};
-
-    fn song() -> Song {
-        let a = Track::new("a", 0).with_clip(Clip::beats(0, 4, 4));
-        let b = Track::new("b", 0).with_clip(Clip::beats(0, 4, 4));
-        Song::new(120.0, Vec::new(), vec![a, b])
-    }
-
-    #[test]
-    fn edits_say_what_to_select() {
-        let mut s = song();
-        assert_eq!(
-            apply(&mut s, &Edit::DuplicateClip((0, 0))),
-            Ok(Select::Clip((0, 1)))
-        );
-        assert_eq!(
-            apply(
-                &mut s,
-                &Edit::MoveClip {
-                    clip: (0, 1),
-                    track: 1,
-                    start: 768
-                }
-            ),
-            Ok(Select::Clip((1, 1)))
-        );
-        assert_eq!(apply(&mut s, &Edit::DeleteTrack(0)), Ok(Select::Track(0)));
-        assert_eq!(s.tracks[0].name, "b");
-        assert_eq!(apply(&mut s, &Edit::AddTrack(0)), Ok(Select::Track(1)));
-        assert_eq!(s.tracks[1].name, "track", "no instrument to name it after");
-    }
-
-    #[test]
-    fn edits_that_cant_be_made_say_why() {
-        let mut s = song();
-        let e = apply(
-            &mut s,
-            &Edit::MoveClip {
-                clip: (0, 0),
-                track: 1,
-                start: 0,
-            },
-        );
-        assert_eq!(e, Err("no room there".to_owned()));
-        assert!(
-            apply(
-                &mut s,
-                &Edit::NewClip {
-                    track: 0,
-                    start: 10
-                }
-            )
-            .is_err()
-        );
-        assert!(apply(&mut s, &Edit::RenameTrack(9, "x".into())).is_err());
-    }
-
-    #[test]
-    fn volume_and_rename() {
-        let mut s = song();
-        apply(&mut s, &Edit::Volume(1, 0.25)).unwrap();
-        assert_eq!(s.volume(1), 0.25);
-        apply(&mut s, &Edit::RenameTrack(0, "kick".into())).unwrap();
-        assert_eq!(s.tracks[0].name, "kick");
     }
 }

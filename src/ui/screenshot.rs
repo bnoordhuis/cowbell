@@ -1,7 +1,9 @@
 //! Dev-only screenshots, for checking the UI without a person at the screen.
 //!
 //! `COWBELL_SCREENSHOT=out.ppm` saves the window as a binary PPM and exits.
-//! `COWBELL_VIEW=rack` shows the rack instead of the arrangement.
+//! `COWBELL_VIEW=rack` shows the rack instead of the arrangement,
+//! `COWBELL_SELECT=track,clip` selects a clip for the clip editor, and
+//! `COWBELL_TAB=devices` shows the devices tab instead.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -20,6 +20,7 @@ use eframe::egui::{
 };
 
 use super::color;
+use super::edit::Edit;
 use crate::song::{Clip, ClipRef, Instrument, Song, TICKS_PER_BAR, TICKS_PER_BEAT, Tick};
 
 pub const HEADER_W: f32 = 280.0;
@@ -44,34 +45,6 @@ pub const SNAPS: [(Tick, &str); 4] = [
     (1, "Off"),
 ];
 
-/// One change to the song, for the caller to make.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Edit {
-    MoveClip {
-        clip: ClipRef,
-        track: usize,
-        start: Tick,
-    },
-    ResizeClip {
-        clip: ClipRef,
-        rows: usize,
-    },
-    NewClip {
-        track: usize,
-        start: Tick,
-    },
-    DuplicateClip(ClipRef),
-    DeleteClip(ClipRef),
-    /// A new track playing this instrument.
-    AddTrack(usize),
-    DuplicateTrack(usize),
-    DeleteTrack(usize),
-    RenameTrack(usize, String),
-    Volume(usize, f32),
-    Mute(usize),
-    Solo(usize),
-}
-
 /// What happened in the arrangement this frame.
 #[derive(Default, Debug, PartialEq)]
 pub struct Output {
@@ -86,6 +59,8 @@ pub struct Output {
     pub live: Option<Edit>,
     /// The gesture is over: what `live` did is one undo step.
     pub gesture_done: bool,
+    /// A clip was double-clicked: show it in the clip editor.
+    pub open_clip: bool,
 }
 
 enum Drag {
@@ -420,6 +395,7 @@ impl ArrangeView {
             && let Some(p) = pointer
         {
             match g.hit(p, song) {
+                Hit::Clip(_) => out.open_clip = true,
                 Hit::Lane(track) => {
                     let start = (g.tick_at(p.x) / self.snap as f64).floor() as Tick * self.snap;
                     out.edits.push(Edit::NewClip { track, start });

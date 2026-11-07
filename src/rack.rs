@@ -158,6 +158,11 @@ impl Kind {
         Kind::Mixer,
     ];
 
+    /// Audio in, audio out: what goes in a track's effects chain.
+    pub fn is_effect(self) -> bool {
+        matches!(self, Kind::Crusher | Kind::Filter | Kind::Delay)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Kind::Track(_) => "track",
@@ -320,10 +325,11 @@ impl Rack {
         id
     }
 
-    /// Add the device for a new track and plug it into a free mixer channel.
+    /// Add the device for a new track and plug it into a free mixer
+    /// channel, adding a mixer if they're all taken.
     pub fn add_track(&mut self, track: usize) -> DeviceId {
         let id = self.add(Kind::Track(track));
-        if let Some(free) = self.free_mixer_input() {
+        if let Some(free) = self.free_mixer_input().or_else(|| self.add_mixer()) {
             let _ = self.connect(
                 Jack {
                     device: id,
@@ -333,6 +339,30 @@ impl Rack {
             );
         }
         id
+    }
+
+    /// A new mixer in front of the master, taking what went into the
+    /// master as its first channel. Returns its first free channel.
+    fn add_mixer(&mut self) -> Option<Jack> {
+        let master = self.devices.iter().find(|d| d.kind == Kind::Master)?.id;
+        let into = Jack {
+            device: master,
+            port: 0,
+        };
+        let old = self.cable_into(into).map(|c| c.from);
+        let mixer = self.add(Kind::Mixer);
+        let channel = |port| Jack {
+            device: mixer,
+            port,
+        };
+        self.connect(channel(0), into).ok()?;
+        match old {
+            Some(old) => {
+                self.connect(old, channel(0)).ok()?;
+                Some(channel(1))
+            }
+            None => Some(channel(0)),
+        }
     }
 
     fn free_mixer_input(&self) -> Option<Jack> {
@@ -528,6 +558,73 @@ impl Rack {
         self.version += 1;
     }
 
+    /// A track's effects chain: the audio effects its sound goes through
+    /// on the way to a mixer or the master, in order, following the first
+    /// cable out of each audio output.
+    pub fn chain(&self, track: usize) -> Vec<DeviceId> {
+        let mut chain = Vec::new();
+        let Some(mut at) = self.track_device(track).map(|d| d.id) else {
+            return chain;
+        };
+        while let Some(next) = self
+            .cable_from(Jack {
+                device: at,
+                port: 0,
+            })
+            .map(|c| c.to)
+        {
+            let Some(d) = self.device(next.device) else {
+                break;
+            };
+            if next.port != 0 || !d.kind.is_effect() || chain.contains(&d.id) {
+                break;
+            }
+            chain.push(d.id);
+            at = d.id;
+        }
+        chain
+    }
+
+    /// The first cable out of an output.
+    pub fn cable_from(&self, from: Jack) -> Option<&Cable> {
+        self.cables.iter().find(|c| c.from == from)
+    }
+
+    /// Add an effect at the end of a track's chain: between its last
+    /// device and wherever that went.
+    pub fn append_effect(&mut self, track: usize, kind: Kind) -> Option<DeviceId> {
+        let last = match self.chain(track).last() {
+            Some(&id) => id,
+            None => self.track_device(track)?.id,
+        };
+        let out = Jack {
+            device: last,
+            port: 0,
+        };
+        let next = self.cable_from(out).map(|c| c.to);
+        let id = self.add(kind);
+        let jack = |device| Jack { device, port: 0 };
+        self.connect(out, jack(id)).ok()?;
+        if let Some(next) = next {
+            self.connect(jack(id), next).ok()?;
+        }
+        Some(id)
+    }
+
+    /// Remove an effect, joining what went into it to where it went.
+    pub fn splice_out(&mut self, id: DeviceId) -> bool {
+        let jack = |port| Jack { device: id, port };
+        let from = self.cable_into(jack(0)).map(|c| c.from);
+        let to = self.cable_from(jack(0)).map(|c| c.to);
+        if !self.remove(id) {
+            return false;
+        }
+        if let (Some(from), Some(to)) = (from, to) {
+            let _ = self.connect(from, to);
+        }
+        true
+    }
+
     /// Track devices whose track no longer exists are removed.
     pub fn sync_tracks(&mut self, tracks: usize) {
         for t in 0..tracks.min(MAX_TRACKS) {
@@ -680,6 +777,63 @@ mod tests {
         assert_eq!(rack.track_device(0).unwrap().id, new, "shifted up");
         assert_eq!(rack.track_device(2).unwrap().id, ids[2]);
         assert!(rack.track_device(3).is_none());
+    }
+
+    #[test]
+    fn effects_chain_follows_the_cables() {
+        let mut rack = Rack::simple(2);
+        assert_eq!(rack.chain(0), vec![], "straight into the mixer");
+        let f = rack.append_effect(0, Kind::Filter).unwrap();
+        let d = rack.append_effect(0, Kind::Delay).unwrap();
+        assert_eq!(rack.chain(0), vec![f, d]);
+        assert_eq!(rack.chain(1), vec![], "the other track is untouched");
+        let mixer = rack
+            .devices
+            .iter()
+            .find(|x| x.kind == Kind::Mixer)
+            .unwrap()
+            .id;
+        assert_eq!(
+            rack.cable_from(jack(d, 0)).unwrap().to,
+            jack(mixer, 0),
+            "still reaches the mixer"
+        );
+        assert!(rack.splice_out(f));
+        assert_eq!(rack.chain(0), vec![d]);
+        let t = rack.track_device(0).unwrap().id;
+        assert_eq!(
+            rack.cable_from(jack(t, 0)).unwrap().to,
+            jack(d, 0),
+            "rejoined"
+        );
+        // A cable into a CV input isn't part of the chain.
+        let lfo = rack.add(Kind::Lfo);
+        rack.connect(jack(lfo, 0), jack(d, 0)).ok();
+        assert!(rack.chain(0).len() <= 1);
+    }
+
+    #[test]
+    fn a_full_mixer_gets_another_in_front_of_it() {
+        let mut rack = Rack::simple(MIXER_CHANNELS);
+        let master = rack
+            .devices
+            .iter()
+            .find(|d| d.kind == Kind::Master)
+            .unwrap()
+            .id;
+        for t in MIXER_CHANNELS..MIXER_CHANNELS + 3 {
+            rack.add_track(t);
+        }
+        let mixers = rack
+            .devices
+            .iter()
+            .filter(|d| d.kind == Kind::Mixer)
+            .count();
+        assert_eq!(mixers, 2);
+        for t in 0..MIXER_CHANNELS + 3 {
+            let id = rack.track_device(t).unwrap().id;
+            assert!(rack.reaches(id, master), "track {t} is heard");
+        }
     }
 
     #[test]
