@@ -1,7 +1,7 @@
 //! Picking files with the mouse: a folder listing, shared with the browser,
 //! and the file dialog for opening, saving and exporting.
 //!
-//! In the dialog, click a folder to go into it, click a file to pick it and
+//! In the dialog, click a folder to go into it (the first row goes up), click a file to pick it and
 //! double-click to pick it and confirm. The name field takes a typed name or
 //! path too (`~/` is the home folder).
 
@@ -40,6 +40,21 @@ pub fn list(dir: &Path, ext: &str) -> std::io::Result<Vec<Entry>> {
         .collect();
     entries.sort_by_key(|e| (!e.dir, e.name.to_lowercase()));
     Ok(entries)
+}
+
+/// The first row of a listing: a way up to `dir`'s parent, named, so it
+/// says where it goes. Returns the parent when clicked.
+pub fn parent_row(ui: &mut egui::Ui, dir: &Path) -> Option<PathBuf> {
+    let parent = dir.parent()?;
+    let name = parent.file_name().map_or_else(
+        || parent.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let label = RichText::new(format!("‹  up to {name}")).color(color::MUTED);
+    ui.selectable_label(false, label)
+        .on_hover_text(parent.display().to_string())
+        .clicked()
+        .then(|| parent.to_owned())
 }
 
 /// Typed text as a path: trimmed, and `~/` is the home folder.
@@ -167,16 +182,7 @@ impl Dialog {
             ui.set_width(620.0);
             ui.heading(self.purpose.title());
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let up = self.dir.parent().map(Path::to_owned);
-                if ui
-                    .add_enabled(up.is_some(), egui::Button::new("Up"))
-                    .clicked()
-                {
-                    go = up;
-                }
-                ui.label(RichText::new(self.dir.display().to_string()).color(color::MUTED));
-            });
+            ui.label(RichText::new(self.dir.display().to_string()).color(color::MUTED));
             ui.add_space(4.0);
             egui::Frame::new()
                 .fill(color::BG)
@@ -188,6 +194,9 @@ impl Dialog {
                         .min_scrolled_height(320.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
+                            if let Some(up) = parent_row(ui, &self.dir) {
+                                go = Some(up);
+                            }
                             if self.entries.is_empty() {
                                 ui.label(
                                     RichText::new(format!(

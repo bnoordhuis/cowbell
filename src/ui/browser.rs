@@ -2,8 +2,9 @@
 //! with, and a folder of samples.
 //!
 //! Click an instrument to add a track playing it. Click a folder to go into
-//! it. Click a sample to hear it; double-click it, or pick it and click
-//! "Add", to add a track playing it, sliced on its hits.
+//! it, or the first row to go up. Click a sample to hear it; double-click
+//! it, or pick it and click "Add", to add a track playing it, sliced on its
+//! hits.
 
 use std::path::{Path, PathBuf};
 
@@ -83,21 +84,12 @@ impl Browser {
         ui.add_space(14.0);
         heading(ui, "SAMPLES");
         let mut go = None;
-        ui.horizontal(|ui| {
-            let up = self.dir.parent().map(Path::to_owned);
-            if ui
-                .add_enabled(up.is_some(), egui::Button::new("Up"))
-                .clicked()
-            {
-                go = up;
-            }
-            let name = self.dir.file_name().map_or_else(
-                || self.dir.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            ui.label(RichText::new(name).color(color::TEXT))
-                .on_hover_text(self.dir.display().to_string());
-        });
+        let name = self.dir.file_name().map_or_else(
+            || self.dir.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        ui.label(RichText::new(name).color(color::TEXT))
+            .on_hover_text(self.dir.display().to_string());
         if let Some(e) = &self.error {
             ui.label(RichText::new(e).color(color::ERROR));
         }
@@ -107,6 +99,9 @@ impl Browser {
             .max_height(list_h)
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                if let Some(up) = files::parent_row(ui, &self.dir) {
+                    go = Some(up);
+                }
                 if self.entries.is_empty() {
                     ui.label(RichText::new("no folders or .wav files here").color(color::DIM));
                 }
