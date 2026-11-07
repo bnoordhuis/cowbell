@@ -603,6 +603,12 @@ impl App {
         }
     }
 
+    /// Move the playhead to the start: of the loop, if there is one.
+    fn go_to_start(&mut self) {
+        let start = self.doc.song.loop_range.as_ref().map_or(0, |r| r.start);
+        let _ = self.controller.send(Command::Locate(start));
+    }
+
     fn play_or_stop(&mut self) {
         let cmd = if self.controller.is_playing() {
             Command::Stop
@@ -689,12 +695,11 @@ impl App {
             self.menus(ui);
             ui.add_space(16.0);
 
-            let to_start = self.doc.song.loop_range.as_ref().map_or(0, |r| r.start);
             if icon_button(ui, Icon::ToStart, false)
-                .on_hover_text("Back to the start")
+                .on_hover_text("Back to the start (Home)")
                 .clicked()
             {
-                let _ = self.controller.send(Command::Locate(to_start));
+                self.go_to_start();
             }
             let play = if playing { Icon::Stop } else { Icon::Play };
             if icon_button(ui, play, playing)
@@ -776,7 +781,7 @@ impl App {
         );
         let hints = match self.view {
             View::Arrange => {
-                "space plays and stops · drag clips to move them, their right edge to resize · double-click an empty spot for a new clip · right-click clips and tracks for more · drag empty space to move around · ctrl+scroll to zoom"
+                "space plays and stops · home goes to the start · drag clips to move them, their right edge to resize · double-click an empty spot for a new clip · right-click clips and tracks for more · drag empty space to move around · ctrl+scroll to zoom"
             }
             View::Rack => {
                 "drag between jacks to patch · drag a plug out to unplug · drag or scroll knobs (shift: fine) · click switches · double-click resets · right-click a knob to automate it"
@@ -1223,17 +1228,17 @@ impl eframe::App for App {
                 i.pointer = Default::default();
             });
         }
-        // Space plays and stops, unless it's being typed into a dialog. It's
-        // taken here, before any widget sees it, so a button that has focus
-        // from a click doesn't press itself again.
-        if self.dialog.is_none()
-            && self.confirm.is_none()
-            && !ctx.egui_wants_keyboard_input()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Space))
-        {
-            self.play_or_stop();
-        }
+        // Space plays and stops and Home goes back to the start, unless
+        // they're being typed into a dialog. They're taken here, before any
+        // widget sees them, so a button that has focus from a click doesn't
+        // press itself again.
         if self.dialog.is_none() && self.confirm.is_none() && !ctx.egui_wants_keyboard_input() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Space)) {
+                self.play_or_stop();
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Home)) {
+                self.go_to_start();
+            }
             for s in ctx.input_mut(take_shortcuts) {
                 self.shortcut(&ctx, s);
             }
