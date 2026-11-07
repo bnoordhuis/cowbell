@@ -1,10 +1,8 @@
 //! Dev-only screenshots, for checking the UI without a person at the screen.
 //!
 //! `COWBELL_SCREENSHOT=out.ppm` saves the window as a binary PPM and exits.
-//! `COWBELL_VIEW=rack` or `COWBELL_VIEW=track` shows the rack or the track
-//! screen instead of the arrangement,
-//! `COWBELL_SELECT=track,clip` selects a clip for the clip editor,
-//! `COWBELL_TAB=devices` shows the devices tab instead, and
+//! `COWBELL_VIEW=editor|devices|rack` shows that screen instead of the
+//! arrangement, `COWBELL_SELECT=track,clip` selects a clip, and
 //! `COWBELL_DIALOG=open|save|export` opens a file dialog.
 
 use std::sync::Arc;

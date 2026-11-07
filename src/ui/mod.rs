@@ -79,16 +79,37 @@ pub fn run(song: Song, path: Option<PathBuf>) -> Result<(), String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
     Arrange,
-    /// The selected track's clip, or its devices, filling the window.
-    Track,
+    /// The clip editor, on the selected clip.
+    Editor,
+    /// The selected track's instrument and effects.
+    Devices,
     Rack,
 }
 
-/// The track screen's tabs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Tab {
-    Clip,
-    Devices,
+impl View {
+    /// Where Tab goes: around Arrange, Editor and Devices. (From the rack,
+    /// on as from the arrangement.)
+    fn next(self) -> View {
+        match self {
+            View::Arrange | View::Rack => View::Editor,
+            View::Editor => View::Devices,
+            View::Devices => View::Arrange,
+        }
+    }
+
+    /// Where Shift+Tab goes: the other way round.
+    fn prev(self) -> View {
+        match self {
+            View::Arrange | View::Rack => View::Devices,
+            View::Editor => View::Arrange,
+            View::Devices => View::Editor,
+        }
+    }
+
+    /// The editor and devices: a track's screens.
+    fn is_track(self) -> bool {
+        matches!(self, View::Editor | View::Devices)
+    }
 }
 
 /// What to do once unsaved changes have been let go of.
@@ -256,8 +277,6 @@ struct App {
     view: View,
     arrange: arrange::ArrangeView,
     rack_view: rack::RackView,
-    /// The track screen: which tab, and the views on it.
-    tab: Tab,
     steps: steps::StepView,
     devices: devices::DevicesView,
     /// Keep the playhead in view while playing.
@@ -299,7 +318,8 @@ impl App {
         #[cfg(feature = "screenshot")]
         let view = match std::env::var("COWBELL_VIEW").as_deref() {
             Ok("rack") => View::Rack,
-            Ok("track") => View::Track,
+            Ok("editor") => View::Editor,
+            Ok("devices") => View::Devices,
             _ => View::Arrange,
         };
         #[cfg(not(feature = "screenshot"))]
@@ -317,7 +337,6 @@ impl App {
             view,
             arrange: arrange::ArrangeView::default(),
             rack_view: rack::RackView::default(),
-            tab: Tab::Clip,
             steps: steps::StepView::default(),
             devices: devices::DevicesView::default(),
             follow: true,
@@ -339,8 +358,7 @@ impl App {
         app
     }
 
-    /// Dev only: `COWBELL_SELECT=track,clip` selects a clip,
-    /// `COWBELL_TAB=devices` shows the devices tab, and
+    /// Dev only: `COWBELL_SELECT=track,clip` selects a clip, and
     /// `COWBELL_DIALOG=open|save|export` opens a file dialog.
     #[cfg(feature = "screenshot")]
     fn screenshot_setup(&mut self) {
@@ -349,9 +367,6 @@ impl App {
             && let (Ok(t), Ok(c)) = (t.parse(), c.parse())
         {
             self.select(Select::Clip((t, c)));
-        }
-        if std::env::var("COWBELL_TAB").as_deref() == Ok("devices") {
-            self.tab = Tab::Devices;
         }
         match std::env::var("COWBELL_DIALOG").as_deref() {
             Ok("open") => self.ask(files::Purpose::Open),
@@ -502,7 +517,6 @@ impl App {
         match t {
             Some(t) => {
                 self.select(Select::Track(t));
-                self.tab = Tab::Devices;
                 self.say(format!("added {name}: double-click its lane for a clip"));
             }
             None => {
@@ -619,9 +633,9 @@ impl App {
         }
     }
 
-    /// Tab flips between the arrangement and the track screen, Shift+Tab
-    /// between the clip and the devices, Esc goes back to the arrangement,
-    /// and on the track screen Ctrl+arrows go to other clips and tracks.
+    /// Tab goes on from the arrangement to the editor to the devices and
+    /// round again, Shift+Tab back; Esc goes back to the arrangement; and on
+    /// a track's screens Ctrl+arrows go to other clips and tracks.
     fn view_keys(&mut self, ctx: &egui::Context) {
         let shift = egui::Modifiers::SHIFT;
         let ctrl = egui::Modifiers::COMMAND;
@@ -630,20 +644,12 @@ impl App {
         // Shift+Tab first: Tab alone would take it too.
         if key(shift, Key::Tab) {
             no_focus_move();
-            self.tab = match self.tab {
-                Tab::Clip => Tab::Devices,
-                Tab::Devices => Tab::Clip,
-            };
-            self.show_track();
+            self.show(self.view.prev());
         } else if key(egui::Modifiers::NONE, Key::Tab) {
             no_focus_move();
-            if self.view == View::Track {
-                self.view = View::Arrange;
-            } else {
-                self.show_track();
-            }
+            self.show(self.view.next());
         }
-        if self.view != View::Track {
+        if !self.view.is_track() {
             return;
         }
         // Esc also closes an open menu; let it do just that.
@@ -651,10 +657,10 @@ impl App {
             self.view = View::Arrange;
             return;
         }
-        if key(ctrl, Key::ArrowLeft) {
+        if self.view == View::Editor && key(ctrl, Key::ArrowLeft) {
             self.step_clip(-1);
         }
-        if key(ctrl, Key::ArrowRight) {
+        if self.view == View::Editor && key(ctrl, Key::ArrowRight) {
             self.step_clip(1);
         }
         let track = self.arrange.selected_track;
@@ -815,16 +821,26 @@ impl App {
                 });
             ui.checkbox(&mut self.follow, "Follow");
             ui.add_space(16.0);
-            ui.selectable_value(&mut self.view, View::Arrange, "Arrange")
-                .on_hover_text("The tracks and their clips (Tab flips to Track)");
-            if ui
-                .selectable_label(self.view == View::Track, "Track")
-                .on_hover_text("The selected clip or the track's devices (Tab flips back)")
-                .clicked()
-            {
-                self.show_track();
+            let views = [
+                (View::Arrange, "Arrange", "The tracks and their clips"),
+                (View::Editor, "Editor", "The selected clip"),
+                (View::Devices, "Devices", "The selected track's instrument and effects"),
+                (View::Rack, "Rack", "Every device and how they're patched"),
+            ];
+            for (view, name, what) in views {
+                let hover = if view == View::Rack {
+                    what.to_owned()
+                } else {
+                    format!("{what} (Tab and Shift+Tab go round Arrange, Editor and Devices)")
+                };
+                if ui
+                    .selectable_label(self.view == view, name)
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    self.show(view);
+                }
             }
-            ui.selectable_value(&mut self.view, View::Rack, "Rack");
             ui.add_space(16.0);
             ui.label(RichText::new(self.project_name()).color(color::MUTED));
         });
@@ -854,11 +870,11 @@ impl App {
             View::Arrange => {
                 "space plays and stops · home goes to the start · drag clips to move them, their right edge to resize · double-click an empty spot for a new clip · right-click clips and tracks for more · drag empty space to move around · ctrl+scroll to zoom"
             }
-            View::Track if self.tab == Tab::Clip => {
-                "tab: back to the arrangement · shift+tab: devices · ctrl+left and right: other clips · ctrl+up and down: other tracks · click or drag to add and remove hits · right-click a hit to roll it · scroll over a hit for velocity · click a lane name to hear it"
+            View::Editor => {
+                "tab: devices · shift+tab: arrangement · esc: arrangement · ctrl+left and right: other clips · ctrl+up and down: other tracks · click or drag to add and remove hits · right-click a hit to roll it · scroll over a hit for velocity · click a lane name to hear it"
             }
-            View::Track => {
-                "tab: back to the arrangement · shift+tab: the clip · ctrl+up and down: other tracks · drag or scroll knobs (shift: fine) · click switches · double-click resets"
+            View::Devices => {
+                "tab: arrangement · shift+tab: editor · esc: arrangement · ctrl+up and down: other tracks · drag or scroll knobs (shift: fine) · click switches · double-click resets"
             }
             View::Rack => {
                 "drag between jacks to patch · drag a plug out to unplug · drag or scroll knobs (shift: fine) · click switches · double-click resets · right-click a knob to automate it"
@@ -895,8 +911,7 @@ impl App {
             self.set_loop(false);
         }
         if out.open_clip {
-            self.tab = Tab::Clip;
-            self.view = View::Track;
+            self.show(View::Editor);
         }
         self.changes(out.edits, out.live, false, out.gesture_done);
         if playing || ui.input(|i| i.pointer.any_down()) {
@@ -1084,11 +1099,11 @@ impl App {
         });
     }
 
-    /// Show the track screen. With no clip open, the selected track's clip
-    /// nearest the playhead opens.
-    fn show_track(&mut self) {
-        self.view = View::Track;
-        if self.open_clip().is_none() {
+    /// Show `view`. For the editor with no clip open, the selected track's
+    /// clip nearest the playhead opens.
+    fn show(&mut self, view: View) {
+        self.view = view;
+        if view == View::Editor && self.open_clip().is_none() {
             let (track, pos) = (self.arrange.selected_track, self.controller.position());
             if let Some(c) = track::clip_near(&self.doc.song, track, pos) {
                 self.select(Select::Clip(c));
@@ -1127,9 +1142,10 @@ impl App {
         }
     }
 
-    /// The track screen: the selected clip in the clip editor, or the
+    /// A track's screen: the selected clip in the clip editor, or the
     /// selected track's devices, with ways to get to the others.
     fn track_view(&mut self, ui: &mut egui::Ui) {
+        let editor = self.view == View::Editor;
         let song = &self.doc.song;
         let track = self.arrange.selected_track;
         let clip = self.open_clip();
@@ -1138,15 +1154,6 @@ impl App {
         let mut step = 0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            ui.selectable_value(&mut self.tab, Tab::Clip, RichText::new("Clip").size(15.0))
-                .on_hover_text("Shift+Tab flips between the clip and the devices");
-            ui.selectable_value(
-                &mut self.tab,
-                Tab::Devices,
-                RichText::new("Devices").size(15.0),
-            )
-            .on_hover_text("Shift+Tab flips between the clip and the devices");
-            ui.add_space(16.0);
             let name = song
                 .tracks
                 .get(track)
@@ -1164,7 +1171,7 @@ impl App {
                 })
                 .response
                 .on_hover_text("Ctrl+Up and Ctrl+Down for the track above or below");
-            if self.tab != Tab::Clip {
+            if !editor {
                 return;
             }
             let clips = song.tracks.get(track).map_or(0, |t| t.clips.len());
@@ -1206,7 +1213,7 @@ impl App {
                 }
             }
         });
-        if self.tab == Tab::Clip && track < song.tracks.len() {
+        if editor && track < song.tracks.len() {
             ui.add_space(4.0);
             let pos = self.controller.position();
             if let Some(c) = track::strip(ui, song, track, clip, pos) {
@@ -1228,47 +1235,42 @@ impl App {
         let (_, rect) = ui.allocate_space(ui.available_size());
         let mut content = ui.new_child(egui::UiBuilder::new().max_rect(rect));
         let song = &self.doc.song;
-        match self.tab {
-            Tab::Clip => {
-                let Some(at) = clip else {
-                    let has_clips = song.tracks.get(track).is_some_and(|t| !t.clips.is_empty());
-                    let text = if has_clips {
-                        "Pick a clip in the strip above, or with Ctrl+Left and Ctrl+Right."
-                    } else {
-                        "This track has no clips yet. Double-click an empty spot in its lane in the arrangement for one."
-                    };
-                    content.centered_and_justified(|ui| {
-                        ui.label(RichText::new(text).color(color::MUTED));
-                    });
-                    return;
+        if editor {
+            let Some(at) = clip else {
+                let has_clips = song.tracks.get(track).is_some_and(|t| !t.clips.is_empty());
+                let text = if has_clips {
+                    "Pick a clip in the strip above, or with Ctrl+Left and Ctrl+Right."
+                } else {
+                    "This track has no clips yet. Double-click an empty spot in its lane in the arrangement for one."
                 };
-                let pos = self.controller.position();
-                let c = song.clip(at).unwrap();
-                let playhead = (self.controller.is_playing() && c.span().contains(&pos))
-                    .then(|| ((pos - c.start) / c.ticks_per_row()) as usize);
-                let out = self.steps.show(&mut content, song, at, playhead);
-                if let Some((instrument, slice)) = out.audition {
-                    let _ = self.controller.send(Command::Audition {
-                        instrument,
-                        slice,
-                        velocity: 110,
-                        hold: false,
-                    });
-                }
-                self.changes(out.edits, out.live, out.end_first, out.gesture_done);
+                content.centered_and_justified(|ui| {
+                    ui.label(RichText::new(text).color(color::MUTED));
+                });
+                return;
+            };
+            let pos = self.controller.position();
+            let c = song.clip(at).unwrap();
+            let playhead = (self.controller.is_playing() && c.span().contains(&pos))
+                .then(|| ((pos - c.start) / c.ticks_per_row()) as usize);
+            let out = self.steps.show(&mut content, song, at, playhead);
+            if let Some((instrument, slice)) = out.audition {
+                let _ = self.controller.send(Command::Audition {
+                    instrument,
+                    slice,
+                    velocity: 110,
+                    hold: false,
+                });
             }
-            Tab::Devices => {
-                if track >= song.tracks.len() {
-                    content.centered_and_justified(|ui| {
-                        ui.label(
-                            RichText::new("Add a track to see its devices.").color(color::MUTED),
-                        );
-                    });
-                    return;
-                }
-                let out = self.devices.show(&mut content, song, track);
-                self.changes(out.edits, out.live, out.end_first, out.gesture_done);
+            self.changes(out.edits, out.live, out.end_first, out.gesture_done);
+        } else {
+            if track >= song.tracks.len() {
+                content.centered_and_justified(|ui| {
+                    ui.label(RichText::new("Add a track to see its devices.").color(color::MUTED));
+                });
+                return;
             }
+            let out = self.devices.show(&mut content, song, track);
+            self.changes(out.edits, out.live, out.end_first, out.gesture_done);
         }
         if ui.input(|i| i.pointer.any_down()) || self.controller.is_playing() {
             ui.ctx().request_repaint();
@@ -1443,7 +1445,7 @@ impl eframe::App for App {
             .frame(frame(color::BG))
             .show(ui, |ui| match self.view {
                 View::Arrange => self.arrange(ui),
-                View::Track => {
+                View::Editor | View::Devices => {
                     egui::Frame::new()
                         .inner_margin(egui::Margin::symmetric(10, 6))
                         .show(ui, |ui| self.track_view(ui));
@@ -1563,5 +1565,28 @@ mod tests {
         );
         frame(tab(), true);
         assert_eq!(ctx.memory(|m| m.focused()), None, "every time");
+    }
+
+    #[test]
+    fn tab_goes_round_arrange_editor_and_devices() {
+        let mut v = View::Arrange;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            v = v.next();
+            seen.push(v);
+        }
+        assert_eq!(
+            seen,
+            [View::Editor, View::Devices, View::Arrange, View::Editor]
+        );
+        for v in [View::Arrange, View::Editor, View::Devices] {
+            assert_eq!(v.next().prev(), v, "Shift+Tab undoes Tab");
+        }
+        assert_eq!(
+            View::Rack.next(),
+            View::Editor,
+            "on as from the arrangement"
+        );
+        assert_eq!(View::Rack.prev(), View::Devices);
     }
 }
