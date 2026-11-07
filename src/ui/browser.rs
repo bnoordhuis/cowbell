@@ -60,6 +60,39 @@ impl Browser {
 
     pub fn show(&mut self, ui: &mut egui::Ui) -> Option<Pick> {
         let mut pick = None;
+        // "Add" stays at the bottom; everything above it scrolls as one,
+        // so a short window (or a big zoom) cuts nothing off.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new("click a sample to hear it, double-click to add it")
+                        .size(12.0)
+                        .color(color::DIM),
+                )
+                .wrap(),
+            );
+            let add = egui::Button::new("Add as a track")
+                .min_size(egui::vec2(ui.available_width(), 32.0));
+            if ui.add_enabled(self.selected.is_some(), add).clicked() {
+                pick = self.selected.clone().map(Pick::Sample);
+            }
+            ui.add_space(6.0);
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if let Some(p) = self.list(ui) {
+                            pick = Some(p);
+                        }
+                    });
+            });
+        });
+        pick
+    }
+
+    /// The instruments, then the folder's samples.
+    fn list(&mut self, ui: &mut egui::Ui) -> Option<Pick> {
+        let mut pick = None;
         let heading = |ui: &mut egui::Ui, text: &str| {
             ui.label(RichText::new(text).size(12.0).strong().color(color::MUTED));
         };
@@ -93,52 +126,34 @@ impl Browser {
         if let Some(e) = &self.error {
             ui.label(RichText::new(e).color(color::ERROR));
         }
-        let add_h = 60.0;
-        let list_h = (ui.available_height() - add_h).max(80.0);
-        egui::ScrollArea::vertical()
-            .max_height(list_h)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if let Some(up) = files::parent_row(ui, &self.dir) {
-                    go = Some(up);
-                }
-                if self.entries.is_empty() {
-                    ui.label(RichText::new("no folders or .wav files here").color(color::DIM));
-                }
-                for e in &self.entries {
-                    let label = if e.dir {
-                        RichText::new(format!("{}/", e.name)).color(color::TEXT)
-                    } else {
-                        RichText::new(&e.name).color(color::ACCENT)
-                    };
-                    let selected = self.selected.as_ref() == Some(&e.path);
-                    let r = ui.selectable_label(selected, label);
-                    if e.dir && r.clicked() {
-                        go = Some(e.path.clone());
-                    } else if !e.dir && r.clicked() {
-                        self.selected = Some(e.path.clone());
-                        // The second click of a double-click adds the
-                        // sample; it shouldn't start it over.
-                        if !r.double_clicked() {
-                            self.preview = Some(e.path.clone());
-                        }
-                    }
-                    if !e.dir && r.double_clicked() {
-                        pick = Some(Pick::Sample(e.path.clone()));
-                    }
-                }
-            });
-        ui.add_space(6.0);
-        let add =
-            egui::Button::new("Add as a track").min_size(egui::vec2(ui.available_width(), 32.0));
-        if ui.add_enabled(self.selected.is_some(), add).clicked() {
-            pick = self.selected.clone().map(Pick::Sample);
+        if let Some(up) = files::parent_row(ui, &self.dir) {
+            go = Some(up);
         }
-        ui.label(
-            RichText::new("click a sample to hear it, double-click to add it")
-                .size(12.0)
-                .color(color::DIM),
-        );
+        if self.entries.is_empty() {
+            ui.label(RichText::new("no folders or .wav files here").color(color::DIM));
+        }
+        for e in &self.entries {
+            let label = if e.dir {
+                RichText::new(format!("{}/", e.name)).color(color::TEXT)
+            } else {
+                RichText::new(&e.name).color(color::ACCENT)
+            };
+            let selected = self.selected.as_ref() == Some(&e.path);
+            let r = ui.selectable_label(selected, label);
+            if e.dir && r.clicked() {
+                go = Some(e.path.clone());
+            } else if !e.dir && r.clicked() {
+                self.selected = Some(e.path.clone());
+                // The second click of a double-click adds the sample; it
+                // shouldn't start it over.
+                if !r.double_clicked() {
+                    self.preview = Some(e.path.clone());
+                }
+            }
+            if !e.dir && r.double_clicked() {
+                pick = Some(Pick::Sample(e.path.clone()));
+            }
+        }
         if let Some(dir) = go {
             self.cd(&dir);
         }

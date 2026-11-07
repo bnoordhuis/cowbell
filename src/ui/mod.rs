@@ -49,6 +49,10 @@ mod color {
     ];
 }
 
+/// How much bigger than egui's usual size everything is drawn: text,
+/// buttons, lanes and all. Ctrl+= and Ctrl+- change it while running.
+const ZOOM: f32 = 1.3;
+
 /// Open the window. `path` is where the project is saved; it needn't exist
 /// yet.
 pub fn run(song: Song, path: Option<PathBuf>) -> Result<(), String> {
@@ -63,7 +67,10 @@ pub fn run(song: Song, path: Option<PathBuf>) -> Result<(), String> {
     eframe::run_native(
         "cowbell",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new(song, path)))),
+        Box::new(|cc| {
+            cc.egui_ctx.set_zoom_factor(ZOOM);
+            Ok(Box::new(App::new(song, path)))
+        }),
     )
     .map_err(|e| e.to_string())
 }
@@ -760,7 +767,7 @@ impl App {
             (None, Ok(_), Some(m)) if self.view == View::Rack => (m.clone(), color::ERROR),
             _ => (String::new(), color::TEXT),
         };
-        p.text(
+        let said = p.text(
             r.left_center() + vec2(10.0, 0.0),
             Align2::LEFT_CENTER,
             text,
@@ -775,13 +782,18 @@ impl App {
                 "drag between jacks to patch · drag a plug out to unplug · drag or scroll knobs (shift: fine) · click switches · double-click resets · right-click a knob to automate it"
             }
         };
-        p.text(
-            r.right_center() - vec2(10.0, 0.0),
-            Align2::RIGHT_CENTER,
-            hints,
-            font,
-            color::MUTED,
-        );
+        // The hints get what room the message leaves, cut short if need be.
+        let room = r.right() - 10.0 - (said.right() + 30.0).max(r.left() + 10.0);
+        if room > 40.0 {
+            let mut job = egui::text::LayoutJob::single_section(
+                hints.to_owned(),
+                egui::TextFormat::simple(font, color::MUTED),
+            );
+            job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            let at = r.right_center() - vec2(10.0 + galley.size().x, galley.size().y / 2.0);
+            p.galley(at, galley, color::MUTED);
+        }
     }
 
     fn arrange(&mut self, ui: &mut egui::Ui) {
@@ -1027,19 +1039,27 @@ impl App {
                         grid = Some(Edit::Resolution(at, rpb));
                     }
                     ui.add_space(16.0);
-                    ui.label(
-                        RichText::new(
-                            "click or drag to add and remove hits · right-click a hit to roll it · scroll over a hit for velocity · click a lane name to hear it",
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "click or drag to add and remove hits · right-click a hit to roll it · scroll over a hit for velocity · click a lane name to hear it",
+                            )
+                            .color(color::DIM),
                         )
-                        .color(color::DIM),
+                        .truncate(),
                     );
                 }
                 (Tab::Devices, _) if !name.is_empty() => {
                     ui.label(RichText::new(format!("{name} · instrument and effects")).color(color::MUTED));
                     ui.add_space(16.0);
-                    ui.label(
-                        RichText::new("drag or scroll knobs (shift: fine) · click switches · double-click resets")
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "drag or scroll knobs (shift: fine) · click switches · double-click resets",
+                            )
                             .color(color::DIM),
+                        )
+                        .truncate(),
                     );
                 }
                 _ => {}
@@ -1243,9 +1263,14 @@ impl eframe::App for App {
             .frame(frame(color::PANEL))
             .show(ui, |ui| self.status(ui));
         if self.view == View::Arrange {
+            // At most a share of the window, so the tracks keep room even
+            // when the window is small for its zoom. (The default size is
+            // taken once, before the window has its real size.)
+            let most = (ctx.content_rect().height() * 0.45).max(160.0);
             egui::Panel::bottom("editor")
                 .resizable(true)
                 .default_size(330.0)
+                .max_size(most)
                 .min_size(160.0)
                 .frame(frame(color::BG).inner_margin(egui::Margin::symmetric(10, 6)))
                 .show(ui, |ui| self.editor_panel(ui));
