@@ -17,7 +17,7 @@ fn plain_song() -> Song {
     for t in &mut song.tracks {
         for c in &mut t.clips {
             for cell in &mut c.cells {
-                if let Some(tr) = &mut cell.trigger {
+                for tr in cell.notes.iter_mut().flatten() {
                     tr.velocity = 0x7f;
                 }
             }
@@ -93,7 +93,7 @@ fn bounced_clip_plays_back_identically() {
     assert!(left.is_empty(), "originals cleared, but not {left:?}");
     let new = &song.tracks[t].clips[0];
     assert_eq!((new.start, new.cells.len()), (clip.start, rows));
-    let triggers = new.cells.iter().filter(|c| c.trigger.is_some()).count();
+    let triggers = new.cells.iter().filter(|c| c.has_hit()).count();
     assert!(triggers > 3, "{triggers} slices");
     assert_eq!(
         frames(&song, song.instruments.len() - 1),
@@ -131,7 +131,7 @@ fn bounce_clears_only_its_stretch() {
     assert_eq!(cells[16..], groove.cells[16..]);
     let new = &song.tracks[tracks].clips[0];
     assert_eq!(new.start, groove.start + 2 * TICKS_PER_BEAT);
-    assert!(new.cells[0].trigger.is_some(), "slice 0 on the first row");
+    assert!(new.cells[0].has_hit(), "slice 0 on the first row");
     // The same clip later in the song is untouched.
     assert_eq!(song.tracks[0].clips[again].cells, groove.cells);
 }

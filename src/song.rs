@@ -64,25 +64,106 @@ impl Fx {
     }
 }
 
+/// Most notes (or hits) one cell can start.
+pub const MAX_NOTES: usize = 4;
+
+/// A note: a slice of a sample, or a synth's note number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trigger {
     pub slice: u16,
     /// 0..=127
     pub velocity: u8,
+    /// How many rows it lasts. 0 is until something stops it: on a mono
+    /// track the next notes, on a poly track a cut (or, for a sample, the
+    /// end of its slice).
+    #[serde(default)]
+    pub rows: u16,
 }
 
+impl Trigger {
+    pub fn new(slice: u16, velocity: u8) -> Self {
+        Trigger {
+            slice,
+            velocity,
+            rows: 0,
+        }
+    }
+}
+
+/// One row of a clip: the notes it starts, and its effects, which apply to
+/// all of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cell {
-    pub trigger: Option<Trigger>,
+    /// Filled from the front.
+    pub notes: [Option<Trigger>; MAX_NOTES],
     pub fx: [Option<Fx>; MAX_FX],
 }
 
 impl Cell {
     pub fn hit(slice: u16, velocity: u8) -> Self {
-        Cell {
-            trigger: Some(Trigger { slice, velocity }),
-            fx: [None; MAX_FX],
+        Cell::default().with_note(Trigger::new(slice, velocity))
+    }
+
+    /// The cell with another note added, if there's room.
+    pub fn with_note(mut self, note: Trigger) -> Self {
+        self.add(note);
+        self
+    }
+
+    /// The notes it starts, in order.
+    pub fn hits(&self) -> impl Iterator<Item = Trigger> + '_ {
+        self.notes.iter().flatten().copied()
+    }
+
+    pub fn has_hit(&self) -> bool {
+        self.notes[0].is_some()
+    }
+
+    /// The first note, which leads a chord.
+    pub fn first(&self) -> Option<Trigger> {
+        self.notes[0]
+    }
+
+    pub fn note(&self, slice: u16) -> Option<Trigger> {
+        self.hits().find(|n| n.slice == slice)
+    }
+
+    pub fn note_mut(&mut self, slice: u16) -> Option<&mut Trigger> {
+        self.notes.iter_mut().flatten().find(|n| n.slice == slice)
+    }
+
+    /// Add a note, or replace the one on the same slice. Fails if the cell
+    /// is full.
+    pub fn add(&mut self, note: Trigger) -> bool {
+        if let Some(n) = self.note_mut(note.slice) {
+            *n = note;
+            return true;
         }
+        match self.notes.iter_mut().find(|n| n.is_none()) {
+            Some(slot) => {
+                *slot = Some(note);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove the note on `slice`, keeping the rest in order.
+    pub fn remove(&mut self, slice: u16) -> bool {
+        let Some(i) = self
+            .notes
+            .iter()
+            .position(|n| n.is_some_and(|n| n.slice == slice))
+        else {
+            return false;
+        };
+        self.notes.copy_within(i + 1.., i);
+        self.notes[MAX_NOTES - 1] = None;
+        true
+    }
+
+    pub fn clear_notes(&mut self) {
+        self.notes = [None; MAX_NOTES];
     }
 
     pub fn with_fx(mut self, fx: Fx) -> Self {
@@ -200,6 +281,10 @@ pub struct Track {
     pub instrument: usize,
     pub mute: bool,
     pub solo: bool,
+    /// Off (mono): a row's notes play until the next row with notes (or a
+    /// cut) takes over, as when chopping a break or sliding a bassline. On:
+    /// each note plays out by itself, as with a drum kit or a pad.
+    pub poly: bool,
     /// The knob this track's `Knob` effects turn.
     pub automation: Option<Target>,
     /// Sorted by start, and never overlapping.
@@ -213,6 +298,7 @@ impl Track {
             instrument,
             mute: false,
             solo: false,
+            poly: false,
             automation: None,
             clips: Vec::new(),
         }
@@ -480,6 +566,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cells_hold_several_notes() {
+        let mut c = Cell::hit(60, 100);
+        assert!(c.add(Trigger::new(64, 90)));
+        assert!(c.add(Trigger::new(60, 70)), "same note: replaced");
+        assert_eq!(
+            c.hits().map(|n| (n.slice, n.velocity)).collect::<Vec<_>>(),
+            [(60, 70), (64, 90)]
+        );
+        assert!(c.add(Trigger::new(67, 1)) && c.add(Trigger::new(71, 1)));
+        assert!(!c.add(Trigger::new(72, 1)), "full");
+        assert!(c.remove(60));
+        assert_eq!(c.first().map(|n| n.slice), Some(64), "the rest move up");
+        assert!(!c.remove(60));
+        c.clear_notes();
+        assert!(!c.has_hit());
+    }
+
+    #[test]
     fn every_resolution_divides_a_beat() {
         for r in RESOLUTIONS {
             assert_eq!(TICKS_PER_BEAT % r as Tick, 0, "{r} rows per beat");
@@ -597,7 +701,7 @@ mod tests {
         assert!(song.set_resolution((0, 0), 8));
         let c = &song.tracks[0].clips[0];
         assert_eq!((c.rows_per_beat, c.cells.len(), c.len()), (8, 16, 384));
-        let hits: Vec<_> = (0..16).filter(|&r| c.cells[r].trigger.is_some()).collect();
+        let hits: Vec<_> = (0..16).filter(|&r| c.cells[r].has_hit()).collect();
         assert_eq!(hits, vec![0, 6, 12]);
         // Down to a beat grid: rows 0, 3 and 6 of 16ths are beats 0, 0.75
         // and 1.5, which round to 0, 1 and 2; the clip stays two beats long
@@ -606,8 +710,8 @@ mod tests {
         assert!(song.set_resolution((0, 0), 1));
         let c = &song.tracks[0].clips[0];
         assert_eq!(c.cells.len(), 2);
-        assert_eq!(c.cells[0].trigger.unwrap().slice, 1);
-        assert_eq!(c.cells[1].trigger.unwrap().slice, 2);
+        assert_eq!(c.cells[0].first().unwrap().slice, 1);
+        assert_eq!(c.cells[1].first().unwrap().slice, 2);
         assert!(!song.set_resolution((0, 0), 5), "not a resolution");
     }
 

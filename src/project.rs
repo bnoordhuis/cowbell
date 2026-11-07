@@ -18,12 +18,14 @@ use serde::{Deserialize, Serialize};
 use crate::engine::MAX_TRACKS;
 use crate::rack::Rack;
 use crate::sample::Sample;
-use crate::song::{Cell, Clip, Instrument, Song, Target, Tick, Track, nearest_resolution};
+use crate::song::{
+    Cell, Clip, Fx, Instrument, MAX_FX, Song, Target, Tick, Track, Trigger, nearest_resolution,
+};
 use crate::synthvoice::{SynthKind, SynthPatch};
 use crate::tuning::Tuning;
 
 pub const EXTENSION: &str = "cowbell";
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct ProjectFile {
@@ -65,6 +67,8 @@ struct TrackFile {
     mute: bool,
     #[serde(default)]
     solo: bool,
+    #[serde(default)]
+    poly: bool,
     /// The knob its `K` effects turn.
     #[serde(default)]
     automation: Option<Target>,
@@ -76,7 +80,62 @@ struct ClipFile {
     start: Tick,
     rows_per_beat: u32,
     rows: usize,
-    cells: BTreeMap<usize, Cell>,
+    cells: BTreeMap<usize, CellFile>,
+}
+
+/// A cell as written: its notes as a list, without the empty slots.
+#[derive(Serialize, Deserialize)]
+struct CellFile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<NoteFile>,
+    #[serde(default)]
+    fx: [Option<Fx>; MAX_FX],
+}
+
+/// A note as written: the length only when it has one.
+#[derive(Serialize, Deserialize)]
+struct NoteFile {
+    slice: u16,
+    velocity: u8,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    rows: u16,
+}
+
+fn is_zero(n: &u16) -> bool {
+    *n == 0
+}
+
+impl From<&Cell> for CellFile {
+    fn from(c: &Cell) -> Self {
+        let notes = c
+            .hits()
+            .map(|n| NoteFile {
+                slice: n.slice,
+                velocity: n.velocity,
+                rows: n.rows,
+            })
+            .collect();
+        CellFile { notes, fx: c.fx }
+    }
+}
+
+impl From<CellFile> for Cell {
+    fn from(c: CellFile) -> Self {
+        let mut cell = Cell {
+            fx: c.fx,
+            ..Cell::default()
+        };
+        // Any past what a cell holds are dropped.
+        for n in c.notes {
+            let note = Trigger {
+                slice: n.slice,
+                velocity: n.velocity.min(127),
+                rows: n.rows,
+            };
+            cell.add(note);
+        }
+        cell
+    }
 }
 
 /// The folder for a project's own samples: `song.cowbell` → `song.samples`.
@@ -157,6 +216,7 @@ pub fn save(song: &Song, path: &Path) -> Result<(), String> {
             instrument: t.instrument,
             mute: t.mute,
             solo: t.solo,
+            poly: t.poly,
             automation: t.automation,
             clips: t
                 .clips
@@ -170,7 +230,7 @@ pub fn save(song: &Song, path: &Path) -> Result<(), String> {
                         .iter()
                         .enumerate()
                         .filter(|(_, c)| **c != Cell::default())
-                        .map(|(row, c)| (row, *c))
+                        .map(|(row, c)| (row, CellFile::from(c)))
                         .collect(),
                 })
                 .collect(),
@@ -253,12 +313,13 @@ pub fn load(path: &Path) -> Result<Song, String> {
             let mut track = Track::new(&t.name, t.instrument.min(instruments.len() - 1));
             track.mute = t.mute;
             track.solo = t.solo;
+            track.poly = t.poly;
             track.automation = t.automation;
             for c in t.clips {
                 let mut clip = Clip::new(c.start, nearest_resolution(c.rows_per_beat), c.rows);
                 for (row, cell) in c.cells {
                     if let Some(slot) = clip.cells.get_mut(row) {
-                        *slot = cell;
+                        *slot = cell.into();
                     }
                 }
                 // An overlapping or empty clip can't play; drop it.
@@ -362,14 +423,43 @@ mod tests {
             .iter()
             .flat_map(|t| &t.clips)
             .flat_map(|c| &c.cells)
-            .filter(|c| **c != Cell::default());
-        assert_eq!(text.matches("trigger:").count(), used.count());
-        // One cell per line.
+            .filter(|c| **c != Cell::default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text.matches("fx:").count(),
+            used.len(),
+            "one entry per cell"
+        );
+        let notes: usize = used.iter().map(|c| c.hits().count()).sum();
+        assert_eq!(text.matches("slice:").count(), notes);
+        // One cell per line, without empty note lists or zero lengths.
         assert!(
             text.lines()
-                .any(|l| l.trim() == "29: (trigger: None, fx: (Some(Cut(4)), None)),"),
+                .any(|l| l.trim() == "29: (fx: (Some(Cut(4)), None)),"),
             "{text}"
         );
+        assert!(!text.contains("rows: 0"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn chords_lengths_and_poly_survive() {
+        let dir = temp_dir("poly");
+        let path = dir.join("song.cowbell");
+        let mut song = demo::song(demo::kit());
+        song.tracks[3].poly = true;
+        let mut chord = Cell::hit(60, 100).with_fx(Fx::Pitch(2));
+        chord.add(Trigger {
+            slice: 64,
+            velocity: 90,
+            rows: 6,
+        });
+        chord.add(Trigger::new(67, 80));
+        song.tracks[3].clips[0].cells[1] = chord;
+        save(&song, &path).unwrap();
+        let loaded = load(&path).unwrap();
+        assert!(loaded.tracks[3].poly && !loaded.tracks[2].poly);
+        assert_eq!(loaded.tracks[3].clips[0].cells[1], chord);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

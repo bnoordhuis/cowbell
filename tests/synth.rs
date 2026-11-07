@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use cowbell::engine::Engine;
-use cowbell::song::{Cell, Clip, Fx, Instrument, Song, Track};
+use cowbell::song::{Cell, Clip, Fx, Instrument, Song, Track, Trigger};
 use cowbell::synthvoice::{SynthKind, SynthPatch};
 use cowbell::tuning::Tuning;
 
@@ -192,4 +192,41 @@ fn held_audition_rings_until_released() {
     engine.process(&mut buf);
     let tail = &buf[buf.len() - 4800..];
     assert!(rms(tail) < 1e-3, "released audition still at {}", rms(tail));
+}
+
+#[test]
+fn notes_in_a_mono_row_play_like_a_chord() {
+    let mut song = sine_song(Tuning::default());
+    song.tracks[0].clips[0].cells[0] = Cell::hit(57, 127).with_fx(Fx::Chord(0x47));
+    let chord = render(song.clone(), RATE as usize / 2);
+    song.tracks[0].clips[0].cells[0] = Cell::hit(57, 127)
+        .with_note(Trigger::new(61, 127))
+        .with_note(Trigger::new(64, 127));
+    let notes = render(song, RATE as usize / 2);
+    assert_eq!(chord, notes);
+}
+
+#[test]
+fn poly_notes_each_play_for_their_length() {
+    // 120 bpm, 4 rows a beat: rows are 6000 frames. A quick release, so
+    // notes end close to when they're let go.
+    let mut song = sine_song(Tuning::default());
+    let Instrument::Synth(patch) = &mut song.instruments[0] else {
+        panic!()
+    };
+    Arc::make_mut(patch).params[7] = 5.0;
+    song.tracks[0].poly = true;
+    let note = |slice, rows| Trigger {
+        slice,
+        velocity: 127,
+        rows,
+    };
+    song.tracks[0].clips[0].cells[0] = Cell::default()
+        .with_note(note(69, 2))
+        .with_note(note(76, 8));
+    let out = render(song, 10 * 6000);
+    let rows = |a: usize, b: usize| &out[a * 6000..b * 6000];
+    let f = pitch(rows(3, 7));
+    assert!((f - 659.3).abs() < 4.0, "only the E is left: {f} Hz");
+    assert!(rows(9, 10).iter().all(|s| s.abs() < 1e-3), "both let go");
 }

@@ -92,10 +92,13 @@ enum Discard {
 const SENSITIVITY: f32 = 0.6;
 const MIN_SLICE_MS: f32 = 40.0;
 
-/// A new, empty project: the drum kit on one track.
+/// A new, empty project: the drum kit on one poly track, so its hits ring
+/// out over each other.
 fn new_song() -> Song {
     let kit = Instrument::Sampler(Arc::new(crate::demo::kit()));
-    Song::new(crate::demo::BPM, vec![kit], vec![Track::new("drums", 0)])
+    let mut drums = Track::new("drums", 0);
+    drums.poly = true;
+    Song::new(crate::demo::BPM, vec![kit], vec![drums])
 }
 
 /// Where the browser starts: the built-in samples when running from the
@@ -383,15 +386,19 @@ impl App {
         self.dialog = Some(files::Dialog::new(purpose, &dir, &name));
     }
 
-    /// Add a track playing a new instrument, as one undo step.
-    fn add_instrument(&mut self, instrument: Instrument, name: &str) {
+    /// Add a track playing a new instrument, as one undo step. `poly`: its
+    /// notes ring over each other.
+    fn add_instrument(&mut self, instrument: Instrument, name: &str, poly: bool) {
         self.finish_gesture();
         let t = self.doc.edit(|s| {
             s.instruments.push(instrument);
             let i = s.instruments.len() - 1;
             let t = s.add_track(name, i);
-            if t.is_none() {
-                s.instruments.pop();
+            match t {
+                Some(t) => s.tracks[t].poly = poly,
+                None => {
+                    s.instruments.pop();
+                }
             }
             t
         });
@@ -415,12 +422,15 @@ impl App {
     fn pick(&mut self, pick: browser::Pick) {
         match pick {
             browser::Pick::Kit => {
+                // Kit hits ring out over each other.
                 let kit = Instrument::Sampler(Arc::new(crate::demo::kit()));
-                self.add_instrument(kit, "drums");
+                self.add_instrument(kit, "drums", true);
             }
             browser::Pick::Synth(kind) => {
                 let patch = SynthPatch::new(kind, kind.name());
-                self.add_instrument(Instrument::Synth(Arc::new(patch)), kind.name());
+                // Acid lines slide from note to note, so one at a time.
+                let poly = kind != crate::synthvoice::SynthKind::Acid;
+                self.add_instrument(Instrument::Synth(Arc::new(patch)), kind.name(), poly);
             }
             browser::Pick::Sample(path) => match Sample::load_wav(&path) {
                 Ok(mut sample) => {
@@ -429,7 +439,9 @@ impl App {
                         .file_stem()
                         .map_or_else(|| "sample".to_owned(), |s| s.to_string_lossy().into_owned());
                     let slices = sample.slices.len();
-                    self.add_instrument(Instrument::Sampler(Arc::new(sample)), &name);
+                    // A one-shot rings out; a loop with slices gets chopped.
+                    let poly = slices == 1;
+                    self.add_instrument(Instrument::Sampler(Arc::new(sample)), &name, poly);
                     if self
                         .message
                         .as_deref()
@@ -1072,6 +1084,7 @@ mod tests {
         let song = new_song();
         assert_eq!(song.tracks.len(), 1);
         assert!(song.tracks[0].clips.is_empty());
+        assert!(song.tracks[0].poly, "kit hits ring out");
         assert!(matches!(song.instruments[0], Instrument::Sampler(_)));
         assert!(song.rack.track_device(0).is_some(), "it can be heard");
     }

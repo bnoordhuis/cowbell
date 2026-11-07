@@ -21,6 +21,9 @@ use crate::voice::Voice;
 pub const MAX_TRACKS: usize = 16;
 /// One voice per track, plus one for auditioning slices from the UI.
 const AUDITION: usize = MAX_TRACKS;
+/// Sample voices per track: a row's hits, or a poly track's ringing over
+/// each other. At least `MAX_NOTES`.
+const VOICES: usize = 6;
 
 pub enum Command {
     /// Play from where the playhead is.
@@ -75,7 +78,13 @@ pub struct Engine {
     /// Output frames until the next tick. Fractional, so ticks land on the
     /// right frame even when a tick isn't a whole number of frames long.
     tick_clock: f64,
-    voices: [Voice; MAX_TRACKS + 1],
+    /// Sample voices per track, plus the audition's. A mono track's first
+    /// voice plays its rows' first hits, so a break chopped one hit per row
+    /// sounds exactly as it always has.
+    voices: [[Voice; VOICES]; MAX_TRACKS + 1],
+    /// When each voice was last started, to steal the oldest.
+    started: [[u64; VOICES]; MAX_TRACKS + 1],
+    starts: u64,
     /// Per track, the sound a voice was making when it was stolen or
     /// retriggered, fading out under the new note. Only used with declick.
     tails: [Voice; MAX_TRACKS],
@@ -148,6 +157,8 @@ impl Engine {
             pos: 0,
             tick_clock: 0.0,
             voices: Default::default(),
+            started: [[0; VOICES]; MAX_TRACKS + 1],
+            starts: 0,
             tails: Default::default(),
             synths: Default::default(),
             graph,
@@ -220,11 +231,11 @@ impl Engine {
                     hold,
                 } => match self.song.instruments.get(instrument) {
                     Some(Instrument::Sampler(sample)) => {
-                        let trigger = Trigger { slice, velocity };
+                        let trigger = Trigger::new(slice, velocity);
                         // Effects are timed by rows; auditions have none, so
                         // any row length will do.
                         let fpr = frames_per_row(self.out_rate, self.song.bpm, 4);
-                        self.voices[AUDITION].trigger(
+                        self.voices[AUDITION][0].trigger(
                             instrument,
                             sample,
                             trigger,
@@ -254,7 +265,11 @@ impl Engine {
                     for synth in &mut self.synths {
                         synth.retain(|i| instruments.get(i).is_some_and(|i| i.is_synth()));
                     }
-                    let voices = self.voices.iter_mut().chain(self.tails.iter_mut());
+                    let voices = self
+                        .voices
+                        .iter_mut()
+                        .flatten()
+                        .chain(self.tails.iter_mut());
                     for voice in voices.filter(|v| v.is_active()) {
                         let same = match (
                             old.instruments.get(voice.instrument()),
@@ -291,7 +306,7 @@ impl Engine {
     /// Silence everything and undo automation: rack knobs go back to where
     /// the rack has them, synth knobs to their patches (in `SynthTrack::stop`).
     fn stop_voices(&mut self) {
-        self.voices.iter_mut().for_each(Voice::stop);
+        self.voices.iter_mut().flatten().for_each(Voice::stop);
         self.tails.iter_mut().for_each(Voice::stop);
         self.synths.iter_mut().for_each(SynthTrack::stop);
         for d in &self.song.rack.devices {
@@ -322,14 +337,15 @@ impl Engine {
                 continue;
             };
             let fpr = frames_per_row(self.out_rate, self.song.bpm, clip.rows_per_beat);
-            let (cell, instrument) = (clip.cells[row], track.instrument);
-            self.fire_cell(t, instrument, cell, fpr);
+            let (cell, instrument, poly) = (clip.cells[row], track.instrument, track.poly);
+            self.fire_cell(t, instrument, cell, fpr, poly);
         }
     }
 
-    /// Fire one cell on track `t`, `fpr` frames per row.
-    fn fire_cell(&mut self, t: usize, instrument: usize, cell: Cell, fpr: f64) {
-        let voice = &mut self.voices[t];
+    /// Fire one cell on track `t`, `fpr` frames per row. On a mono track its
+    /// notes take over from what was sounding; on a poly one they join it.
+    fn fire_cell(&mut self, t: usize, instrument: usize, cell: Cell, fpr: f64, poly: bool) {
+        let pool = &mut self.voices[t];
         let tail = &mut self.tails[t];
         let synth = &mut self.synths[t];
         let cut = cell.fx().find_map(|f| match f {
@@ -363,56 +379,118 @@ impl Engine {
         let sample = match self.song.instruments.get(instrument) {
             Some(Instrument::Sampler(sample)) => sample,
             Some(Instrument::Synth(_)) => {
-                if let Some(trigger) = cell.trigger {
+                if cell.has_hit() {
                     // The track switched from a sample: that stops.
-                    voice.stop();
+                    pool.iter_mut().for_each(Voice::stop);
                     let glide = cell.fx().find_map(|f| match f {
                         Fx::Glide(n) => Some(n as f32 * 4.0),
                         _ => None,
                     });
-                    // The root, plus any chord notes, each through the tuning.
-                    let root = trigger.slice.min(127) as u8;
                     let chord = cell.fx().find_map(|f| match f {
                         Fx::Chord(n) => Some(n),
                         _ => None,
                     });
-                    let mut freqs = [0.0; MAX_CHORD];
-                    let mut n = 0;
-                    let notes =
-                        std::iter::once(0).chain(chord.into_iter().flat_map(Fx::chord_intervals));
-                    for interval in notes.take(MAX_CHORD) {
-                        freqs[n] = self
-                            .song
-                            .tuning
-                            .freq(root.saturating_add(interval).min(127));
-                        n += 1;
+                    let tuning = &self.song.tuning;
+                    // A note, plus any chord notes, each through the tuning.
+                    let with_chord = |root: u16, freqs: &mut [f64; MAX_CHORD], n: &mut usize| {
+                        let root = root.min(127) as u8;
+                        let notes = std::iter::once(0)
+                            .chain(chord.into_iter().flat_map(Fx::chord_intervals));
+                        for interval in notes {
+                            if *n == MAX_CHORD {
+                                break;
+                            }
+                            freqs[*n] = tuning.freq(root.saturating_add(interval).min(127));
+                            *n += 1;
+                        }
+                    };
+                    let hold = |rows: u16| (rows > 0).then_some(rows as f64 * fpr);
+                    if poly {
+                        for hit in cell.hits() {
+                            let (mut freqs, mut n) = ([0.0; MAX_CHORD], 0);
+                            with_chord(hit.slice, &mut freqs, &mut n);
+                            synth.play(
+                                instrument,
+                                &freqs[..n],
+                                hit.velocity,
+                                hold(hit.rows),
+                                self.out_rate,
+                            );
+                        }
+                    } else {
+                        // The row's notes sound together, led by the first.
+                        let (mut freqs, mut n) = ([0.0; MAX_CHORD], 0);
+                        for hit in cell.hits() {
+                            with_chord(hit.slice, &mut freqs, &mut n);
+                        }
+                        let first = cell.first().unwrap();
+                        synth.note_on(
+                            instrument,
+                            &freqs[..n],
+                            first.velocity,
+                            glide.unwrap_or(0.0),
+                            self.out_rate,
+                        );
+                        if let Some(frames) = hold(first.rows) {
+                            synth.note_off_in(frames);
+                        }
                     }
-                    synth.note_on(
-                        instrument,
-                        &freqs[..n],
-                        trigger.velocity,
-                        glide.unwrap_or(0.0),
-                        self.out_rate,
-                    );
                 }
                 if let Some(frames) = cut {
-                    synth.note_off_in(frames);
+                    if poly {
+                        synth.release_all(frames);
+                    } else {
+                        synth.note_off_in(frames);
+                    }
                 }
                 return;
             }
             None => return,
         };
-        if cell.trigger.is_some() && synth.is_active() {
+        if cell.has_hit() && synth.is_active() {
             // The track switched from a synth: let it ring out.
-            synth.note_off_in(0.0);
+            synth.release_all(0.0);
         }
-        if let Some(trigger) = cell.trigger {
-            if self.graph.track_declick(t) {
-                voice.steal_into(tail);
+        let declick = self.graph.track_declick(t);
+        let started = &mut self.started[t];
+        let trigger = |v: &mut Voice, hit: Trigger| {
+            v.trigger(instrument, sample, hit, cell.fx(), self.out_rate, fpr);
+            if hit.rows > 0 {
+                v.schedule_cut(hit.rows as f64 * fpr);
             }
-            voice.trigger(instrument, sample, trigger, cell.fx(), self.out_rate, fpr);
-        } else if let Some(frames) = cut {
-            voice.schedule_cut(frames);
+        };
+        if !cell.has_hit() {
+            if let Some(frames) = cut {
+                pool[0].schedule_cut(frames);
+                for v in pool[1..].iter_mut().filter(|v| v.is_active()) {
+                    v.schedule_cut(frames);
+                }
+            }
+        } else if poly {
+            // Each hit on a voice of its own, the oldest if none is free.
+            for hit in cell.hits() {
+                let i = (0..VOICES)
+                    .find(|&i| !pool[i].is_active())
+                    .unwrap_or_else(|| (0..VOICES).min_by_key(|&i| started[i]).unwrap());
+                if pool[i].is_active() && declick {
+                    pool[i].steal_into(tail);
+                }
+                trigger(&mut pool[i], hit);
+                self.starts += 1;
+                started[i] = self.starts;
+            }
+        } else {
+            // The row's hits take over: the first on the first voice, as a
+            // single hit always has, the others alongside it.
+            for v in pool[1..].iter_mut().filter(|v| v.is_active()) {
+                v.schedule_cut(0.0);
+            }
+            for (k, hit) in cell.hits().enumerate() {
+                if k == 0 && declick {
+                    pool[0].steal_into(tail);
+                }
+                trigger(&mut pool[k], hit);
+            }
         }
     }
 
@@ -476,7 +554,8 @@ impl Engine {
                 }
                 self.tick_clock -= 1.0;
             }
-            for (t, voice) in self.voices.iter_mut().enumerate() {
+            for (t, pool) in self.voices.iter_mut().enumerate() {
+                let [voice, rest @ ..] = pool;
                 let tail = self.tails.get_mut(t);
                 let declick = tail.is_some() && self.graph.track_declick(t);
                 let instruments = &self.song.instruments;
@@ -503,6 +582,14 @@ impl Engine {
                 } else {
                     frame = [frame[0] + v[0], frame[1] + v[1]];
                 }
+                // The other voices only add anything while they sound, so a
+                // track playing one hit at a time is bit for bit as before.
+                let mut hit = false;
+                for v in rest.iter_mut().filter(|v| v.is_active()) {
+                    let s = render(v);
+                    frame = [frame[0] + s[0], frame[1] + s[1]];
+                    hit |= v.take_hit();
+                }
                 let synth = &mut self.synths[t];
                 if synth.is_active() {
                     let patch = |i: usize| match instruments.get(i) {
@@ -512,7 +599,7 @@ impl Engine {
                     let s = synth.next_frame(patch, self.out_rate);
                     frame = [frame[0] + s[0], frame[1] + s[1]];
                 }
-                let hit = voice.take_hit() | synth.take_hit();
+                let hit = hit | voice.take_hit() | synth.take_hit();
                 if t == AUDITION {
                     self.audition[i] = frame;
                 } else if audible[t] {

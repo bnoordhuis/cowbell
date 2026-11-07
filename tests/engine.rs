@@ -3,7 +3,7 @@ use std::sync::Arc;
 use cowbell::engine::{Command, Engine};
 use cowbell::rack::Rack;
 use cowbell::sample::Sample;
-use cowbell::song::{Cell, Clip, Fx, Instrument, Song, Track};
+use cowbell::song::{Cell, Clip, Fx, Instrument, Song, Track, Trigger};
 use cowbell::transform::Roll;
 use cowbell::{demo, synth};
 
@@ -126,7 +126,7 @@ fn roll_sweeps_hits_and_pitch() {
         cells[7].fx().collect::<Vec<_>>(),
         vec![Fx::Retrig(8), Fx::Pitch(12)]
     );
-    assert_eq!(cells[7].trigger.unwrap().velocity, 120);
+    assert_eq!(cells[7].first().unwrap().velocity, 120);
 }
 
 #[test]
@@ -538,4 +538,80 @@ fn stop_keeps_the_playhead_and_locate_moves_it() {
     assert!(c.send(Command::Locate(1 << 40)).is_ok());
     engine.process(&mut buf[..2]);
     assert_eq!(c.position(), 0, "past the end goes back to the start");
+}
+
+/// A steady 0.5 split into two slices, so two hits overlapping add up to
+/// exactly 1.0 (with declick off).
+fn two_slice_song(poly: bool) -> Song {
+    let sample = Sample::new("dc", RATE, vec![[0.5, 0.5]; 48_000]).with_slices(vec![0, 24_000]);
+    let mut song = one_track_song(sample, 120.0, 4, 8);
+    song.tracks[0].poly = poly;
+    set_declick(&mut song, false);
+    song
+}
+
+#[test]
+fn hits_in_one_row_play_together() {
+    for poly in [false, true] {
+        let mut song = two_slice_song(poly);
+        song.tracks[0].clips[0].cells[0] = Cell::hit(0, 127).with_note(Trigger::new(1, 127));
+        let out = left(&render(song, 1000));
+        assert_eq!(out[10], 1.0, "poly {poly}");
+    }
+}
+
+#[test]
+fn mono_rows_take_over_and_poly_rows_ring_on() {
+    // 120 bpm, 4 rows a beat: rows are 6000 frames.
+    // Mono: only the second row's hit is left. Poly: it joins both of the
+    // first row's.
+    for (poly, expected) in [(false, 0.5), (true, 1.5)] {
+        let mut song = two_slice_song(poly);
+        let cells = &mut song.tracks[0].clips[0].cells;
+        cells[0] = Cell::hit(0, 127).with_note(Trigger::new(1, 127));
+        cells[1] = Cell::hit(1, 127);
+        let out = left(&render(song, 8000));
+        assert_eq!(out[7000], expected, "poly {poly}");
+    }
+}
+
+#[test]
+fn a_note_with_a_length_stops_on_time() {
+    for poly in [false, true] {
+        let mut song = two_slice_song(poly);
+        let long = Trigger {
+            slice: 0,
+            velocity: 127,
+            rows: 1,
+        };
+        song.tracks[0].clips[0].cells[0] = Cell::default().with_note(long);
+        let out = left(&render(song, 8000));
+        assert_eq!(out[5999], 0.5, "poly {poly}");
+        assert_eq!(out[6000], 0.0, "poly {poly}: cut after its row");
+    }
+}
+
+#[test]
+fn a_poly_track_steals_its_oldest_voice() {
+    // One slice eight rows long, hit on every row: more hits ringing than
+    // there are voices.
+    let mut song = one_track_song(
+        Sample::new("dc", RATE, vec![[0.5, 0.5]; 48_000]),
+        120.0,
+        4,
+        8,
+    );
+    song.tracks[0].poly = true;
+    set_declick(&mut song, false);
+    for row in 0..8 {
+        song.tracks[0].clips[0].cells[row] = Cell::hit(0, 127);
+    }
+    let out = left(&render(song, 8 * 6000));
+    let most = out.iter().fold(0.0f32, |m, &s| m.max(s));
+    assert_eq!(most, 3.0, "six voices at most, 0.5 each");
+    assert_eq!(
+        out[7 * 6000 + 10],
+        3.0,
+        "the last hit took the oldest voice"
+    );
 }

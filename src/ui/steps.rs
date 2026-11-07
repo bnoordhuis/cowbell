@@ -111,12 +111,14 @@ enum Kind {
     Paint(Vec<(u16, usize)>),
     /// Remove the hits in these (lane, row) cells.
     Erase(Vec<(u16, usize)>),
-    /// A synth note from `start` through `end`.
+    /// A synth note from `start` through `end`. On a poly track that's its
+    /// length; on a mono one, the length of its row's notes together.
     Note {
         note: u16,
         start: usize,
         end: usize,
         velocity: u8,
+        poly: bool,
     },
 }
 
@@ -133,41 +135,81 @@ fn without_cut(mut c: Cell) -> Cell {
     c
 }
 
-/// For each row of a synth track: the note sounding there and the row it
-/// started on. A note lasts until the next note, or a cut.
-fn sounding(cells: &[Cell]) -> Vec<Option<(u16, usize)>> {
-    let mut active = None;
-    cells
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            match c.trigger {
-                Some(t) => active = Some((t.slice, i)),
-                None if has_cut(c) => active = None,
-                None => {}
-            }
-            let here = active;
-            if c.trigger.is_some() && has_cut(c) {
-                active = None;
-            }
-            here
-        })
-        .collect()
+/// A synth note sounding over rows `start..=end`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Span {
+    note: u16,
+    start: usize,
+    end: usize,
+}
+
+/// Where a synth track's notes sound, as the engine plays them. On a mono
+/// track a row's notes last until the next row with notes, or a cut (or
+/// the first note's length, if it has one); on a poly track each note
+/// lasts its own length, or until a cut. A cut in a note's own row ends it
+/// there.
+fn spans(cells: &[Cell], poly: bool) -> Vec<Span> {
+    let n = cells.len();
+    let stops = |r: usize| {
+        let c = &cells[r];
+        (!poly && c.has_hit()) || (!c.has_hit() && has_cut(c))
+    };
+    let mut out = Vec::new();
+    for (row, c) in cells.iter().enumerate() {
+        let Some(first) = c.first() else {
+            continue;
+        };
+        let open = if has_cut(c) {
+            row
+        } else {
+            (row + 1..n).find(|&r| stops(r)).map_or(n - 1, |r| r - 1)
+        };
+        for t in c.hits() {
+            let rows = if poly { t.rows } else { first.rows };
+            let end = if rows > 0 {
+                (row + rows as usize - 1).min(open)
+            } else {
+                open
+            };
+            out.push(Span {
+                note: t.slice,
+                start: row,
+                end,
+            });
+        }
+    }
+    out
+}
+
+/// The row of the hit at (lane `v`, `row`): the cell itself on sample
+/// tracks, the start of the note covering it on synth tracks.
+fn hit_row(cells: &[Cell], synth: bool, poly: bool, v: u16, row: usize) -> Option<usize> {
+    if synth {
+        spans(cells, poly)
+            .into_iter()
+            .filter(|s| s.note == v && (s.start..=s.end).contains(&row))
+            .map(|s| s.start)
+            .max()
+    } else {
+        cells[row].note(v).map(|_| row)
+    }
 }
 
 fn apply(base: &[Cell], kind: &Kind, velocity: u8) -> Vec<Cell> {
     let mut cells = base.to_vec();
     match kind {
-        Kind::Paint(cellsat) => {
-            for &(v, r) in cellsat {
-                let c = &mut cells[r];
-                let velocity = c.trigger.map_or(velocity, |t| t.velocity);
-                c.trigger = Some(Trigger { slice: v, velocity });
+        Kind::Paint(cells_at) => {
+            for &(v, r) in cells_at {
+                // Join what's in the row, if there's room.
+                if cells[r].note(v).is_none() {
+                    cells[r].add(Trigger::new(v, velocity));
+                }
             }
         }
-        Kind::Erase(cellsat) => {
-            for &(v, r) in cellsat {
-                if cells[r].trigger.is_some_and(|t| t.slice == v) {
+        Kind::Erase(cells_at) => {
+            for &(v, r) in cells_at {
+                if cells[r].remove(v) && !cells[r].has_hit() {
+                    // Its effects were for it.
                     cells[r] = Cell::default();
                 }
             }
@@ -177,22 +219,36 @@ fn apply(base: &[Cell], kind: &Kind, velocity: u8) -> Vec<Cell> {
             start,
             end,
             velocity,
+            poly: true,
         } => {
-            cells[start] = Cell {
-                trigger: Some(Trigger {
-                    slice: note,
-                    velocity,
-                }),
-                ..without_cut(cells[start])
-            };
+            let rows = (end - start + 1) as u16;
+            cells[start].add(Trigger {
+                slice: note,
+                velocity,
+                rows,
+            });
+        }
+        &Kind::Note {
+            note,
+            start,
+            end,
+            velocity,
+            poly: false,
+        } => {
+            // The row's notes last until the next row with notes or a cut:
+            // clear the way to `end`, and cut after it.
+            let mut c = without_cut(cells[start]);
+            c.add(Trigger::new(note, velocity));
+            for n in c.notes.iter_mut().flatten() {
+                n.rows = 0;
+            }
+            cells[start] = c;
             for c in &mut cells[start + 1..=end] {
-                *c = Cell {
-                    trigger: None,
-                    ..without_cut(*c)
-                };
+                c.clear_notes();
+                *c = without_cut(*c);
             }
             if let Some(next) = cells.get_mut(end + 1)
-                && next.trigger.is_none()
+                && !next.has_hit()
                 && !has_cut(next)
             {
                 *next = next.with_fx(Fx::Cut(0));
@@ -353,7 +409,7 @@ impl StepView {
         let (Some(track), Some(clip)) = (song.tracks.get(at.0), song.clip(at)) else {
             return out;
         };
-        let instrument = track.instrument;
+        let (instrument, poly) = (track.instrument, track.poly);
         let (synth, sample) = match song.instruments.get(instrument) {
             Some(Instrument::Synth(_)) => (true, None),
             Some(Instrument::Sampler(s)) => (false, Some(s.clone())),
@@ -363,7 +419,16 @@ impl StepView {
         let rpb = clip.rows_per_beat.max(1) as usize;
         let g = self.layout(at, &cells, area, synth, sample.as_deref());
 
-        self.interact(ui, &response, at, &cells, &g, synth, instrument, &mut out);
+        self.interact(
+            ui,
+            &response,
+            at,
+            &cells,
+            &g,
+            (synth, poly),
+            instrument,
+            &mut out,
+        );
         // Show the gesture's latest step straight away.
         let cells = match &out.live {
             Some(Edit::SetCells(_, c)) => c.clone(),
@@ -480,18 +545,14 @@ impl StepView {
             ));
         };
         if synth {
-            let sound = sounding(&cells);
-            for row in 0..cells.len() {
-                let Some(t) = cells[row].trigger else {
-                    continue;
-                };
-                let end = (row..cells.len())
-                    .take_while(|&i| sound[i] == Some((t.slice, row)))
-                    .last()
-                    .unwrap_or(row);
+            for span in spans(&cells, poly) {
+                let (row, end) = (span.start, span.end);
                 if end < g.first_col || row >= g.first_col + cols {
                     continue;
                 }
+                let Some(t) = cells[row].note(span.note) else {
+                    continue;
+                };
                 let (a, b) = (row.max(g.first_col), end.min(g.first_col + cols - 1));
                 let chord = cells[row].fx().find_map(|f| match f {
                     Fx::Chord(n) => Some(n),
@@ -529,19 +590,18 @@ impl StepView {
             }
         } else {
             for (row, cell) in cells.iter().enumerate().skip(g.first_col).take(cols) {
-                let Some(t) = cell.trigger else {
-                    continue;
-                };
-                let Some(lane) = g.lane_of(t.slice) else {
-                    continue;
-                };
-                let Some(r) = g.cell_rect(lane, row) else {
-                    above(&p, row, lane < g.first_lane);
-                    continue;
-                };
-                let fill = hit_color(color, t.velocity);
-                let pk = peaks.as_ref().and_then(|pk| pk.get(t.slice as usize));
-                draw_hit(&p, r, cell, fill, pk, self.cursor == Some(row));
+                for t in cell.hits() {
+                    let Some(lane) = g.lane_of(t.slice) else {
+                        continue;
+                    };
+                    let Some(r) = g.cell_rect(lane, row) else {
+                        above(&p, row, lane < g.first_lane);
+                        continue;
+                    };
+                    let fill = hit_color(color, t.velocity);
+                    let pk = peaks.as_ref().and_then(|pk| pk.get(t.slice as usize));
+                    draw_hit(&p, r, cell, fill, pk, self.cursor == Some(row));
+                }
             }
         }
 
@@ -595,7 +655,7 @@ impl StepView {
             if synth {
                 let mut notes: Vec<u16> = cells
                     .iter()
-                    .filter_map(|c| c.trigger.map(|t| t.slice))
+                    .flat_map(|c| c.hits().map(|t| t.slice))
                     .collect();
                 notes.sort_unstable();
                 let centre = notes.get(notes.len() / 2).copied().unwrap_or(HOME_NOTE);
@@ -638,7 +698,7 @@ impl StepView {
         at: ClipRef,
         cells: &[Cell],
         g: &Geometry,
-        synth: bool,
+        (synth, poly): (bool, bool),
         instrument: usize,
         out: &mut Output,
     ) {
@@ -676,16 +736,17 @@ impl StepView {
             } else if in_grid(p) {
                 let (lane, row) = g.cell_at(p);
                 let v = g.lanes[lane];
-                let kind = if cells[row].trigger.is_some_and(|t| t.slice == v) {
+                let kind = if cells[row].note(v).is_some() {
                     Kind::Erase(vec![(v, row)])
                 } else if synth {
-                    match sounding(cells)[row] {
+                    match hit_row(cells, true, poly, v, row) {
                         // Inside a note: move its end.
-                        Some((n, start)) if n == v && start < row => Kind::Note {
+                        Some(start) if start < row => Kind::Note {
                             note: v,
                             start,
                             end: row - 1,
-                            velocity: cells[start].trigger.map_or(self.velocity, |t| t.velocity),
+                            velocity: cells[start].note(v).map_or(self.velocity, |t| t.velocity),
+                            poly,
                         },
                         _ => {
                             out.audition = Some((instrument, v));
@@ -694,6 +755,7 @@ impl StepView {
                                 start: row,
                                 end: row,
                                 velocity: self.velocity,
+                                poly,
                             }
                         }
                     }
@@ -752,7 +814,7 @@ impl StepView {
             && let Some(p) = hover.filter(|&p| in_grid(p))
         {
             let (lane, row) = g.cell_at(p);
-            if let Some(start) = hit_row(cells, synth, g.lanes[lane], row) {
+            if let Some(start) = hit_row(cells, synth, poly, g.lanes[lane], row) {
                 end_wheel(self, out);
                 let mut rolled = cells.to_vec();
                 rolled[start] = next_roll(rolled[start]);
@@ -769,11 +831,12 @@ impl StepView {
             let hit = in_grid(p)
                 .then(|| {
                     let (lane, row) = g.cell_at(p);
-                    hit_row(cells, synth, g.lanes[lane], row)
+                    let v = g.lanes[lane];
+                    hit_row(cells, synth, poly, v, row).map(|r| (r, v))
                 })
                 .flatten();
-            if let Some(row) = hit {
-                let vel = cells[row].trigger.unwrap().velocity;
+            if let Some((row, note)) = hit {
+                let vel = cells[row].note(note).unwrap().velocity;
                 let (delta, now) = ui.input(|i| (knob::wheel_delta(i), i.time));
                 if let Some((v, first)) =
                     self.wheel
@@ -785,7 +848,7 @@ impl StepView {
                             end_wheel(self, out);
                         }
                         let mut turned = cells.to_vec();
-                        if let Some(t) = &mut turned[row].trigger {
+                        if let Some(t) = turned[row].note_mut(note) {
                             t.velocity = velocity;
                         }
                         self.cursor = Some(row);
@@ -813,22 +876,6 @@ impl StepView {
     /// The window made the open wheel gesture an undo step.
     pub fn end_wheel(&mut self) {
         self.wheeling = false;
-    }
-}
-
-/// The row of the hit at (lane `v`, `row`): the cell itself on sample
-/// tracks, the start of the note covering it on synth tracks.
-fn hit_row(cells: &[Cell], synth: bool, v: u16, row: usize) -> Option<usize> {
-    if synth {
-        match sounding(cells)[row] {
-            Some((n, start)) if n == v => Some(start),
-            _ => None,
-        }
-    } else {
-        cells[row]
-            .trigger
-            .is_some_and(|t| t.slice == v)
-            .then_some(row)
     }
 }
 
@@ -921,63 +968,108 @@ mod tests {
         vec![Cell::default(); n]
     }
 
+    fn slices(c: &Cell) -> Vec<u16> {
+        c.hits().map(|t| t.slice).collect()
+    }
+
     #[test]
-    fn painting_replaces_the_row_and_erasing_only_its_lane() {
+    fn painting_adds_to_the_row_and_erasing_takes_one_out() {
         let base = cells(8);
         let out = apply(&base, &Kind::Paint(vec![(2, 0), (2, 1), (3, 1)]), 100);
-        assert_eq!(out[0].trigger.unwrap().slice, 2);
-        assert_eq!(out[1].trigger.unwrap().slice, 3, "one hit per row");
-        assert_eq!(out[0].trigger.unwrap().velocity, 100);
+        assert_eq!(slices(&out[0]), [2]);
+        assert_eq!(slices(&out[1]), [2, 3], "both in the row");
+        assert_eq!(out[0].first().unwrap().velocity, 100);
         let out2 = apply(&out, &Kind::Erase(vec![(2, 0), (2, 1)]), 100);
-        assert_eq!(out2[0].trigger, None);
+        assert_eq!(out2[0], Cell::default());
+        assert_eq!(slices(&out2[1]), [3], "lane 3 stays");
+        // A full row takes no more.
+        let full = apply(&base, &Kind::Paint((0..6).map(|v| (v, 0)).collect()), 100);
+        assert_eq!(full[0].hits().count(), crate::song::MAX_NOTES);
+    }
+
+    fn span(note: u16, start: usize, end: usize) -> Span {
+        Span { note, start, end }
+    }
+
+    #[test]
+    fn mono_notes_last_until_the_next_notes_or_a_cut() {
+        let mut c = cells(8);
+        c[1] = Cell::hit(60, 100).with_note(Trigger::new(64, 100));
+        c[4] = Cell::default().with_fx(Fx::Cut(0));
+        c[6] = Cell::hit(62, 100);
         assert_eq!(
-            out2[1].trigger.unwrap().slice,
-            3,
-            "lane 2 had nothing in row 1"
+            spans(&c, false),
+            [span(60, 1, 3), span(64, 1, 3), span(62, 6, 7)]
         );
     }
 
     #[test]
-    fn notes_last_until_the_next_note_or_a_cut() {
+    fn poly_notes_last_their_own_lengths() {
         let mut c = cells(8);
-        c[1] = Cell::hit(60, 100);
-        c[4] = Cell::default().with_fx(Fx::Cut(0));
-        c[6] = Cell::hit(62, 100);
-        let s = sounding(&c);
-        assert_eq!(s[0], None);
-        assert_eq!(&s[1..4], &[Some((60, 1)); 3]);
-        assert_eq!(s[4], None);
-        assert_eq!(s[7], Some((62, 6)));
+        let note = |slice, rows| Trigger {
+            slice,
+            velocity: 100,
+            rows,
+        };
+        c[0] = Cell::default()
+            .with_note(note(60, 6))
+            .with_note(note(64, 2));
+        c[2] = Cell::hit(67, 100);
+        c[5] = Cell::default().with_fx(Fx::Cut(0));
+        assert_eq!(
+            spans(&c, true),
+            [span(60, 0, 4), span(64, 0, 1), span(67, 2, 4)],
+            "the cut ends the C and the G; the E ends first"
+        );
+        assert_eq!(hit_row(&c, true, true, 60, 3), Some(0));
+        assert_eq!(hit_row(&c, true, true, 64, 3), None);
     }
 
     #[test]
-    fn a_note_gesture_sets_its_length() {
+    fn a_mono_note_gesture_sets_the_rows_length() {
         let base = cells(8);
         let kind = |end| Kind::Note {
             note: 60,
             start: 1,
             end,
             velocity: 90,
+            poly: false,
         };
         let short = apply(&base, &kind(1), 0);
-        assert_eq!(sounding(&short)[1..3], [Some((60, 1)), None]);
+        assert_eq!(spans(&short, false), [span(60, 1, 1)]);
         assert!(has_cut(&short[2]));
         let long = apply(&short, &kind(4), 0);
-        let s = sounding(&long);
-        assert_eq!(
-            s[1..6],
-            [
-                Some((60, 1)),
-                Some((60, 1)),
-                Some((60, 1)),
-                Some((60, 1)),
-                None
-            ]
-        );
+        assert_eq!(spans(&long, false), [span(60, 1, 4)]);
         assert!(!has_cut(&long[2]), "the old end is gone");
-        // To the end of the pattern: nothing to cut.
+        // To the end of the clip: nothing to cut.
         let full = apply(&base, &kind(7), 0);
         assert!(full.iter().all(|c| !has_cut(c)));
+        // A second note in the row joins the first, and they end together.
+        let e = Kind::Note {
+            note: 64,
+            start: 1,
+            end: 2,
+            velocity: 90,
+            poly: false,
+        };
+        let both = apply(&long, &e, 0);
+        assert_eq!(spans(&both, false), [span(60, 1, 2), span(64, 1, 2)]);
+    }
+
+    #[test]
+    fn a_poly_note_gesture_sets_only_its_own_length() {
+        let base = cells(8);
+        let kind = |note, end| Kind::Note {
+            note,
+            start: 1,
+            end,
+            velocity: 90,
+            poly: true,
+        };
+        let one = apply(&base, &kind(60, 5), 0);
+        let two = apply(&one, &kind(64, 2), 0);
+        assert_eq!(spans(&two, true), [span(60, 1, 5), span(64, 1, 2)]);
+        assert!(two.iter().all(|c| !has_cut(c)), "no cuts needed");
     }
 
     mod mouse {
@@ -1108,7 +1200,7 @@ mod tests {
             fn triggers(&self) -> Vec<Option<u16>> {
                 self.cells()
                     .iter()
-                    .map(|c| c.trigger.map(|t| t.slice))
+                    .map(|c| c.first().map(|t| t.slice))
                     .collect()
             }
         }
@@ -1139,7 +1231,7 @@ mod tests {
             let a = h.at(3, 2);
             h.drag(&[a]);
             let undo = h.undo.len();
-            let before = h.cells()[2].trigger.unwrap().velocity;
+            let before = h.cells()[2].first().unwrap().velocity;
             let wheel = || Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Line,
                 delta: vec2(0.0, -2.0),
@@ -1149,12 +1241,12 @@ mod tests {
             };
             h.frame(vec![wheel()]);
             h.frame(vec![wheel()]);
-            let after = h.cells()[2].trigger.unwrap().velocity;
+            let after = h.cells()[2].first().unwrap().velocity;
             assert!(after < before, "{before} -> {after}");
             assert!(h.view.wheeling());
             h.undo();
             assert_eq!(h.undo.len(), undo, "both turns in one step");
-            assert_eq!(h.cells()[2].trigger.unwrap().velocity, before);
+            assert_eq!(h.cells()[2].first().unwrap().velocity, before);
         }
 
         #[test]
@@ -1162,21 +1254,48 @@ mod tests {
             let mut h = Harness::new(true);
             let path = [h.at(60, 2), h.at(60, 3), h.at(62, 5)];
             h.drag(&path);
-            let s = sounding(h.cells());
-            assert_eq!(
-                &s[2..7],
-                &[Some((60, 2)); 4]
-                    .iter()
-                    .copied()
-                    .chain([None])
-                    .collect::<Vec<_>>()[..]
-            );
+            assert_eq!(spans(h.cells(), false), [span(60, 2, 5)]);
             // Drag inside it to move its end back.
             let path = [h.at(60, 4), h.at(60, 3)];
             h.drag(&path);
-            let s = sounding(h.cells());
-            assert_eq!(s[3], Some((60, 2)));
-            assert_eq!(s[4], None);
+            assert_eq!(spans(h.cells(), false), [span(60, 2, 3)]);
+        }
+
+        #[test]
+        fn a_second_note_on_a_step_joins_the_first() {
+            // C3, then E3, on the same step of an acid line.
+            let mut h = Harness::new(true);
+            let c = h.at(48, 0);
+            h.drag(&[c]);
+            let e = h.at(52, 0);
+            h.drag(&[e]);
+            assert_eq!(slices(&h.cells()[0]), [48, 52]);
+            assert_eq!(spans(h.cells(), false), [span(48, 0, 0), span(52, 0, 0)]);
+            // Clicking one takes just that one out.
+            let c = h.at(48, 0);
+            h.drag(&[c]);
+            assert_eq!(slices(&h.cells()[0]), [52]);
+        }
+
+        #[test]
+        fn hits_share_a_step_on_a_sample_track() {
+            let mut h = Harness::new(false);
+            let (kick, hat) = (h.at(0, 4), h.at(2, 4));
+            h.drag(&[kick]);
+            h.drag(&[hat]);
+            assert_eq!(slices(&h.cells()[4]), [0, 2]);
+        }
+
+        #[test]
+        fn poly_notes_get_their_own_lengths() {
+            let mut h = Harness::new(true);
+            h.song.tracks[0].poly = true;
+            let path = [h.at(60, 2), h.at(60, 3), h.at(60, 5)];
+            h.drag(&path);
+            let e = h.at(64, 2);
+            h.drag(&[e]);
+            assert_eq!(spans(h.cells(), true), [span(60, 2, 5), span(64, 2, 2)]);
+            assert!(h.cells().iter().all(|c| !has_cut(c)));
         }
 
         #[test]

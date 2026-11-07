@@ -40,6 +40,8 @@ pub enum Edit {
     RenameTrack(usize, String),
     /// Make a track play another of the song's instruments.
     SetInstrument(usize, usize),
+    /// Make a track poly (notes play out by themselves) or mono.
+    SetPoly(usize, bool),
     Volume(usize, f32),
     Mute(usize),
     Solo(usize),
@@ -152,6 +154,10 @@ pub fn apply(song: &mut Song, edit: &Edit) -> Result<Select, String> {
                 return Err("no such instrument".into());
             }
             song.tracks.get_mut(t).ok_or_else(no_track)?.instrument = i;
+            Ok(Select::Keep)
+        }
+        Edit::SetPoly(t, poly) => {
+            song.tracks.get_mut(t).ok_or_else(no_track)?.poly = poly;
             Ok(Select::Keep)
         }
         Edit::Volume(t, v) => song
@@ -289,6 +295,8 @@ mod tests {
         assert_eq!(s.tracks[1].instrument, 1);
         assert!(apply(&mut s, &Edit::SetInstrument(1, 2)).is_err());
         assert!(apply(&mut s, &Edit::SetInstrument(5, 0)).is_err());
+        apply(&mut s, &Edit::SetPoly(1, true)).unwrap();
+        assert!(s.tracks[1].poly && !s.tracks[0].poly);
     }
 
     #[test]

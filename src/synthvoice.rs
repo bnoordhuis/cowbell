@@ -360,17 +360,19 @@ impl SynthVoice {
     }
 }
 
-/// Voices per synth track: room for a three-note chord plus the release
-/// of the one before.
+/// Voices a mono track's chords share: room for a three-note chord plus
+/// the release of the one before. Bigger chords get as many as they need.
 pub const POLYPHONY: usize = 4;
-/// Most notes one cell can start: the root and two chord notes.
-pub const MAX_CHORD: usize = 3;
+/// Voices per synth track, for poly tracks' notes to ring over each other.
+pub const VOICES: usize = 12;
+/// Most notes one row can start: its notes, and their chord notes.
+pub const MAX_CHORD: usize = 8;
 
 /// A synth track's voices. A new note starts on a free voice while the
 /// previous one releases, so tails overlap instead of being cut short.
 #[derive(Clone, Debug)]
 pub struct SynthTrack {
-    voices: [SynthVoice; POLYPHONY],
+    voices: [SynthVoice; VOICES],
     /// The voices playing the current note or chord, root first.
     held: [Option<usize>; MAX_CHORD],
     /// Knob values set by automation, overriding the patch's; NaN where
@@ -439,6 +441,7 @@ impl SynthTrack {
         rate: f64,
     ) {
         let freqs = &freqs[..freqs.len().min(MAX_CHORD)];
+        let range = POLYPHONY.max(freqs.len() + 1).min(VOICES);
         let held = self.held;
         let mut next = [None; MAX_CHORD];
         if glide_ms > 0.0 && held.iter().any(Option::is_some) {
@@ -446,7 +449,7 @@ impl SynthTrack {
                 // Slide a held voice; a chord note with none starts fresh.
                 let v = match held[k] {
                     Some(v) if self.voices[v].is_active() => v,
-                    _ => self.free_voice(&held, &next),
+                    _ => self.free_voice(&held, &next, range),
                 };
                 self.voices[v].note_on(instrument, f, velocity, glide_ms, rate);
                 next[k] = Some(v);
@@ -459,7 +462,7 @@ impl SynthTrack {
                 self.voices[*v].note_off_in(0.0);
             }
             for (k, &f) in freqs.iter().enumerate() {
-                let v = self.free_voice(&[None; MAX_CHORD], &next);
+                let v = self.free_voice(&[None; MAX_CHORD], &next, range);
                 self.voices[v].note_on(instrument, f, velocity, 0.0, rate);
                 next[k] = Some(v);
             }
@@ -467,21 +470,54 @@ impl SynthTrack {
         self.held = next;
     }
 
-    /// A voice to start a note on: a silent one if there is one, otherwise
-    /// the quietest one not in `keep` or `taken`, which starts over.
+    /// Start notes (a note and its chord notes) on free voices, leaving the
+    /// ones sounding alone: a poly track's notes ring over each other.
+    /// Released after `hold` frames, if given.
+    pub fn play(
+        &mut self,
+        instrument: usize,
+        freqs: &[f64],
+        velocity: u8,
+        hold: Option<f64>,
+        rate: f64,
+    ) {
+        let mut taken = [None; MAX_CHORD];
+        for (k, &f) in freqs.iter().take(MAX_CHORD).enumerate() {
+            let v = self.free_voice(&[None; MAX_CHORD], &taken, VOICES);
+            self.voices[v].note_on(instrument, f, velocity, 0.0, rate);
+            if let Some(frames) = hold {
+                self.voices[v].note_off_in(frames);
+            }
+            taken[k] = Some(v);
+        }
+        // A mono note after this starts afresh rather than sliding.
+        self.held = [None; MAX_CHORD];
+    }
+
+    /// Release every note, held or not, after `frames` output frames.
+    pub fn release_all(&mut self, frames: f64) {
+        for v in self.voices.iter_mut().filter(|v| v.is_active()) {
+            v.note_off_in(frames);
+        }
+    }
+
+    /// A voice among the first `range` to start a note on: a silent one if
+    /// there is one, otherwise the quietest one not in `keep` or `taken`,
+    /// which starts over.
     fn free_voice(
         &mut self,
         keep: &[Option<usize>; MAX_CHORD],
         taken: &[Option<usize>; MAX_CHORD],
+        range: usize,
     ) -> usize {
         let open = |i: &usize| !taken.contains(&Some(*i)) && !keep.contains(&Some(*i));
-        if let Some(i) = (0..POLYPHONY)
+        if let Some(i) = (0..range)
             .filter(open)
             .find(|&i| !self.voices[i].is_active())
         {
             return i;
         }
-        let i = (0..POLYPHONY)
+        let i = (0..range)
             .filter(open)
             .min_by(|&a, &b| self.voices[a].amp.total_cmp(&self.voices[b].amp))
             .unwrap_or(0);
@@ -647,6 +683,37 @@ mod tests {
             .map(|&v| t.voices[v].target)
             .collect();
         assert_eq!(held, vec![400.0, 500.0]);
+    }
+
+    #[test]
+    fn poly_notes_ring_over_each_other_and_end_on_time() {
+        let patch = SynthPatch::new(SynthKind::Fm, "t");
+        let mut t = SynthTrack::default();
+        // Eight notes, each held a hundred frames longer than the last.
+        for k in 0..8 {
+            t.play(
+                0,
+                &[100.0 * (k + 1) as f64],
+                100,
+                Some(100.0 * (k + 1) as f64),
+                RATE,
+            );
+        }
+        assert_eq!(t.active_voices(), 8, "none cut short");
+        for _ in 0..450 {
+            t.next_frame(|_| Some(&patch), RATE);
+        }
+        let releasing = t
+            .voices
+            .iter()
+            .filter(|v| v.is_active() && v.stage == Stage::Release)
+            .count();
+        assert_eq!(releasing, 4, "the four shortest are letting go");
+        t.release_all(0.0);
+        for _ in 0..48_000 * 4 {
+            t.next_frame(|_| Some(&patch), RATE);
+        }
+        assert!(!t.is_active());
     }
 
     #[test]

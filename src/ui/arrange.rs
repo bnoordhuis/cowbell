@@ -624,6 +624,19 @@ impl ArrangeView {
                 if ui.button("Rename track").clicked() {
                     rename = Some(t);
                 }
+                if let Some(tr) = song.tracks.get(t) {
+                    let mut poly = tr.poly;
+                    let r = ui
+                        .checkbox(&mut poly, "Poly: notes ring over each other")
+                        .on_hover_text(
+                            "Off (mono): each row's notes take over from the last, \
+                             for chopping breaks and sliding basslines. \
+                             On: each note plays out by itself, for kits, pads and bells.",
+                        );
+                    if r.clicked() {
+                        out.edits.push(Edit::SetPoly(t, poly));
+                    }
+                }
                 let playing = song.tracks.get(t).map(|tr| tr.instrument);
                 ui.menu_button("Plays", |ui| {
                     for (i, inst) in song.instruments.iter().enumerate() {
@@ -841,10 +854,11 @@ impl ArrangeView {
                 .instruments
                 .get(track.instrument)
                 .map_or("", Instrument::name);
-            headers.text(
+            let mode = if track.poly { "poly" } else { "mono" };
+            headers.with_clip_rect(r.intersect(g.headers)).text(
                 r.left_top() + vec2(42.0, 64.0),
                 Align2::LEFT_CENTER,
-                instrument,
+                format!("{instrument} · {mode}"),
                 small.clone(),
                 color::MUTED,
             );
@@ -930,7 +944,7 @@ fn draw_hits(p: &egui::Painter, g: &Geometry, clip: &Clip, r: Rect, tint: Color3
         .cells
         .iter()
         .enumerate()
-        .filter_map(|(row, c)| c.trigger.map(|t| (row, t.slice)))
+        .flat_map(|(row, c)| c.hits().map(move |t| (row, t.slice)))
         .collect();
     let Some(lo) = hits.iter().map(|h| h.1).min() else {
         return;
