@@ -144,6 +144,37 @@ const COPY: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers
 const CUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::X);
 const PASTE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::V);
 
+/// The strip down the side, named sideways, that opens and folds the
+/// browser next to it. Returns whether it was clicked.
+fn browser_strip(ui: &mut egui::Ui, open: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        ui.painter().rect_filled(rect, 0.0, color::BAR);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let text_color = if hovered { color::TEXT } else { color::MUTED };
+    let arrow = if open { "‹" } else { "›" };
+    let galley = ui.painter().layout_no_wrap(
+        format!("INSTRUMENTS · SAMPLES   {arrow}"),
+        FontId::proportional(13.0),
+        text_color,
+    );
+    // Turned a quarter clockwise, the text runs down from its top-left
+    // corner and its height lies to the left of it.
+    let at = egui::pos2(rect.center().x + galley.size().y / 2.0, rect.top() + 14.0);
+    ui.painter().add(
+        egui::epaint::TextShape::new(at, galley, text_color)
+            .with_angle(std::f32::consts::FRAC_PI_2),
+    );
+    let hover = if open {
+        "Fold the instruments and samples away"
+    } else {
+        "Show the instruments and samples"
+    };
+    response.on_hover_text(hover).clicked()
+}
+
 /// egui moves the focus between widgets with Tab (and the arrows) before
 /// the app sees the key. For keys that are the app's, undo that: no widget
 /// gets focus from it, and none keeps it.
@@ -284,6 +315,8 @@ struct App {
     /// The loop range to bring back when the loop is switched on again.
     loop_memory: Range<Tick>,
     browser: browser::Browser,
+    /// Whether the browser is open, or folded into a strip at the side.
+    browser_open: bool,
     dialog: Option<files::Dialog>,
     /// Asking whether to drop unsaved changes, and what for.
     confirm: Option<Discard>,
@@ -342,6 +375,7 @@ impl App {
             follow: true,
             loop_memory,
             browser: browser::Browser::new(&samples_folder(path.as_deref())),
+            browser_open: false,
             dialog: None,
             confirm: None,
             message: None,
@@ -358,8 +392,8 @@ impl App {
         app
     }
 
-    /// Dev only: `COWBELL_SELECT=track,clip` selects a clip, and
-    /// `COWBELL_DIALOG=open|save|export` opens a file dialog.
+    /// Dev only: `COWBELL_SELECT=track,clip` selects a clip,
+    /// `COWBELL_BROWSER=open` opens the browser, and `COWBELL_DIALOG=open|save|export` opens a file dialog.
     #[cfg(feature = "screenshot")]
     fn screenshot_setup(&mut self) {
         if let Ok(sel) = std::env::var("COWBELL_SELECT")
@@ -367,6 +401,9 @@ impl App {
             && let (Ok(t), Ok(c)) = (t.parse(), c.parse())
         {
             self.select(Select::Clip((t, c)));
+        }
+        if std::env::var("COWBELL_BROWSER").as_deref() == Ok("open") {
+            self.browser_open = true;
         }
         match std::env::var("COWBELL_DIALOG").as_deref() {
             Ok("open") => self.ask(files::Purpose::Open),
@@ -1427,18 +1464,33 @@ impl eframe::App for App {
             .frame(frame(color::PANEL))
             .show(ui, |ui| self.status(ui));
         if self.view == View::Arrange {
-            let pick = egui::Panel::left("browser")
-                .resizable(true)
-                .default_size(250.0)
-                .min_size(180.0)
-                .frame(frame(color::PANEL).inner_margin(egui::Margin::symmetric(10, 8)))
-                .show(ui, |ui| self.browser.show(ui))
-                .inner;
-            if let Some(path) = self.browser.take_preview() {
-                self.preview(&path);
-            }
-            if let Some(pick) = pick {
-                self.pick(pick);
+            // The strip stays put; clicking it again folds the panel back,
+            // without moving the mouse.
+            egui::Panel::left("browser strip")
+                .exact_size(30.0)
+                .resizable(false)
+                .frame(frame(color::PANEL))
+                .show(ui, |ui| {
+                    if browser_strip(ui, self.browser_open) {
+                        self.browser_open = !self.browser_open;
+                    }
+                });
+            if self.browser_open {
+                let pick = egui::Panel::left("browser")
+                    .resizable(true)
+                    .default_size(250.0)
+                    .min_size(180.0)
+                    .frame(frame(color::PANEL).inner_margin(egui::Margin::symmetric(10, 8)))
+                    .show(ui, |ui| self.browser.show(ui))
+                    .inner;
+                if let Some(path) = self.browser.take_preview() {
+                    self.preview(&path);
+                }
+                if let Some(pick) = pick {
+                    self.pick(pick);
+                    // It's done its job; give the tracks their room back.
+                    self.browser_open = false;
+                }
             }
         }
         egui::CentralPanel::default()

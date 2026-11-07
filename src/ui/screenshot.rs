@@ -2,7 +2,8 @@
 //!
 //! `COWBELL_SCREENSHOT=out.ppm` saves the window as a binary PPM and exits.
 //! `COWBELL_VIEW=editor|devices|rack` shows that screen instead of the
-//! arrangement, `COWBELL_SELECT=track,clip` selects a clip, and
+//! arrangement, `COWBELL_SELECT=track,clip` selects a clip,
+//! `COWBELL_BROWSER=open` opens the browser, and
 //! `COWBELL_DIALOG=open|save|export` opens a file dialog.
 
 use std::sync::Arc;
