@@ -79,11 +79,11 @@ pub fn export_wav(song: &Song, path: &Path) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{demo, synth};
+    use crate::demo;
 
     #[test]
     fn plays_once_then_rings_out() {
-        let song = demo::song(synth::demo_break(RATE, demo::BPM as f32));
+        let song = demo::song(demo::kit());
         let seconds = song_seconds(&song);
         let out = render(&song);
         let len = out.len() as f64 / RATE as f64;
@@ -102,7 +102,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cowbell-test-export-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.wav");
-        let song = demo::song(synth::demo_break(RATE, demo::BPM as f32));
+        let song = demo::song(demo::kit());
         let seconds = export_wav(&song, &path).unwrap();
         let r = hound::WavReader::open(&path).unwrap();
         assert_eq!(r.spec().channels, 2);

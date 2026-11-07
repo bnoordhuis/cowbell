@@ -32,7 +32,26 @@ impl Sample {
     }
 
     pub fn load_wav(path: &Path) -> Result<Self, hound::Error> {
-        let mut reader = hound::WavReader::open(path)?;
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let mut sample = Self::read_wav(hound::WavReader::open(path)?, name)?;
+        sample.path = Some(std::path::absolute(path).unwrap_or_else(|_| path.to_owned()));
+        Ok(sample)
+    }
+
+    /// A WAV file's contents, e.g. one built into the program.
+    pub fn from_wav_bytes(name: &str, bytes: &[u8]) -> Result<Self, hound::Error> {
+        Self::read_wav(
+            hound::WavReader::new(std::io::Cursor::new(bytes))?,
+            name.to_owned(),
+        )
+    }
+
+    fn read_wav<R: std::io::Read>(
+        mut reader: hound::WavReader<R>,
+        name: String,
+    ) -> Result<Self, hound::Error> {
         let spec = reader.spec();
         let samples: Vec<f32> = match spec.sample_format {
             hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>()?,
@@ -55,12 +74,7 @@ impl Sample {
                 }
             })
             .collect();
-        let name = path
-            .file_name()
-            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        let mut sample = Sample::new(name, spec.sample_rate, frames);
-        sample.path = Some(std::path::absolute(path).unwrap_or_else(|_| path.to_owned()));
-        Ok(sample)
+        Ok(Sample::new(name, spec.sample_rate, frames))
     }
 
     /// Write as a 32-bit float stereo WAV, which is lossless.

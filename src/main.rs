@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use cowbell::demo;
 use cowbell::engine::Engine;
 use cowbell::sample::Sample;
-use cowbell::{demo, synth};
 
 const USAGE: &str = "\
 usage:
@@ -55,7 +55,7 @@ fn parse_args() -> Result<Args, String> {
 fn load_break(path: Option<&PathBuf>) -> Result<Sample, String> {
     match path {
         // Voices resample, so the break's rate needn't match the device's.
-        None => Ok(synth::demo_break(48_000, demo::BPM as f32)),
+        None => Ok(demo::kit()),
         Some(path) => {
             let mut s = Sample::load_wav(path).map_err(|e| format!("{}: {e}", path.display()))?;
             s.detect_slices(0.6, 60.0);

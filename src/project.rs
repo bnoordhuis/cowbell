@@ -284,7 +284,7 @@ pub fn load(path: &Path) -> Result<Song, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{demo, synth};
+    use crate::demo;
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("cowbell-test-{name}-{}", std::process::id()));
@@ -304,9 +304,9 @@ mod tests {
     fn round_trip() {
         let dir = temp_dir("round-trip");
         let path = dir.join("song.cowbell");
-        let song = demo::song(synth::demo_break(48_000, 172.0));
+        let song = demo::song(demo::kit());
         save(&song, &path).unwrap();
-        assert!(dir.join("song.samples").join("00-demo_break.wav").exists());
+        assert!(dir.join("song.samples").join("00-kit.wav").exists());
 
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.bpm, song.bpm);
@@ -327,7 +327,7 @@ mod tests {
         let Instrument::Sampler(s) = &loaded.instruments[0] else {
             panic!("not a sample")
         };
-        assert_eq!(s.slices, synth::demo_break(48_000, 172.0).slices);
+        assert_eq!(s.slices, demo::kit().slices);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -335,7 +335,7 @@ mod tests {
     fn samples_from_files_stay_where_they_are() {
         let dir = temp_dir("external");
         let wav = dir.join("break.wav");
-        synth::demo_break(48_000, 172.0).save_wav(&wav).unwrap();
+        demo::kit().save_wav(&wav).unwrap();
         let mut song = demo::song(Sample::load_wav(&wav).unwrap());
         song.instruments.truncate(1);
         let path = dir.join("song.cowbell");
@@ -354,7 +354,7 @@ mod tests {
     fn empty_cells_are_not_written() {
         let dir = temp_dir("sparse");
         let path = dir.join("song.cowbell");
-        let song = demo::song(synth::demo_break(48_000, 172.0));
+        let song = demo::song(demo::kit());
         save(&song, &path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let used = song
@@ -377,7 +377,7 @@ mod tests {
     fn mixer_state_and_loop_survive() {
         let dir = temp_dir("mixer");
         let path = dir.join("song.cowbell");
-        let mut song = demo::song(synth::demo_break(48_000, 172.0));
+        let mut song = demo::song(demo::kit());
         song.tracks[1].mute = true;
         song.tracks[0].solo = true;
         song.tracks[0].automation = Some(Target::Synth { param: 2 });
@@ -397,7 +397,7 @@ mod tests {
     fn overlapping_clips_are_dropped_on_load() {
         let dir = temp_dir("overlap");
         let path = dir.join("song.cowbell");
-        let song = demo::song(synth::demo_break(48_000, 172.0));
+        let song = demo::song(demo::kit());
         save(&song, &path).unwrap();
         // Move the second clip of the first track onto the first.
         let text = std::fs::read_to_string(&path).unwrap();
@@ -413,7 +413,7 @@ mod tests {
     fn broken_cables_are_dropped_on_load() {
         let dir = temp_dir("repair");
         let path = dir.join("song.cowbell");
-        let mut song = demo::song(synth::demo_break(48_000, 172.0));
+        let mut song = demo::song(demo::kit());
         let n = song.rack.cables.len();
         let mut bogus = song.rack.cables[0];
         bogus.from.device = 9999;

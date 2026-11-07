@@ -1,2 +1,4 @@
 /target
 *.wav
+# The demo's CC0 drum samples are part of the source.
+!assets/**/*.wav

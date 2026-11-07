@@ -131,7 +131,7 @@ fn roll_sweeps_hits_and_pitch() {
 
 #[test]
 fn swapped_song_is_handed_back() {
-    let song = demo::song(synth::demo_break(RATE, 172.0));
+    let song = demo::song(demo::kit());
     let (mut engine, mut controller) = Engine::new(RATE, song.clone());
     engine.play();
     let mut buf = vec![0.0; 1024];
@@ -157,10 +157,7 @@ fn swapped_song_is_handed_back() {
 
 #[test]
 fn demo_song_renders_without_clipping_or_nans() {
-    let out = render(
-        demo::song(synth::demo_break(RATE, 172.0)),
-        RATE as usize * 4,
-    );
+    let out = render(demo::song(demo::kit()), RATE as usize * 4);
     let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     assert!(out.iter().all(|s| s.is_finite()));
     assert!(peak > 0.1 && peak < 2.0, "peak {peak}");

@@ -1,12 +1,18 @@
-use cowbell::bounce::{self, RATE};
-use cowbell::song::{Cell, Instrument, Song, TICKS_PER_BEAT};
-use cowbell::{demo, synth};
+use cowbell::bounce;
+use cowbell::demo;
+use cowbell::song::{Cell, Fx, Instrument, Song, TICKS_PER_BEAT};
 
-/// The demo song, without its effects rack, so the bounced track (which goes
-/// straight into the mixer) and the original sound the same.
+/// The demo song's drums: without its effects rack and at full volume
+/// everywhere, so the bounced track (which goes straight into the mixer)
+/// and the originals sound the same. The synths are muted, as you'd bounce
+/// a break, but stay in the song: a bounce makes the seventh track, which
+/// needs a second mixer to be heard.
 fn plain_song() -> Song {
-    let mut song = demo::song(synth::demo_break(RATE, demo::BPM as f32));
+    let mut song = demo::song(demo::kit());
     song.rack = cowbell::rack::Rack::simple(song.tracks.len());
+    for t in &mut song.tracks[2..] {
+        t.mute = true;
+    }
     // Full velocity, so the bounce track's 7F triggers play at the same gain.
     for t in &mut song.tracks {
         for c in &mut t.clips {
@@ -27,32 +33,72 @@ fn frames(song: &Song, i: usize) -> Vec<[f32; 2]> {
     s.frames.to_vec()
 }
 
+/// The first break clip that has a hit with this effect.
+fn clip_with(song: &Song, fx: fn(&Fx) -> bool) -> usize {
+    song.tracks[0]
+        .clips
+        .iter()
+        .position(|c| c.cells.iter().any(|cell| cell.fx().any(|f| fx(&f))))
+        .expect("the demo has one")
+}
+
 #[test]
 fn bounced_clip_plays_back_identically() {
     let mut song = plain_song();
-    // The second break clip has retriggers, reverse, stutter, crush, and the
-    // snare roll under it.
-    let clip = song.tracks[0].clips[1].clone();
+    // A break clip with retriggers, reverse, stutter and crush, with a snare
+    // roll under it.
+    let i = clip_with(&song, |f| matches!(f, Fx::Crush(_)));
+    let clip = song.tracks[0].clips[i].clone();
+    for (what, fx) in [
+        (
+            "retrigger",
+            (|f: &Fx| matches!(f, Fx::Retrig(_))) as fn(&Fx) -> bool,
+        ),
+        ("reverse", |f| *f == Fx::Reverse),
+        ("stutter", |f| matches!(f, Fx::Stutter(_))),
+    ] {
+        assert!(
+            clip.cells.iter().any(|c| c.fx().any(|f| fx(&f))),
+            "no {what}"
+        );
+    }
+    let span = clip.span();
+    assert!(
+        song.tracks[1]
+            .clips
+            .iter()
+            .any(|c| c.start < span.end && span.start < c.end()),
+        "a roll under it"
+    );
+    let tracks = song.tracks.len();
     let rows = clip.cells.len();
     let before = bounce::bounce(&song, clip.start, rows, clip.rows_per_beat, "before");
     let t = bounce::bounce_to_track(&mut song, clip.start, rows, clip.rows_per_beat).unwrap();
 
-    assert_eq!(t, 2, "a new track");
+    assert_eq!(t, tracks, "a new track");
     assert_eq!(
-        song.rack.track_device(2).map(|d| d.kind),
-        Some(cowbell::rack::Kind::Track(2))
+        song.rack.track_device(t).map(|d| d.kind),
+        Some(cowbell::rack::Kind::Track(t))
     );
-    assert!(
-        song.tracks[..2].iter().all(|t| t
-            .clip_at(clip.start)
-            .is_some_and(|c| c.cells.iter().all(|c| *c == Cell::default()))),
-        "originals cleared"
-    );
-    let new = &song.tracks[2].clips[0];
+    let mut left = Vec::new();
+    for track in &song.tracks[..t] {
+        for c in &track.clips {
+            for r in 0..c.cells.len() {
+                if span.contains(&c.row_tick(r)) && c.cells[r] != Cell::default() {
+                    left.push(format!("{} row {r}", track.name));
+                }
+            }
+        }
+    }
+    assert!(left.is_empty(), "originals cleared, but not {left:?}");
+    let new = &song.tracks[t].clips[0];
     assert_eq!((new.start, new.cells.len()), (clip.start, rows));
     let triggers = new.cells.iter().filter(|c| c.trigger.is_some()).count();
     assert!(triggers > 3, "{triggers} slices");
-    assert_eq!(frames(&song, 1), *before.sample.frames);
+    assert_eq!(
+        frames(&song, song.instruments.len() - 1),
+        *before.sample.frames
+    );
 
     // Playing it now gives the same audio as before the bounce.
     let after = bounce::bounce(&song, clip.start, rows, clip.rows_per_beat, "after");
@@ -69,17 +115,23 @@ fn bounced_clip_plays_back_identically() {
 #[test]
 fn bounce_clears_only_its_stretch() {
     let mut song = plain_song();
-    let first = song.tracks[0].clips[0].clone();
-    // Rows 8..16 of the first clip: beats 2 to 4.
-    let start = first.row_tick(8);
-    bounce::bounce_to_track(&mut song, start, 8, first.rows_per_beat).unwrap();
-    let cells = &song.tracks[0].clips[0].cells;
+    // The first clip of the groove, which comes back later unchanged.
+    let i = clip_with(&song, |f| matches!(f, Fx::Cut(_)));
+    let groove = song.tracks[0].clips[i].clone();
+    let again = (i + 1..song.tracks[0].clips.len())
+        .find(|&j| song.tracks[0].clips[j].cells == groove.cells)
+        .expect("the groove comes back");
+    let tracks = song.tracks.len();
+    // Rows 8..16 of it: beats 2 to 4.
+    let start = groove.row_tick(8);
+    bounce::bounce_to_track(&mut song, start, 8, groove.rows_per_beat).unwrap();
+    let cells = &song.tracks[0].clips[i].cells;
     assert!(cells[8..16].iter().all(|c| *c == Cell::default()));
-    assert_eq!(cells[..8], first.cells[..8]);
-    assert_eq!(cells[16..], first.cells[16..]);
-    let new = &song.tracks[2].clips[0];
-    assert_eq!(new.start, 2 * TICKS_PER_BEAT);
+    assert_eq!(cells[..8], groove.cells[..8]);
+    assert_eq!(cells[16..], groove.cells[16..]);
+    let new = &song.tracks[tracks].clips[0];
+    assert_eq!(new.start, groove.start + 2 * TICKS_PER_BEAT);
     assert!(new.cells[0].trigger.is_some(), "slice 0 on the first row");
     // The same clip later in the song is untouched.
-    assert_eq!(song.tracks[0].clips[2].cells, first.cells);
+    assert_eq!(song.tracks[0].clips[again].cells, groove.cells);
 }
