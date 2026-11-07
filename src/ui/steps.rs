@@ -28,6 +28,8 @@ const LABEL_W: f32 = 100.0;
 const MIN_LANE: f32 = 16.0;
 const MAX_LANE: f32 = 30.0;
 const NOTE_LANE: f32 = 16.0;
+/// How strongly the lane and step under the pointer light up.
+const HOVER_ALPHA: u8 = 9;
 const MIN_COL: f32 = 12.0;
 const MAX_COL: f32 = 48.0;
 /// Right-click steps a hit through these retrigger counts, then back to a
@@ -360,6 +362,14 @@ impl Geometry {
         )
     }
 
+    /// The lane and row of the cell under `p`, if it's over one.
+    fn hovered(&self, p: Pos2) -> Option<(usize, usize)> {
+        let lanes = self.visible_lanes() as f32 * self.lane_h;
+        let cols = self.visible_cols() as f32 * self.col_w;
+        let over_grid = Rect::from_min_size(self.grid.min, vec2(cols, lanes));
+        over_grid.contains(p).then(|| self.cell_at(p))
+    }
+
     /// Screen y of a lane's top, if it's visible.
     fn lane_y(&self, lane: usize) -> Option<f32> {
         (lane >= self.first_lane && lane < self.first_lane + self.visible_lanes())
@@ -532,6 +542,28 @@ impl StepView {
                     Stroke::new(1.0, color::DIM),
                 );
             }
+        }
+
+        // The lane and step under the pointer, lit up faintly across the
+        // grid, so it's plain which note or beat it's on.
+        if let Some((lane, row)) = ui
+            .input(|i| i.pointer.hover_pos())
+            .and_then(|q| g.hovered(q))
+        {
+            let glow = Color32::from_white_alpha(HOVER_ALPHA);
+            if let Some(y) = g.lane_y(lane) {
+                let band = Rect::from_min_max(
+                    pos2(g.labels.left(), y),
+                    pos2(g.col_x(g.first_col + cols), y + g.lane_h),
+                );
+                p.rect_filled(band, 2.0, glow);
+            }
+            let x = g.col_x(row);
+            let band = Rect::from_min_max(
+                pos2(x, g.grid.top() - HEADER),
+                pos2(x + g.col_w, g.grid.top() + lanes as f32 * g.lane_h),
+            );
+            p.rect_filled(band, 2.0, glow);
         }
 
         // Hits.
@@ -979,6 +1011,27 @@ mod tests {
 
     fn slices(c: &Cell) -> Vec<u16> {
         c.hits().map(|t| t.slice).collect()
+    }
+
+    #[test]
+    fn only_a_visible_cell_counts_as_hovered() {
+        // 4 lanes of 10 shown out of 8, from the second; 5 rows of 20 shown
+        // out of 16, from the third.
+        let g = Geometry {
+            labels: Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 40.0)),
+            grid: Rect::from_min_size(pos2(100.0, 0.0), vec2(100.0, 40.0)),
+            lanes: (0..8).collect(),
+            first_lane: 1,
+            lane_h: 10.0,
+            first_col: 2,
+            col_w: 20.0,
+            rows: 16,
+        };
+        assert_eq!(g.hovered(pos2(105.0, 5.0)), Some((1, 2)));
+        assert_eq!(g.hovered(pos2(195.0, 35.0)), Some((4, 6)));
+        assert_eq!(g.hovered(pos2(50.0, 5.0)), None, "a lane's name");
+        assert_eq!(g.hovered(pos2(105.0, 45.0)), None, "below the lanes");
+        assert_eq!(g.hovered(pos2(205.0, 5.0)), None, "past the rows");
     }
 
     #[test]
