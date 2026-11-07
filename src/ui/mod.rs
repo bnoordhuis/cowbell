@@ -3,8 +3,10 @@
 //! status line. Everything is done with the mouse.
 
 mod arrange;
+mod browser;
 mod devices;
 mod edit;
+mod files;
 mod knob;
 mod rack;
 #[cfg(feature = "screenshot")]
@@ -13,6 +15,7 @@ mod steps;
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, RichText, vec2};
 
@@ -21,7 +24,9 @@ use crate::document::Document;
 use crate::engine::{Command, Controller, Engine};
 use crate::graph::Graph;
 use crate::project;
-use crate::song::{Song, TICKS_PER_BAR, TRACK_VOLUME, Target, Tick};
+use crate::sample::Sample;
+use crate::song::{Instrument, Song, TICKS_PER_BAR, TRACK_VOLUME, Target, Tick, Track};
+use crate::synthvoice::SynthPatch;
 use edit::{Edit, Select, apply};
 
 mod color {
@@ -76,40 +81,34 @@ enum Tab {
     Devices,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PromptKind {
-    Open,
-    SaveAs,
-    Export,
+/// What to do once unsaved changes have been let go of.
+#[derive(Debug, PartialEq)]
+enum Discard {
+    New,
+    Open(PathBuf),
 }
 
-struct Prompt {
-    kind: PromptKind,
-    text: String,
-    /// Focus the text field on the first frame only.
-    focused: bool,
+/// Slice detection for samples added from the browser.
+const SENSITIVITY: f32 = 0.6;
+const MIN_SLICE_MS: f32 = 40.0;
+
+/// A new, empty project: the drum kit on one track.
+fn new_song() -> Song {
+    let kit = Instrument::Sampler(Arc::new(crate::demo::kit()));
+    Song::new(crate::demo::BPM, vec![kit], vec![Track::new("drums", 0)])
 }
 
-/// A project path from typed text: `.cowbell` is added if missing.
-fn project_path(text: &str) -> PathBuf {
-    let mut path = typed_path(text);
-    if path.extension().is_none_or(|e| e != project::EXTENSION) {
-        let mut name = path.into_os_string();
-        name.push(".");
-        name.push(project::EXTENSION);
-        path = name.into();
+/// Where the browser starts: the built-in samples when running from the
+/// source tree, else the project's folder, else the current one.
+fn samples_folder(project: Option<&Path>) -> PathBuf {
+    let assets = Path::new("assets/drums");
+    if assets.is_dir() {
+        return assets.to_owned();
     }
-    path
-}
-
-/// Typed text as a path: trimmed, and `~/` is the home folder.
-fn typed_path(text: &str) -> PathBuf {
-    let text = text.trim();
-    match text.strip_prefix("~/") {
-        Some(rest) => std::env::var_os("HOME")
-            .map_or_else(|| PathBuf::from(text), |h| Path::new(&h).join(rest)),
-        None => PathBuf::from(text),
-    }
+    project
+        .and_then(Path::parent)
+        .filter(|d| !d.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_owned)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,7 +189,10 @@ struct App {
     follow: bool,
     /// The loop range to bring back when the loop is switched on again.
     loop_memory: Range<Tick>,
-    prompt: Option<Prompt>,
+    browser: browser::Browser,
+    dialog: Option<files::Dialog>,
+    /// Asking whether to drop unsaved changes, and what for.
+    confirm: Option<Discard>,
     message: Option<String>,
     /// Set after a close was cancelled because of unsaved changes; a second
     /// close goes through.
@@ -230,7 +232,7 @@ impl App {
             rack_version,
             sent_revision: 0,
             saved_revision: 0,
-            path,
+            path: path.clone(),
             view,
             arrange: arrange::ArrangeView::default(),
             rack_view: rack::RackView::default(),
@@ -239,7 +241,9 @@ impl App {
             devices: devices::DevicesView::default(),
             follow: true,
             loop_memory,
-            prompt: None,
+            browser: browser::Browser::new(&samples_folder(path.as_deref())),
+            dialog: None,
+            confirm: None,
             message: None,
             close_armed: false,
             title: String::new(),
@@ -252,8 +256,9 @@ impl App {
         app
     }
 
-    /// Dev only: `COWBELL_SELECT=track,clip` selects a clip, and
-    /// `COWBELL_TAB=devices` shows the devices tab.
+    /// Dev only: `COWBELL_SELECT=track,clip` selects a clip,
+    /// `COWBELL_TAB=devices` shows the devices tab, and
+    /// `COWBELL_DIALOG=open|save|export` opens a file dialog.
     #[cfg(feature = "screenshot")]
     fn screenshot_setup(&mut self) {
         if let Ok(sel) = std::env::var("COWBELL_SELECT")
@@ -264,6 +269,12 @@ impl App {
         }
         if std::env::var("COWBELL_TAB").as_deref() == Ok("devices") {
             self.tab = Tab::Devices;
+        }
+        match std::env::var("COWBELL_DIALOG").as_deref() {
+            Ok("open") => self.ask(files::Purpose::Open),
+            Ok("save") => self.ask(files::Purpose::SaveAs),
+            Ok("export") => self.ask(files::Purpose::Export),
+            _ => {}
         }
     }
 
@@ -303,21 +314,45 @@ impl App {
     fn open(&mut self, path: PathBuf) {
         match project::load(&path) {
             Ok(song) => {
-                let _ = self.controller.send(Command::Stop);
-                let _ = self.controller.send(Command::Locate(0));
-                self.loop_memory = song.loop_range.clone().unwrap_or(0..4 * TICKS_PER_BAR);
-                self.doc = Document::new(song);
-                // Resend the song and rebuild the graph, whatever revision
-                // and rack version the new document starts at.
-                self.sent_revision = u64::MAX;
-                self.rack_version = self.doc.song.rack.version.wrapping_add(1);
-                self.saved_revision = self.doc.revision;
-                self.close_armed = false;
-                self.arrange = arrange::ArrangeView::default();
+                self.start(song);
                 self.say(format!("opened {}", path.display()));
                 self.path = Some(path);
             }
             Err(e) => self.say(format!("couldn't open: {e}")),
+        }
+    }
+
+    /// Start afresh on `song`: stopped, at the start, nothing to undo, and
+    /// nothing unsaved.
+    fn start(&mut self, song: Song) {
+        let _ = self.controller.send(Command::Stop);
+        let _ = self.controller.send(Command::Locate(0));
+        self.gesture = None;
+        self.loop_memory = song.loop_range.clone().unwrap_or(0..4 * TICKS_PER_BAR);
+        self.doc = Document::new(song);
+        // Resend the song and rebuild the graph, whatever revision and rack
+        // version the new document starts at.
+        self.sent_revision = u64::MAX;
+        self.rack_version = self.doc.song.rack.version.wrapping_add(1);
+        self.saved_revision = self.doc.revision;
+        self.close_armed = false;
+        self.arrange = arrange::ArrangeView::default();
+        self.path = None;
+    }
+
+    /// Do `what`, first asking if that would lose unsaved changes (unless
+    /// `asked` already).
+    fn discard_then(&mut self, what: Discard, asked: bool) {
+        if self.unsaved() && !asked {
+            self.confirm = Some(what);
+            return;
+        }
+        match what {
+            Discard::New => {
+                self.start(new_song());
+                self.say("new project");
+            }
+            Discard::Open(path) => self.open(path),
         }
     }
 
@@ -329,19 +364,85 @@ impl App {
         self.say(message);
     }
 
-    fn ask(&mut self, kind: PromptKind) {
-        let text = match (&self.path, kind) {
-            (Some(p), PromptKind::Export) => p.with_extension("wav").display().to_string(),
-            (None, PromptKind::Export) => "untitled.wav".into(),
-            (Some(p), _) => p.display().to_string(),
-            (None, PromptKind::SaveAs) => format!("untitled.{}", project::EXTENSION),
-            (None, PromptKind::Open) => String::new(),
+    fn ask(&mut self, purpose: files::Purpose) {
+        let dir = self
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|d| !d.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_owned);
+        let stem = self.path.as_deref().and_then(Path::file_stem).map_or_else(
+            || "untitled".to_owned(),
+            |s| s.to_string_lossy().into_owned(),
+        );
+        let name = match purpose {
+            files::Purpose::Open => String::new(),
+            files::Purpose::SaveAs => format!("{stem}.{}", project::EXTENSION),
+            files::Purpose::Export => format!("{stem}.wav"),
         };
-        self.prompt = Some(Prompt {
-            kind,
-            text,
-            focused: false,
+        self.dialog = Some(files::Dialog::new(purpose, &dir, &name));
+    }
+
+    /// Add a track playing a new instrument, as one undo step.
+    fn add_instrument(&mut self, instrument: Instrument, name: &str) {
+        self.finish_gesture();
+        let t = self.doc.edit(|s| {
+            s.instruments.push(instrument);
+            let i = s.instruments.len() - 1;
+            let t = s.add_track(name, i);
+            if t.is_none() {
+                s.instruments.pop();
+            }
+            t
         });
+        match t {
+            Some(t) => {
+                self.select(Select::Track(t));
+                self.tab = Tab::Devices;
+                self.say(format!("added {name}: double-click its lane for a clip"));
+            }
+            None => {
+                // Nothing changed, so there's nothing to undo either.
+                self.doc.undo();
+                self.say(format!(
+                    "can't: {} tracks is the most",
+                    crate::engine::MAX_TRACKS
+                ));
+            }
+        }
+    }
+
+    fn pick(&mut self, pick: browser::Pick) {
+        match pick {
+            browser::Pick::Kit => {
+                let kit = Instrument::Sampler(Arc::new(crate::demo::kit()));
+                self.add_instrument(kit, "drums");
+            }
+            browser::Pick::Synth(kind) => {
+                let patch = SynthPatch::new(kind, kind.name());
+                self.add_instrument(Instrument::Synth(Arc::new(patch)), kind.name());
+            }
+            browser::Pick::Sample(path) => match Sample::load_wav(&path) {
+                Ok(mut sample) => {
+                    sample.detect_slices(SENSITIVITY, MIN_SLICE_MS);
+                    let name = path
+                        .file_stem()
+                        .map_or_else(|| "sample".to_owned(), |s| s.to_string_lossy().into_owned());
+                    let slices = sample.slices.len();
+                    self.add_instrument(Instrument::Sampler(Arc::new(sample)), &name);
+                    if self
+                        .message
+                        .as_deref()
+                        .is_some_and(|m| m.starts_with("added"))
+                    {
+                        self.say(format!(
+                            "added {name}, {slices} slices: double-click its lane for a clip"
+                        ));
+                    }
+                }
+                Err(e) => self.say(format!("couldn't load {}: {e}", path.display())),
+            },
+        }
     }
 
     fn undo(&mut self, redo: bool) {
@@ -422,21 +523,24 @@ impl App {
 
     fn menus(&mut self, ui: &mut egui::Ui) {
         ui.menu_button("File", |ui| {
+            if ui.button("New").clicked() {
+                self.discard_then(Discard::New, false);
+            }
             if ui.button("Open…").clicked() {
-                self.ask(PromptKind::Open);
+                self.ask(files::Purpose::Open);
             }
             if ui.button("Save").clicked() {
                 match self.path.clone() {
                     Some(path) => self.save(path),
-                    None => self.ask(PromptKind::SaveAs),
+                    None => self.ask(files::Purpose::SaveAs),
                 }
             }
             if ui.button("Save as…").clicked() {
-                self.ask(PromptKind::SaveAs);
+                self.ask(files::Purpose::SaveAs);
             }
             ui.separator();
             if ui.button("Export WAV…").clicked() {
-                self.ask(PromptKind::Export);
+                self.ask(files::Purpose::Export);
             }
         });
         ui.menu_button("Edit", |ui| {
@@ -834,45 +938,47 @@ impl App {
         }
     }
 
-    fn prompt(&mut self, ctx: &egui::Context) {
-        let Some(prompt) = &mut self.prompt else {
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(d) = &mut self.dialog
+            && let Some(answer) = d.show(ctx)
+        {
+            let purpose = d.purpose;
+            self.dialog = None;
+            if let files::Answer::Chose(path) = answer {
+                match purpose {
+                    files::Purpose::Open => self.discard_then(Discard::Open(path), false),
+                    files::Purpose::SaveAs => self.save(path),
+                    files::Purpose::Export => self.export(path),
+                }
+            }
+        }
+        let Some(what) = &self.confirm else {
             return;
         };
-        let title = match prompt.kind {
-            PromptKind::Open => "Open project",
-            PromptKind::SaveAs => "Save project as",
-            PromptKind::Export => "Export the song to WAV",
+        let doing = match what {
+            Discard::New => "starting a new project".to_owned(),
+            Discard::Open(p) => format!("opening {}", p.display()),
         };
-        let (mut confirm, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::unique("prompt")).show(ctx, |ui| {
-            ui.set_width(460.0);
-            ui.heading(title);
+        let (mut yes, mut no) = (false, false);
+        let modal = egui::Modal::new(egui::Id::unique("discard")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading("Unsaved changes");
             ui.add_space(6.0);
-            let edit =
-                ui.add(egui::TextEdit::singleline(&mut prompt.text).desired_width(f32::INFINITY));
-            if !prompt.focused {
-                edit.request_focus();
-                prompt.focused = true;
-            }
-            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                confirm = true;
-            }
-            ui.add_space(6.0);
+            ui.label(format!(
+                "{} has changes that aren't saved. They're lost by {doing}.",
+                self.project_name().trim_end_matches(" *")
+            ));
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                confirm |= ui.button("OK").clicked();
-                cancel |= ui.button("Cancel").clicked();
+                yes = ui.button("Discard them").clicked();
+                no = ui.button("Cancel").clicked();
             });
         });
-        cancel |= modal.should_close();
-        if confirm {
-            let prompt = self.prompt.take().unwrap();
-            match prompt.kind {
-                PromptKind::Open => self.open(project_path(&prompt.text)),
-                PromptKind::SaveAs => self.save(project_path(&prompt.text)),
-                PromptKind::Export => self.export(typed_path(&prompt.text)),
-            }
-        } else if cancel {
-            self.prompt = None;
+        if yes {
+            let what = self.confirm.take().unwrap();
+            self.discard_then(what, true);
+        } else if no || modal.should_close() {
+            self.confirm = None;
         }
     }
 }
@@ -893,7 +999,8 @@ impl eframe::App for App {
         // Space plays and stops, unless it's being typed into a dialog. It's
         // taken here, before any widget sees it, so a button that has focus
         // from a click doesn't press itself again.
-        if self.prompt.is_none()
+        if self.dialog.is_none()
+            && self.confirm.is_none()
             && !ctx.egui_wants_keyboard_input()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Space))
         {
@@ -930,6 +1037,16 @@ impl eframe::App for App {
                 .min_size(160.0)
                 .frame(frame(color::BG).inner_margin(egui::Margin::symmetric(10, 6)))
                 .show(ui, |ui| self.editor_panel(ui));
+            let pick = egui::Panel::left("browser")
+                .resizable(true)
+                .default_size(250.0)
+                .min_size(180.0)
+                .frame(frame(color::PANEL).inner_margin(egui::Margin::symmetric(10, 8)))
+                .show(ui, |ui| self.browser.show(ui))
+                .inner;
+            if let Some(pick) = pick {
+                self.pick(pick);
+            }
         }
         egui::CentralPanel::default()
             .frame(frame(color::BG))
@@ -937,11 +1054,31 @@ impl eframe::App for App {
                 View::Arrange => self.arrange(ui),
                 View::Rack => self.rack(ui),
             });
-        self.prompt(&ctx);
+        self.dialogs(&ctx);
 
         #[cfg(feature = "screenshot")]
         if let Some(s) = &mut self.screenshot {
             s.update(&ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_project_is_the_kit_on_one_empty_track() {
+        let song = new_song();
+        assert_eq!(song.tracks.len(), 1);
+        assert!(song.tracks[0].clips.is_empty());
+        assert!(matches!(song.instruments[0], Instrument::Sampler(_)));
+        assert!(song.rack.track_device(0).is_some(), "it can be heard");
+    }
+
+    #[test]
+    fn the_browser_starts_somewhere_sensible() {
+        // Tests run from the source tree, which has the built-in samples.
+        assert_eq!(samples_folder(None), Path::new("assets/drums"));
     }
 }

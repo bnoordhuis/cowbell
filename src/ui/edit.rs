@@ -38,6 +38,8 @@ pub enum Edit {
     DuplicateTrack(usize),
     DeleteTrack(usize),
     RenameTrack(usize, String),
+    /// Make a track play another of the song's instruments.
+    SetInstrument(usize, usize),
     Volume(usize, f32),
     Mute(usize),
     Solo(usize),
@@ -143,6 +145,13 @@ pub fn apply(song: &mut Song, edit: &Edit) -> Result<Select, String> {
         Edit::RenameTrack(t, ref name) => {
             let track = song.tracks.get_mut(t).ok_or_else(no_track)?;
             track.name = name.clone();
+            Ok(Select::Keep)
+        }
+        Edit::SetInstrument(t, i) => {
+            if i >= song.instruments.len() {
+                return Err("no such instrument".into());
+            }
+            song.tracks.get_mut(t).ok_or_else(no_track)?.instrument = i;
             Ok(Select::Keep)
         }
         Edit::Volume(t, v) => song
@@ -261,6 +270,25 @@ mod tests {
         cells[4] = Cell::hit(2, 90);
         apply(&mut s, &Edit::SetCells((0, 0), cells.clone())).unwrap();
         assert_eq!(s.tracks[0].clips[0].cells, cells);
+    }
+
+    #[test]
+    fn tracks_can_play_another_instrument() {
+        let mut s = song();
+        s.instruments
+            .push(Instrument::Synth(Arc::new(SynthPatch::new(
+                SynthKind::Fm,
+                "fm",
+            ))));
+        s.instruments
+            .push(Instrument::Synth(Arc::new(SynthPatch::new(
+                SynthKind::Acid,
+                "acid",
+            ))));
+        apply(&mut s, &Edit::SetInstrument(1, 1)).unwrap();
+        assert_eq!(s.tracks[1].instrument, 1);
+        assert!(apply(&mut s, &Edit::SetInstrument(1, 2)).is_err());
+        assert!(apply(&mut s, &Edit::SetInstrument(5, 0)).is_err());
     }
 
     #[test]

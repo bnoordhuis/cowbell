@@ -624,6 +624,15 @@ impl ArrangeView {
                 if ui.button("Rename track").clicked() {
                     rename = Some(t);
                 }
+                let playing = song.tracks.get(t).map(|tr| tr.instrument);
+                ui.menu_button("Plays", |ui| {
+                    for (i, inst) in song.instruments.iter().enumerate() {
+                        if ui.radio(playing == Some(i), inst.name()).clicked() && playing != Some(i)
+                        {
+                            out.edits.push(Edit::SetInstrument(t, i));
+                        }
+                    }
+                });
                 if ui.button("Duplicate track").clicked() {
                     out.edits.push(Edit::DuplicateTrack(t));
                 }

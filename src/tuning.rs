@@ -1,7 +1,7 @@
 //! Tunings: which frequency each note number plays. Equal temperament by
 //! default; anything else comes from a Scala (`.scl`) file.
 //!
-//! Notes are MIDI-style numbers: 60 is middle C (C-4).
+//! Notes are MIDI-style numbers: 60 is middle C (C4).
 
 use serde::{Deserialize, Serialize};
 
@@ -135,10 +135,10 @@ pub fn builtin(name: &str) -> Option<Tuning> {
 pub const LOWEST_NOTE: u8 = 12;
 pub const HIGHEST_NOTE: u8 = 119;
 
-/// A note's name in tracker style: `C-4`, `C#4`.
+/// A note's name: `C4`, `C#4`.
 pub fn note_name(note: u8) -> String {
     const NAMES: [&str; 12] = [
-        "C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-",
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
     ];
     format!("{}{}", NAMES[note as usize % 12], note as i32 / 12 - 1)
 }
@@ -201,10 +201,10 @@ mod tests {
 
     #[test]
     fn names() {
-        assert_eq!(note_name(60), "C-4");
+        assert_eq!(note_name(60), "C4");
         assert_eq!(note_name(61), "C#4");
-        assert_eq!(note_name(69), "A-4");
-        assert_eq!(note_name(LOWEST_NOTE), "C-0");
-        assert_eq!(note_name(HIGHEST_NOTE), "B-8");
+        assert_eq!(note_name(69), "A4");
+        assert_eq!(note_name(LOWEST_NOTE), "C0");
+        assert_eq!(note_name(HIGHEST_NOTE), "B8");
     }
 }

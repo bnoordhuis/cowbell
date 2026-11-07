@@ -3,7 +3,8 @@
 //! `COWBELL_SCREENSHOT=out.ppm` saves the window as a binary PPM and exits.
 //! `COWBELL_VIEW=rack` shows the rack instead of the arrangement,
 //! `COWBELL_SELECT=track,clip` selects a clip for the clip editor, and
-//! `COWBELL_TAB=devices` shows the devices tab instead.
+//! `COWBELL_TAB=devices` shows the devices tab instead, and
+//! `COWBELL_DIALOG=open|save|export` opens a file dialog.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

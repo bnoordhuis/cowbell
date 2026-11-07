@@ -19,8 +19,7 @@ use crate::tuning::Tuning;
 /// Effect columns per cell.
 pub const MAX_FX: usize = 2;
 
-/// Per-cell effect commands. These are what the tracker shows as `O3C`,
-/// `R18`, `Rv1` and so on.
+/// Per-cell effect commands, applied when the cell plays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Fx {
     /// Start `n/256` of the way into the slice.
