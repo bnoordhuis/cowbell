@@ -9,8 +9,9 @@
 //!   resize, right-click to duplicate or delete. Moves and resizes snap to
 //!   [`ArrangeView::snap`].
 //! - Empty lane: double-click for a new clip, drag to move the view.
-//! - Headers: mute, solo and a volume fader; right-click or double-click
-//!   the name to rename; right-click to duplicate or delete the track.
+//! - Headers: mute, solo and a volume fader; drag up or down to move the
+//!   track; right-click or double-click the name to rename; right-click to
+//!   duplicate or delete the track.
 //! - Scroll to scroll the tracks, ctrl+scroll to zoom.
 //!
 //! The view never changes the song itself. It reports edits, and the
@@ -102,13 +103,22 @@ enum Drag {
     Volume {
         track: usize,
     },
+    /// Moving a track up or down: where it was, where the press was, and
+    /// whether it has turned into a drag yet.
+    Track {
+        from: usize,
+        y: f32,
+        moved: bool,
+    },
 }
 
 impl Drag {
     /// Whether the drag has made edits that need an undo step.
     fn edited(&self) -> bool {
         match self {
-            Drag::Move { moved, .. } | Drag::Resize { moved, .. } => *moved,
+            Drag::Move { moved, .. } | Drag::Resize { moved, .. } | Drag::Track { moved, .. } => {
+                *moved
+            }
             Drag::Volume { .. } => true,
             Drag::Ruler { .. } | Drag::Pan { .. } => false,
         }
@@ -528,6 +538,11 @@ impl ArrangeView {
             Hit::Header(t) => {
                 self.selected_track = t;
                 self.selected_clip = None;
+                self.drag = Some(Drag::Track {
+                    from: t,
+                    y: p.y,
+                    moved: false,
+                });
             }
             Hit::Mute(t) => out.edits.push(Edit::Mute(t)),
             Hit::Solo(t) => out.edits.push(Edit::Solo(t)),
@@ -607,13 +622,25 @@ impl ArrangeView {
             Some(Drag::Volume { track }) => {
                 out.live = Some(Edit::Volume(*track, g.volume_at(*track, p.x)));
             }
+            Some(Drag::Track { from, y, moved }) => {
+                if (*y - p.y).abs() > DRAG_SLOP {
+                    *moved = true;
+                }
+                if *moved && tracks > 0 {
+                    // Above the lanes is the top; below the last, the bottom.
+                    let to = g.lane_at(p.y).unwrap_or(0).min(tracks - 1);
+                    out.live = Some(Edit::MoveTrack { from: *from, to });
+                }
+            }
             None => {}
         }
     }
 
     fn cursor(&self, ui: &egui::Ui, pointer: Option<Pos2>, g: &Geometry, song: &Song) {
         let icon = match &self.drag {
-            Some(Drag::Move { moved: true, .. } | Drag::Pan { .. }) => CursorIcon::Grabbing,
+            Some(
+                Drag::Move { moved: true, .. } | Drag::Track { moved: true, .. } | Drag::Pan { .. },
+            ) => CursorIcon::Grabbing,
             Some(Drag::Resize { .. }) => CursorIcon::ResizeHorizontal,
             Some(_) => return,
             None => match pointer.map(|p| g.hit(p, song)) {
@@ -1280,6 +1307,34 @@ mod tests {
             }],
             "starts on the beat it was clicked in"
         );
+    }
+
+    #[test]
+    fn dragging_a_header_moves_the_track() {
+        let mut h = Harness::new();
+        let grab = pos2(Harness::header(0).left() + 10.0, Harness::lane(0));
+        h.drag(grab, pos2(grab.x, Harness::lane(1)));
+        assert_eq!(h.lives().last(), Some(&Edit::MoveTrack { from: 0, to: 1 }));
+        assert_eq!(h.done(), 1, "one undo step");
+        assert!(h.edits().is_empty());
+
+        // Far below the last track is the bottom; above the lanes, the top.
+        let mut h = Harness::new();
+        h.drag(grab, pos2(grab.x, Harness::lane(5)));
+        assert_eq!(h.lives().last(), Some(&Edit::MoveTrack { from: 0, to: 1 }));
+        let mut h = Harness::new();
+        let low = pos2(grab.x, Harness::lane(1));
+        h.drag(low, pos2(grab.x, 5.0));
+        assert_eq!(h.lives().last(), Some(&Edit::MoveTrack { from: 1, to: 0 }));
+    }
+
+    #[test]
+    fn clicking_a_header_only_selects_its_track() {
+        let mut h = Harness::new();
+        h.click(pos2(Harness::header(1).left() + 10.0, Harness::lane(1)));
+        assert!(h.lives().is_empty());
+        assert_eq!(h.done(), 0);
+        assert_eq!(h.view.selected_track, 1);
     }
 
     #[test]

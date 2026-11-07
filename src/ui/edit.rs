@@ -39,6 +39,11 @@ pub enum Edit {
     AddTrack(usize),
     DuplicateTrack(usize),
     DeleteTrack(usize),
+    /// Move a track up or down, from one place to another.
+    MoveTrack {
+        from: usize,
+        to: usize,
+    },
     RenameTrack(usize, String),
     /// Make a track play another of the song's instruments.
     SetInstrument(usize, usize),
@@ -145,6 +150,13 @@ pub fn apply(song: &mut Song, edit: &Edit) -> Result<Select, String> {
             song.add_track(&name, instrument)
                 .map(Select::Track)
                 .ok_or_else(full)
+        }
+        Edit::MoveTrack { from, to } => {
+            if song.move_track(from, to) {
+                Ok(Select::Track(to))
+            } else {
+                Err(no_track())
+            }
         }
         Edit::DuplicateTrack(t) => song.duplicate_track(t).map(Select::Track).ok_or_else(full),
         Edit::DeleteTrack(t) => {

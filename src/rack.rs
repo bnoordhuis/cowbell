@@ -558,6 +558,17 @@ impl Rack {
         self.version += 1;
     }
 
+    /// Renumber the track devices for track `from` moving to `to`, the
+    /// ones in between shifting over. Devices and cables stay as they are.
+    pub fn move_track(&mut self, from: usize, to: usize) {
+        for d in &mut self.devices {
+            if let Kind::Track(t) = &mut d.kind {
+                *t = moved_index(*t, from, to);
+            }
+        }
+        self.version += 1;
+    }
+
     /// A track's effects chain: the audio effects its sound goes through
     /// on the way to a mixer or the master, in order, following the first
     /// cable out of each audio output.
@@ -644,6 +655,19 @@ impl Rack {
                 .retain(|c| c.from.device != id && c.to.device != id);
             self.version += 1;
         }
+    }
+}
+
+/// Where index `i` ends up when the item at `from` moves to `to`.
+pub fn moved_index(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < to && (from + 1..=to).contains(&i) {
+        i - 1
+    } else if to < from && (to..from).contains(&i) {
+        i + 1
+    } else {
+        i
     }
 }
 

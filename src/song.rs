@@ -538,6 +538,19 @@ impl Song {
         Some(t)
     }
 
+    /// Move a track up or down to `to`, the ones in between shifting over.
+    /// Its rack device goes with it.
+    pub fn move_track(&mut self, from: usize, to: usize) -> bool {
+        let n = self.tracks.len();
+        if from >= n || to >= n {
+            return false;
+        }
+        let track = self.tracks.remove(from);
+        self.tracks.insert(to, track);
+        self.rack.move_track(from, to);
+        true
+    }
+
     pub fn delete_track(&mut self, track: usize) -> bool {
         if track >= self.tracks.len() {
             return false;
@@ -742,6 +755,32 @@ mod tests {
         while song.add_track("more", 0).is_some() {}
         assert_eq!(song.tracks.len(), MAX_TRACKS);
         assert_eq!(song.duplicate_track(0), None);
+    }
+
+    #[test]
+    fn tracks_move_with_their_rack_devices() {
+        let names = |s: &Song| s.tracks.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        let mut song = Song::new(
+            120.0,
+            Vec::new(),
+            ["a", "b", "c", "d"].map(|n| Track::new(n, 0)).to_vec(),
+        );
+        for t in 0..4 {
+            song.set_volume(t, t as f32 / 10.0);
+        }
+        assert!(song.move_track(0, 2));
+        assert_eq!(names(&song), ["b", "c", "a", "d"]);
+        let volumes: Vec<f32> = (0..4).map(|t| song.volume(t)).collect();
+        assert_eq!(
+            volumes,
+            [0.1, 0.2, 0.0, 0.3],
+            "each device went with its track"
+        );
+        assert!(song.move_track(3, 0));
+        assert_eq!(names(&song), ["d", "b", "c", "a"]);
+        assert!(song.move_track(1, 1), "staying put is fine");
+        assert!(!song.move_track(0, 4));
+        assert!(!song.move_track(4, 0));
     }
 
     #[test]
