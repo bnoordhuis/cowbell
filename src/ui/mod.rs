@@ -86,6 +86,8 @@ enum Tab {
 enum Discard {
     New,
     Open(PathBuf),
+    /// Close the window.
+    Quit,
 }
 
 /// Slice detection for samples added from the browser.
@@ -196,10 +198,12 @@ struct App {
     dialog: Option<files::Dialog>,
     /// Asking whether to drop unsaved changes, and what for.
     confirm: Option<Discard>,
+    /// What to go on with once the project is saved under a name, when
+    /// "Save" in the unsaved-changes dialog needed one.
+    after_save: Option<Discard>,
     message: Option<String>,
-    /// Set after a close was cancelled because of unsaved changes; a second
-    /// close goes through.
-    close_armed: bool,
+    /// Set once closing is decided on, so the close request goes through.
+    quitting: bool,
     title: String,
     /// The song as it was when the current drag in the arrangement
     /// started, and whether the drag has changed anything yet.
@@ -248,7 +252,8 @@ impl App {
             dialog: None,
             confirm: None,
             message: None,
-            close_armed: false,
+            after_save: None,
+            quitting: false,
             title: String::new(),
             gesture: None,
             #[cfg(feature = "screenshot")]
@@ -277,6 +282,7 @@ impl App {
             Ok("open") => self.ask(files::Purpose::Open),
             Ok("save") => self.ask(files::Purpose::SaveAs),
             Ok("export") => self.ask(files::Purpose::Export),
+            Ok("quit") => self.confirm = Some(Discard::Quit),
             _ => {}
         }
     }
@@ -306,7 +312,6 @@ impl App {
         match project::save(&self.doc.song, &path) {
             Ok(()) => {
                 self.saved_revision = self.doc.revision;
-                self.close_armed = false;
                 self.say(format!("saved {}", path.display()));
                 self.path = Some(path);
             }
@@ -338,7 +343,6 @@ impl App {
         self.sent_revision = u64::MAX;
         self.rack_version = self.doc.song.rack.version.wrapping_add(1);
         self.saved_revision = self.doc.revision;
-        self.close_armed = false;
         self.arrange = arrange::ArrangeView::default();
         self.path = None;
     }
@@ -356,6 +360,24 @@ impl App {
                 self.say("new project");
             }
             Discard::Open(path) => self.open(path),
+            Discard::Quit => self.quitting = true,
+        }
+    }
+
+    /// Save, then do `what` if that worked. Without a file name yet, the
+    /// save dialog asks for one first.
+    fn save_then(&mut self, what: Discard) {
+        match self.path.clone() {
+            Some(path) => {
+                self.save(path);
+                if !self.unsaved() {
+                    self.discard_then(what, true);
+                }
+            }
+            None => {
+                self.after_save = Some(what);
+                self.ask(files::Purpose::SaveAs);
+            }
         }
     }
 
@@ -971,10 +993,18 @@ impl App {
         {
             let purpose = d.purpose;
             self.dialog = None;
+            let after_save = self.after_save.take();
             if let files::Answer::Chose(path) = answer {
                 match purpose {
                     files::Purpose::Open => self.discard_then(Discard::Open(path), false),
-                    files::Purpose::SaveAs => self.save(path),
+                    files::Purpose::SaveAs => {
+                        self.save(path);
+                        if let Some(what) = after_save
+                            && !self.unsaved()
+                        {
+                            self.discard_then(what, true);
+                        }
+                    }
                     files::Purpose::Export => self.export(path),
                 }
             }
@@ -982,29 +1012,43 @@ impl App {
         let Some(what) = &self.confirm else {
             return;
         };
-        let doing = match what {
-            Discard::New => "starting a new project".to_owned(),
-            Discard::Open(p) => format!("opening {}", p.display()),
+        let (question, discard) = match what {
+            Discard::New => (
+                "Save them before starting a new project?".to_owned(),
+                "Don't save",
+            ),
+            Discard::Open(p) => (
+                format!("Save them before opening {}?", p.display()),
+                "Don't save",
+            ),
+            Discard::Quit => (
+                "Save them before closing?".to_owned(),
+                "Close without saving",
+            ),
         };
-        let (mut yes, mut no) = (false, false);
+        let (mut save, mut discard_them, mut cancel) = (false, false, false);
         let modal = egui::Modal::new(egui::Id::unique("discard")).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading("Unsaved changes");
             ui.add_space(6.0);
             ui.label(format!(
-                "{} has changes that aren't saved. They're lost by {doing}.",
+                "{} has changes that aren't saved. {question}",
                 self.project_name().trim_end_matches(" *")
             ));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                yes = ui.button("Discard them").clicked();
-                no = ui.button("Cancel").clicked();
+                save = ui.button("Save").clicked();
+                discard_them = ui.button(discard).clicked();
+                cancel = ui.button("Cancel").clicked();
             });
         });
-        if yes {
+        if save {
+            let what = self.confirm.take().unwrap();
+            self.save_then(what);
+        } else if discard_them {
             let what = self.confirm.take().unwrap();
             self.discard_then(what, true);
-        } else if no || modal.should_close() {
+        } else if cancel || modal.should_close() {
             self.confirm = None;
         }
     }
@@ -1040,12 +1084,12 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.unsaved() && !self.close_armed {
+        if ctx.input(|i| i.viewport().close_requested()) && self.unsaved() && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.close_armed = true;
-            self.say(
-                "couldn't close: unsaved changes. Save from the File menu, or close again to discard them",
-            );
+            // Closing again while asking just asks again.
+            if self.dialog.is_none() {
+                self.confirm = Some(Discard::Quit);
+            }
         }
 
         let frame = |fill: Color32| egui::Frame::new().fill(fill);
@@ -1085,6 +1129,9 @@ impl eframe::App for App {
                 View::Rack => self.rack(ui),
             });
         self.dialogs(&ctx);
+        if self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         #[cfg(feature = "screenshot")]
         if let Some(s) = &mut self.screenshot {
