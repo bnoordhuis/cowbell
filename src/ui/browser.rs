@@ -113,6 +113,9 @@ impl Browser {
         if item(ui, "FM synth", "bells, pads, basses") {
             pick = Some(Pick::Synth(SynthKind::Fm));
         }
+        if item(ui, "Piano synth", "modelled strings, with a pedal") {
+            pick = Some(Pick::Synth(SynthKind::Piano));
+        }
 
         ui.add_space(14.0);
         heading(ui, "SAMPLES");

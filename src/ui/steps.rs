@@ -11,6 +11,10 @@
 //! the beat numbers to select whole steps; the window copies, cuts, pastes
 //! and clears them (see [`StepView::copy`]).
 //!
+//! Under a synth's piano roll is the sustain pedal: drag along it to hold
+//! the pedal down, drag over where it's down to let it up, and right-click
+//! where it's down to lift it and put it straight back (a pedal change).
+//!
 //! Like the arrangement, it doesn't change the song itself: it reports
 //! edits in its [`Output`].
 
@@ -25,7 +29,9 @@ use super::{color, knob};
 use crate::rack::{Curve, ParamSpec};
 use crate::sample::Sample;
 use crate::selection::{self, Selection, Steps};
-use crate::song::{Cell, ClipRef, Fx, Instrument, MAX_FX, Song, Trigger};
+use crate::song::{
+    Cell, ClipRef, Fx, Instrument, MAX_FX, PEDAL_CHANGE, PEDAL_DOWN, PEDAL_UP, Song, Trigger,
+};
 use crate::tuning::{HIGHEST_NOTE, LOWEST_NOTE, note_name};
 
 const HEADER: f32 = 20.0;
@@ -33,6 +39,9 @@ const LABEL_W: f32 = 100.0;
 const MIN_LANE: f32 = 16.0;
 const MAX_LANE: f32 = 30.0;
 const NOTE_LANE: f32 = 16.0;
+/// The sustain pedal's lane, under a piano roll, and the gap above it.
+const PEDAL_H: f32 = 18.0;
+const PEDAL_GAP: f32 = 6.0;
 /// How strongly the lane and step under the pointer light up.
 const HOVER_ALPHA: u8 = 9;
 const MIN_COL: f32 = 12.0;
@@ -142,6 +151,57 @@ enum Kind {
         velocity: u8,
         poly: bool,
     },
+    /// The pedal down (or up) from row `from` through `to`, either way.
+    Pedal { from: usize, to: usize, down: bool },
+}
+
+/// Where the pedal is down, row by row, and the rows where it's lifted and
+/// put straight back down.
+fn pedal_rows(cells: &[Cell]) -> (Vec<bool>, Vec<bool>) {
+    let mut down = vec![false; cells.len()];
+    let mut change = vec![false; cells.len()];
+    let mut now = false;
+    for (r, c) in cells.iter().enumerate() {
+        match c.pedal() {
+            Some(PEDAL_UP) => now = false,
+            Some(PEDAL_CHANGE) => {
+                change[r] = now;
+                now = true;
+            }
+            Some(_) => now = true,
+            None => {}
+        }
+        down[r] = now;
+    }
+    (down, change)
+}
+
+/// `cells` with their pedals set to match `down` and `change` (as
+/// [`pedal_rows`] gives them). A cell whose effect slots are full gives
+/// up its last one.
+fn with_pedal_rows(cells: &[Cell], down: &[bool], change: &[bool]) -> Vec<Cell> {
+    let mut out = cells.to_vec();
+    for (r, c) in out.iter_mut().enumerate() {
+        for f in &mut c.fx {
+            if matches!(f, Some(Fx::Pedal(_))) {
+                *f = None;
+            }
+        }
+        let before = r > 0 && down[r - 1];
+        let want = match (down[r], before) {
+            (true, false) => Some(PEDAL_DOWN),
+            (true, true) if change[r] => Some(PEDAL_CHANGE),
+            (false, true) => Some(PEDAL_UP),
+            _ => None,
+        };
+        if let Some(p) = want {
+            if c.fx.iter().all(Option::is_some) {
+                c.fx[MAX_FX - 1] = None;
+            }
+            *c = c.with_fx(Fx::Pedal(p));
+        }
+    }
+    out
 }
 
 /// Whether clip `at` plays a synth: its lanes are notes, not slices.
@@ -228,6 +288,14 @@ fn hit_row(cells: &[Cell], synth: bool, poly: bool, v: u16, row: usize) -> Optio
 fn apply(base: &[Cell], kind: &Kind, velocity: u8) -> Vec<Cell> {
     let mut cells = base.to_vec();
     match kind {
+        &Kind::Pedal { from, to, down } => {
+            let (mut rows, mut change) = pedal_rows(base);
+            for r in from.min(to)..=from.max(to).min(rows.len().saturating_sub(1)) {
+                rows[r] = down;
+                change[r] = false;
+            }
+            cells = with_pedal_rows(base, &rows, &change);
+        }
         Kind::Paint(cells_at) => {
             for &(v, r) in cells_at {
                 // Join what's in the row, if there's room.
@@ -363,9 +431,30 @@ struct Geometry {
     first_col: usize,
     col_w: f32,
     rows: usize,
+    /// Synths have a pedal lane under the grid.
+    pedal: bool,
 }
 
 impl Geometry {
+    /// The pedal lane, labels and all, if there is one.
+    fn pedal_rect(&self) -> Option<Rect> {
+        self.pedal.then(|| {
+            let top = self.grid.top() + self.visible_lanes() as f32 * self.lane_h + PEDAL_GAP;
+            Rect::from_min_max(
+                pos2(self.labels.left(), top),
+                pos2(self.grid.right(), top + PEDAL_H),
+            )
+        })
+    }
+
+    /// The row of the pedal lane under `p`, if it's over it.
+    fn pedal_row(&self, p: Pos2) -> Option<usize> {
+        let r = self.pedal_rect()?;
+        let right = self.col_x(self.first_col + self.visible_cols());
+        (r.y_range().contains(p.y) && (self.grid.left()..right).contains(&p.x))
+            .then(|| self.cell_at(pos2(p.x, self.grid.top())).1)
+    }
+
     fn visible_lanes(&self) -> usize {
         ((self.grid.height() / self.lane_h).floor() as usize).min(self.lanes.len())
     }
@@ -589,6 +678,53 @@ impl StepView {
             p.rect_filled(band, 2.0, glow);
         }
 
+        // The pedal lane.
+        if let Some(lane) = g.pedal_rect() {
+            let label = Rect::from_min_size(lane.min, vec2(LABEL_W - 6.0, PEDAL_H)).shrink(1.0);
+            p.rect_filled(label, 2.0, CELL_A);
+            p.text(
+                label.left_center() + vec2(6.0, 0.0),
+                Align2::LEFT_CENTER,
+                "pedal",
+                small.clone(),
+                color::MUTED,
+            );
+            let hover_row = ui
+                .input(|i| i.pointer.hover_pos())
+                .and_then(|q| g.pedal_row(q).or_else(|| g.hovered(q).map(|(_, r)| r)));
+            let cell = |row: usize| {
+                Rect::from_min_size(pos2(g.col_x(row), lane.top()), vec2(g.col_w, PEDAL_H))
+                    .shrink(1.0)
+            };
+            for row in g.first_col..g.first_col + cols {
+                let even = (row / rpb).is_multiple_of(2);
+                p.rect_filled(cell(row), 2.0, if even { CELL_A } else { CELL_B });
+                if hover_row == Some(row) {
+                    p.rect_filled(cell(row), 2.0, Color32::from_white_alpha(HOVER_ALPHA));
+                }
+            }
+            // Where it's down: a bar per press, broken at each change.
+            let (down, change) = pedal_rows(&cells);
+            let shown = g.first_col..g.first_col + cols;
+            let mut row = 0;
+            while row < down.len() {
+                if !down[row] {
+                    row += 1;
+                    continue;
+                }
+                let start = row;
+                row += 1;
+                while row < down.len() && down[row] && !change[row] {
+                    row += 1;
+                }
+                let (a, b) = (start.max(shown.start), (row - 1).min(shown.end - 1));
+                if a <= b {
+                    let bar = cell(a).union(cell(b)).shrink2(vec2(0.0, 3.0));
+                    p.rect_filled(bar, 3.0, color.gamma_multiply(0.8));
+                }
+            }
+        }
+
         // Hits.
         let above = |p: &egui::Painter, row: usize, up: bool| {
             // A hit out of view: a small arrow at the edge of its column.
@@ -708,9 +844,10 @@ impl StepView {
             pos2(area.left() + 8.0, top),
             pos2(area.left() + 8.0 + LABEL_W, area.bottom() - 6.0),
         );
+        let pedal = if synth { PEDAL_H + PEDAL_GAP } else { 0.0 };
         let grid = Rect::from_min_max(
             pos2(labels.right(), top),
-            pos2(area.right() - 8.0, area.bottom() - 6.0),
+            pos2(area.right() - 8.0, area.bottom() - 6.0 - pedal),
         );
 
         let lanes: Vec<u16> = if synth {
@@ -769,6 +906,7 @@ impl StepView {
             first_col: self.col_scroll,
             col_w,
             rows,
+            pedal: synth,
         }
     }
 
@@ -820,7 +958,19 @@ impl StepView {
                     g.grid.top(),
                 ),
             );
-            if g.labels.contains(p) {
+            if let Some(row) = g.pedal_row(p) {
+                self.selection = None;
+                let down = !pedal_rows(cells).0[row];
+                self.gesture = Some(Gesture {
+                    clip: at,
+                    base: cells.to_vec(),
+                    kind: Kind::Pedal {
+                        from: row,
+                        to: row,
+                        down,
+                    },
+                });
+            } else if g.labels.contains(p) {
                 let lane = g.cell_at(p).0;
                 if g.lane_y(lane).is_some_and(|y| p.y < y + g.lane_h) {
                     out.audition = Some((instrument, g.lanes[lane]));
@@ -892,6 +1042,7 @@ impl StepView {
                 let (lane, row) = g.cell_at(p);
                 let v = g.lanes[lane];
                 match &mut gs.kind {
+                    Kind::Pedal { to, .. } => *to = row,
                     Kind::Paint(cells_at) => {
                         if cells_at.last() != Some(&(v, row)) {
                             cells_at.push((v, row));
@@ -905,7 +1056,7 @@ impl StepView {
                     }
                     Kind::Note { start, end, .. } => *end = row.max(*start),
                 }
-                if !matches!(gs.kind, Kind::Note { .. }) {
+                if !matches!(gs.kind, Kind::Note { .. } | Kind::Pedal { .. }) {
                     self.cursor = Some(row);
                 }
             }
@@ -919,6 +1070,19 @@ impl StepView {
             }
         } else if !down {
             self.gesture = None;
+        }
+
+        // Right-click where the pedal's down for a pedal change there.
+        if response.secondary_clicked()
+            && let Some(row) = hover.and_then(|p| g.pedal_row(p))
+        {
+            let (down, mut change) = pedal_rows(cells);
+            if row > 0 && down[row] && down[row - 1] {
+                end_wheel(self, out);
+                change[row] = !change[row];
+                out.edits
+                    .push(Edit::SetCells(at, with_pedal_rows(cells, &down, &change)));
+            }
         }
 
         // Right-click a hit to roll it.
@@ -1121,9 +1285,12 @@ fn draw_hit_marks(p: &egui::Painter, r: Rect, cell: &Cell, reverse: Option<bool>
             Stroke::NONE,
         ));
     }
-    let other = cell
-        .fx()
-        .any(|f| !matches!(f, Fx::Retrig(_) | Fx::Reverse | Fx::Cut(_) | Fx::Chord(_)));
+    let other = cell.fx().any(|f| {
+        !matches!(
+            f,
+            Fx::Retrig(_) | Fx::Reverse | Fx::Cut(_) | Fx::Chord(_) | Fx::Pedal(_)
+        )
+    });
     if other {
         p.circle_filled(r.right_top() + vec2(-3.5, 3.5), 2.2, color::ACCENT);
     }
@@ -1162,12 +1329,89 @@ mod tests {
             first_col: 2,
             col_w: 20.0,
             rows: 16,
+            pedal: true,
         };
         assert_eq!(g.hovered(pos2(105.0, 5.0)), Some((1, 2)));
         assert_eq!(g.hovered(pos2(195.0, 35.0)), Some((4, 6)));
         assert_eq!(g.hovered(pos2(50.0, 5.0)), None, "a lane's name");
         assert_eq!(g.hovered(pos2(105.0, 45.0)), None, "below the lanes");
         assert_eq!(g.hovered(pos2(205.0, 5.0)), None, "past the rows");
+        // The pedal lane: under the 4 lanes shown, after a gap.
+        let y = 40.0 + PEDAL_GAP + PEDAL_H / 2.0;
+        assert_eq!(g.pedal_row(pos2(105.0, y)), Some(2));
+        assert_eq!(g.pedal_row(pos2(50.0, y)), None, "its name");
+        assert_eq!(g.pedal_row(pos2(105.0, 35.0)), None, "the lanes");
+    }
+
+    fn pedals(cells: &[Cell]) -> Vec<Option<u8>> {
+        cells.iter().map(Cell::pedal).collect()
+    }
+
+    #[test]
+    fn dragging_along_the_pedal_lane_puts_it_down_and_up() {
+        let base = cells(8);
+        let down = |from, to| Kind::Pedal {
+            from,
+            to,
+            down: true,
+        };
+        let c = apply(&base, &down(5, 2), 100);
+        let d = PEDAL_DOWN;
+        assert_eq!(
+            pedals(&c),
+            [None, None, Some(d), None, None, None, Some(PEDAL_UP), None]
+        );
+        // Up in the middle splits it in two.
+        let up = Kind::Pedal {
+            from: 3,
+            to: 3,
+            down: false,
+        };
+        let c = apply(&c, &up, 100);
+        assert_eq!(
+            pedals(&c),
+            [
+                None,
+                None,
+                Some(d),
+                Some(PEDAL_UP),
+                Some(d),
+                None,
+                Some(PEDAL_UP),
+                None
+            ]
+        );
+        // Down again over the gap joins them, and down to the end needs no up.
+        let c = apply(&c, &down(3, 7), 100);
+        assert_eq!(
+            pedals(&c),
+            [None, None, Some(d), None, None, None, None, None]
+        );
+    }
+
+    #[test]
+    fn a_pedal_change_survives_and_full_effect_slots_make_room() {
+        let mut base = cells(6);
+        base[3] = Cell::hit(60, 100)
+            .with_fx(Fx::Glide(4))
+            .with_fx(Fx::Chord(0x47));
+        let (mut down, mut change) = pedal_rows(&base);
+        down[1..5].fill(true);
+        change[3] = true;
+        let c = with_pedal_rows(&base, &down, &change);
+        assert_eq!(
+            pedals(&c),
+            [
+                None,
+                Some(PEDAL_DOWN),
+                None,
+                Some(PEDAL_CHANGE),
+                None,
+                Some(PEDAL_UP)
+            ]
+        );
+        assert_eq!(c[3].fx[0], Some(Fx::Glide(4)), "kept the first");
+        assert_eq!(pedal_rows(&c), (down, change), "reads back the same");
     }
 
     #[test]
@@ -1419,6 +1663,27 @@ mod tests {
                 self.frame(vec![]);
             }
 
+            /// The middle of the pedal lane over `row`.
+            fn pedal(&mut self, row: usize) -> Pos2 {
+                let cells = self.song.tracks[0].clips[0].cells.clone();
+                let g = self.view.layout((0, 0), &cells, SCREEN, true, None);
+                pos2(
+                    g.col_x(row) + g.col_w / 2.0,
+                    g.pedal_rect().expect("a pedal lane").center().y,
+                )
+            }
+
+            fn right_click(&mut self, pos: Pos2) {
+                for pressed in [true, false] {
+                    self.frame(vec![Event::PointerButton {
+                        pos,
+                        button: PointerButton::Secondary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    }]);
+                }
+            }
+
             fn cells(&self) -> &[Cell] {
                 &self.song.tracks[0].clips[0].cells
             }
@@ -1596,6 +1861,34 @@ mod tests {
             h.drag(&[e]);
             assert_eq!(spans(h.cells(), true), [span(60, 2, 5), span(64, 2, 2)]);
             assert!(h.cells().iter().all(|c| !has_cut(c)));
+        }
+
+        #[test]
+        fn the_pedal_lane_puts_the_pedal_down_and_changes_it() {
+            let mut h = Harness::new(true);
+            let pedals = |h: &Harness| h.cells().iter().map(Cell::pedal).collect::<Vec<_>>();
+            let (a, b) = (h.pedal(2), h.pedal(9));
+            h.drag(&[a, b]);
+            let mut want = vec![None; 16];
+            want[2] = Some(PEDAL_DOWN);
+            want[10] = Some(PEDAL_UP);
+            assert_eq!(pedals(&h), want);
+            assert!(h.triggers().iter().all(Option::is_none), "no notes");
+            let c = h.pedal(6);
+            h.right_click(c);
+            want[6] = Some(PEDAL_CHANGE);
+            assert_eq!(pedals(&h), want);
+            // Dragging where it's down lets it up.
+            let (a, b) = (h.pedal(5), h.pedal(6));
+            h.drag(&[a, b]);
+            want[5] = Some(PEDAL_UP);
+            want[6] = None;
+            want[7] = Some(PEDAL_DOWN);
+            assert_eq!(pedals(&h), want);
+            h.undo();
+            h.undo();
+            h.undo();
+            assert_eq!(pedals(&h), vec![None; 16]);
         }
 
         #[test]

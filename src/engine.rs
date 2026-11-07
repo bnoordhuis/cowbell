@@ -15,7 +15,10 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use crate::graph::{BLOCK, Graph};
 use crate::rack::DeviceId;
 use crate::sample::Sample;
-use crate::song::{Cell, Fx, Instrument, Song, TICKS_PER_BEAT, Target, Tick, Trigger};
+use crate::song::{
+    Cell, Fx, Instrument, PEDAL_CHANGE, PEDAL_DOWN, Song, TICKS_PER_BEAT, Target, Tick, Trigger,
+    pedal_at,
+};
 use crate::synthvoice::{MAX_CHORD, SynthTrack};
 use crate::voice::Voice;
 
@@ -171,7 +174,7 @@ impl Engine {
             started: [[0; VOICES]; MAX_TRACKS + 1],
             starts: 0,
             tails: Default::default(),
-            synths: Default::default(),
+            synths: std::array::from_fn(|_| SynthTrack::new(out_rate as f64)),
             graph,
             audition: vec![[0.0; 2]; BLOCK],
             preview: None,
@@ -366,12 +369,31 @@ impl Engine {
         let tracks = self.song.tracks.len().min(MAX_TRACKS);
         for t in 0..tracks {
             let track = &self.song.tracks[t];
+            let synth = &mut self.synths[t];
             let Some(clip) = track.clip_at(self.pos) else {
+                // The pedal goes up between clips.
+                if synth.pedal() {
+                    synth.set_pedal(false);
+                }
                 continue;
             };
             let Some(row) = clip.row_at(self.pos) else {
                 continue;
             };
+            // Worked out from the clip, rather than remembered, so it's
+            // right however playback got here. Before the row's notes, so
+            // they ring on after a change.
+            // Down when it already is (a clip starting again, say) is a
+            // change too.
+            let pedal = clip.cells[row].pedal();
+            if pedal == Some(PEDAL_CHANGE) || (pedal == Some(PEDAL_DOWN) && synth.pedal()) {
+                synth.change_pedal();
+            } else {
+                let down = pedal_at(&clip.cells, row);
+                if down != synth.pedal() {
+                    synth.set_pedal(down);
+                }
+            }
             let fpr = frames_per_row(self.out_rate, self.song.bpm, clip.rows_per_beat);
             let (cell, instrument, poly) = (clip.cells[row], track.instrument, track.poly);
             self.fire_cell(t, instrument, cell, fpr, poly);

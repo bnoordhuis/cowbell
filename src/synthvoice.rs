@@ -1,20 +1,23 @@
-//! Synth instruments: a 303-style acid voice and a two-operator FM voice.
+//! Synth instruments: a 303-style acid voice, a two-operator FM voice and
+//! a physically modelled piano (see [`crate::piano`]).
 //!
-//! Like sample voices, synth voices are monophonic, one per track. Notes
-//! hold until the next note on the track or a cut. A note that glides
-//! (`Fx::Glide`) into a held note slides its pitch without restarting the
-//! envelopes, which is the acid "slide".
+//! On a mono track, notes hold until the next note on the track or a cut.
+//! A note that glides (`Fx::Glide`) into a held note slides its pitch
+//! without restarting the envelopes, which is the acid "slide". While the
+//! sustain pedal is down, notes that are let go ring on until it comes up.
 
 use std::f64::consts::TAU;
 
 use serde::{Deserialize, Serialize};
 
+use crate::piano;
 use crate::rack::{Curve, ParamSpec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SynthKind {
     Acid,
     Fm,
+    Piano,
 }
 
 /// Indices into `SynthPatch::params`.
@@ -43,12 +46,13 @@ mod fm {
 }
 
 impl SynthKind {
-    pub const ALL: [SynthKind; 2] = [SynthKind::Acid, SynthKind::Fm];
+    pub const ALL: [SynthKind; 3] = [SynthKind::Acid, SynthKind::Fm, SynthKind::Piano];
 
     pub fn name(self) -> &'static str {
         match self {
             SynthKind::Acid => "acid",
             SynthKind::Fm => "fm",
+            SynthKind::Piano => "piano",
         }
     }
 
@@ -76,9 +80,22 @@ impl SynthKind {
             ParamSpec::new("detune", -50.0, 50.0, 0.0, Linear, "ct"),
             ParamSpec::new("volume", 0.0, 1.0, 0.5, Linear, ""),
         ];
+        // In the order of `piano::param`.
+        const PIANO: &[ParamSpec] = &[
+            ParamSpec::new("hammer", 0.0, 1.0, 0.5, Linear, ""),
+            ParamSpec::new("sustain", 0.1, 4.0, 1.0, Exp, "×"),
+            ParamSpec::new("damper", 30.0, 3000.0, 250.0, Exp, "ms"),
+            ParamSpec::new("unison", 0.0, 10.0, 1.5, Linear, "ct"),
+            ParamSpec::new("stiffness", 0.0, 3.0, 1.0, Linear, ""),
+            ParamSpec::new("body", 0.0, 1.0, 0.5, Linear, ""),
+            ParamSpec::new("resonance", 0.0, 1.0, 0.4, Linear, ""),
+            ParamSpec::new("width", 0.0, 1.0, 0.6, Linear, ""),
+            ParamSpec::new("volume", 0.0, 1.0, 0.5, Linear, ""),
+        ];
         match self {
             SynthKind::Acid => ACID,
             SynthKind::Fm => FM,
+            SynthKind::Piano => PIANO,
         }
     }
 }
@@ -178,6 +195,14 @@ pub struct SynthVoice {
     /// Output frames until the note is released.
     release_in: Option<f64>,
     hit: bool,
+    /// The sustain pedal is down: a note let go rings on.
+    pedal: bool,
+    /// Let go while the pedal was down: released when it comes up.
+    sustained: bool,
+    piano: piano::Voice,
+    /// The note the piano strings were last struck for; a new one (or a
+    /// glide, which a piano can't do) strikes them again.
+    struck: Option<f64>,
 }
 
 impl SynthVoice {
@@ -191,6 +216,26 @@ impl SynthVoice {
 
     pub fn stop(&mut self) {
         self.active = false;
+    }
+
+    /// Back to a silent, fresh voice, keeping the piano's strings (so
+    /// this never frees memory).
+    fn reset(&mut self) {
+        let piano = std::mem::take(&mut self.piano);
+        *self = SynthVoice::default();
+        self.piano = piano;
+    }
+
+    /// Let go now, unless the pedal holds it.
+    fn release(&mut self) {
+        if self.pedal {
+            self.sustained = true;
+        } else {
+            self.sustained = false;
+            if self.active {
+                self.stage = Stage::Release;
+            }
+        }
     }
 
     pub fn take_hit(&mut self) -> bool {
@@ -208,8 +253,12 @@ impl SynthVoice {
         rate: f64,
     ) {
         let v = velocity.min(127) as f32 / 127.0;
-        let held = self.active && self.stage != Stage::Release && self.instrument == instrument;
+        let held = self.active
+            && self.stage != Stage::Release
+            && !self.sustained
+            && self.instrument == instrument;
         self.release_in = None;
+        self.sustained = false;
         if glide_ms > 0.0 && held {
             self.target = freq;
             let frames = (glide_ms as f64 / 1000.0 * rate).max(1.0);
@@ -228,6 +277,7 @@ impl SynthVoice {
         self.velocity = v;
         self.accent = velocity > 100;
         self.hit = true;
+        self.struck = None;
     }
 
     /// Release the note after `frames` output frames.
@@ -256,10 +306,13 @@ impl SynthVoice {
         if let Some(r) = &mut self.release_in {
             if *r <= 0.0 {
                 self.release_in = None;
-                self.stage = Stage::Release;
+                self.release();
             } else {
                 *r -= 1.0;
             }
+        }
+        if patch.kind == SynthKind::Piano {
+            return self.piano(patch, rate);
         }
         if self.glide != 1.0 {
             self.freq *= self.glide;
@@ -276,12 +329,39 @@ impl SynthVoice {
         let s = match patch.kind {
             SynthKind::Acid => self.acid(patch, rate),
             SynthKind::Fm => self.fm(patch, rate),
+            SynthKind::Piano => unreachable!("rendered above"),
         };
         if self.stage == Stage::Release && self.amp < 1e-4 {
             self.active = false;
             self.stage = Stage::Off;
         }
         [s; 2]
+    }
+
+    fn piano(&mut self, patch: &Params, rate: f64) -> [f32; 2] {
+        if self.struck != Some(self.target) {
+            self.freq = self.target;
+            self.glide = 1.0;
+            if !self
+                .piano
+                .strike(self.freq, self.velocity, patch.values, rate)
+            {
+                self.active = false;
+                return [0.0; 2];
+            }
+            self.struck = Some(self.target);
+        }
+        if self.stage == Stage::Release {
+            self.piano.damp(patch.values, rate);
+        }
+        let [l, r] = self.piano.next_frame();
+        self.amp = self.piano.level();
+        if self.piano.is_done() {
+            self.active = false;
+            self.stage = Stage::Off;
+        }
+        let volume = patch.p(piano::param::VOLUME);
+        [l * volume, r * volume]
     }
 
     fn acid(&mut self, patch: &Params, rate: f64) -> f32 {
@@ -363,8 +443,9 @@ impl SynthVoice {
 /// Voices a mono track's chords share: room for a three-note chord plus
 /// the release of the one before. Bigger chords get as many as they need.
 pub const POLYPHONY: usize = 4;
-/// Voices per synth track, for poly tracks' notes to ring over each other.
-pub const VOICES: usize = 12;
+/// Voices per synth track, for poly tracks' notes (and pedalled piano
+/// notes) to ring over each other.
+pub const VOICES: usize = 16;
 /// Most notes one row can start: its notes, and their chord notes.
 pub const MAX_CHORD: usize = 8;
 
@@ -378,6 +459,11 @@ pub struct SynthTrack {
     /// Knob values set by automation, overriding the patch's; NaN where
     /// there's none.
     overrides: [f32; MAX_PARAMS],
+    pedal: bool,
+    /// The soundboard and sympathetic strings piano notes go through, and
+    /// the knob values of the piano last played.
+    body: piano::Body,
+    body_values: [f32; MAX_PARAMS],
 }
 
 impl Default for SynthTrack {
@@ -386,13 +472,50 @@ impl Default for SynthTrack {
             voices: Default::default(),
             held: [None; MAX_CHORD],
             overrides: [f32::NAN; MAX_PARAMS],
+            pedal: false,
+            body: piano::Body::default(),
+            body_values: [0.0; MAX_PARAMS],
         }
     }
 }
 
 impl SynthTrack {
+    /// A track with room for piano strings at `rate`. Without that (the
+    /// default), pianos stay silent.
+    pub fn new(rate: f64) -> Self {
+        let mut t = SynthTrack::default();
+        for v in &mut t.voices {
+            v.piano = piano::Voice::new(rate);
+        }
+        t.body = piano::Body::new(rate);
+        t
+    }
+
     pub fn is_active(&self) -> bool {
-        self.voices.iter().any(SynthVoice::is_active)
+        self.voices.iter().any(SynthVoice::is_active) || self.body.is_active()
+    }
+
+    pub fn pedal(&self) -> bool {
+        self.pedal
+    }
+
+    /// Put the sustain pedal down or let it up. Notes let go while it was
+    /// down are released when it comes up.
+    pub fn set_pedal(&mut self, down: bool) {
+        self.pedal = down;
+        for v in &mut self.voices {
+            v.pedal = down;
+            if !down && v.sustained {
+                v.release();
+            }
+        }
+    }
+
+    /// Let the pedal up and straight down again: what was ringing on
+    /// stops, the notes still held don't.
+    pub fn change_pedal(&mut self) {
+        self.set_pedal(false);
+        self.set_pedal(true);
     }
 
     pub fn active_voices(&self) -> usize {
@@ -404,6 +527,8 @@ impl SynthTrack {
         self.voices.iter_mut().for_each(SynthVoice::stop);
         self.held = [None; MAX_CHORD];
         self.overrides = [f32::NAN; MAX_PARAMS];
+        self.set_pedal(false);
+        self.body.silence();
     }
 
     /// Set knob `param` from automation, until the next stop.
@@ -441,7 +566,12 @@ impl SynthTrack {
         rate: f64,
     ) {
         let freqs = &freqs[..freqs.len().min(MAX_CHORD)];
-        let range = POLYPHONY.max(freqs.len() + 1).min(VOICES);
+        // With the pedal down, what's let go rings on: it needs room.
+        let range = if self.pedal {
+            VOICES
+        } else {
+            POLYPHONY.max(freqs.len() + 1).min(VOICES)
+        };
         let held = self.held;
         let mut next = [None; MAX_CHORD];
         if glide_ms > 0.0 && held.iter().any(Option::is_some) {
@@ -521,7 +651,8 @@ impl SynthTrack {
             .filter(open)
             .min_by(|&a, &b| self.voices[a].amp.total_cmp(&self.voices[b].amp))
             .unwrap_or(0);
-        self.voices[i] = SynthVoice::default();
+        self.voices[i].reset();
+        self.voices[i].pedal = self.pedal;
         i
     }
 
@@ -540,6 +671,7 @@ impl SynthTrack {
         rate: f64,
     ) -> [f32; 2] {
         let mut out = [0.0f32; 2];
+        let mut pianos = [0.0f32; 2];
         let mut values = [0.0f32; MAX_PARAMS];
         for v in self.voices.iter_mut().filter(|v| v.is_active()) {
             let Some(p) = patch(v.instrument) else {
@@ -558,7 +690,16 @@ impl SynthTrack {
                 },
                 rate,
             );
-            out = [out[0] + s[0], out[1] + s[1]];
+            if p.kind == SynthKind::Piano {
+                pianos = [pianos[0] + s[0], pianos[1] + s[1]];
+                self.body_values[..n].copy_from_slice(&values[..n]);
+            } else {
+                out = [out[0] + s[0], out[1] + s[1]];
+            }
+        }
+        if pianos != [0.0; 2] || self.body.is_active() {
+            let b = self.body.next_frame(pianos, &self.body_values, self.pedal);
+            out = [out[0] + b[0], out[1] + b[1]];
         }
         out
     }
@@ -583,7 +724,7 @@ mod tests {
 
     #[test]
     fn both_kinds_play_in_tune() {
-        for kind in SynthKind::ALL {
+        for kind in [SynthKind::Acid, SynthKind::Fm] {
             let mut patch = SynthPatch::new(kind, "t");
             if kind == SynthKind::Acid {
                 // Open the filter so the fundamental dominates.
@@ -601,7 +742,7 @@ mod tests {
 
     #[test]
     fn note_off_releases_to_silence() {
-        for kind in SynthKind::ALL {
+        for kind in [SynthKind::Acid, SynthKind::Fm] {
             let patch = SynthPatch::new(kind, "t");
             let mut v = SynthVoice::default();
             v.note_on(0, 110.0, 127, 0.0, RATE);
@@ -629,7 +770,7 @@ mod tests {
 
     #[test]
     fn output_stays_bounded() {
-        for kind in SynthKind::ALL {
+        for kind in [SynthKind::Acid, SynthKind::Fm] {
             let mut patch = SynthPatch::new(kind, "t");
             for (p, spec) in patch.params.iter_mut().zip(kind.params()) {
                 *p = spec.max;
@@ -729,6 +870,77 @@ mod tests {
         }
         let freqs: Vec<f64> = t.held.iter().flatten().map(|&v| t.voices[v].freq).collect();
         assert_eq!(freqs, vec![200.0, 300.0]);
+    }
+
+    fn piano_track() -> (SynthTrack, SynthPatch) {
+        (
+            SynthTrack::new(RATE),
+            SynthPatch::new(SynthKind::Piano, "piano"),
+        )
+    }
+
+    fn run(t: &mut SynthTrack, patch: &SynthPatch, frames: usize) -> f32 {
+        let mut sum = 0.0;
+        for _ in 0..frames {
+            let s = t.next_frame(|_| Some(patch), RATE);
+            sum += s[0] * s[0];
+        }
+        (sum / frames as f32).sqrt()
+    }
+
+    #[test]
+    fn the_piano_plays_on_a_track_and_dies_away() {
+        let (mut t, patch) = piano_track();
+        t.play(0, &[261.6], 100, Some(4800.0), RATE);
+        assert!(run(&mut t, &patch, 4800) > 0.01);
+        run(&mut t, &patch, 48_000 * 3);
+        assert!(!t.is_active(), "damped, and the body quiet");
+        let mut silent = SynthTrack::default();
+        silent.play(0, &[261.6], 100, None, RATE);
+        assert_eq!(run(&mut silent, &patch, 100), 0.0, "no room for strings");
+    }
+
+    #[test]
+    fn the_pedal_holds_notes_until_it_comes_up() {
+        let (mut t, patch) = piano_track();
+        t.set_pedal(true);
+        t.play(0, &[261.6], 100, Some(480.0), RATE);
+        run(&mut t, &patch, 9600);
+        assert_eq!(t.active_voices(), 1, "let go, but held by the pedal");
+        assert!(run(&mut t, &patch, 4800) > 0.003, "still ringing");
+        t.set_pedal(false);
+        run(&mut t, &patch, 48_000);
+        assert_eq!(t.active_voices(), 0, "damped once the pedal came up");
+    }
+
+    #[test]
+    fn a_pedal_change_stops_what_rang_on_but_not_held_notes() {
+        let (mut t, patch) = piano_track();
+        t.set_pedal(true);
+        t.play(0, &[261.6], 100, Some(480.0), RATE);
+        t.play(0, &[329.6], 100, None, RATE);
+        run(&mut t, &patch, 4800);
+        t.change_pedal();
+        assert!(t.pedal());
+        run(&mut t, &patch, 48_000);
+        assert_eq!(t.active_voices(), 1, "only the held note");
+    }
+
+    #[test]
+    fn mono_notes_ring_on_under_the_pedal() {
+        let (mut t, patch) = piano_track();
+        t.set_pedal(true);
+        for (k, f) in [220.0, 247.0, 262.0, 294.0, 330.0, 349.0]
+            .iter()
+            .enumerate()
+        {
+            t.note_on(0, &[*f], 100, 0.0, RATE);
+            run(&mut t, &patch, 2400);
+            assert_eq!(t.active_voices(), k + 1);
+        }
+        t.set_pedal(false);
+        run(&mut t, &patch, 48_000);
+        assert_eq!(t.active_voices(), 1, "the held note");
     }
 
     #[test]

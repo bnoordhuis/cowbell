@@ -46,6 +46,25 @@ pub enum Fx {
     /// Set the track's automation target (see [`Target`]) to `n/FF` of
     /// its range.
     Knob(u8),
+    /// Synths: the sustain pedal. [`PEDAL_UP`], [`PEDAL_DOWN`], or
+    /// [`PEDAL_CHANGE`]: up and straight back down, so what rang on stops
+    /// and this row's notes ring on. It stays as set until the next pedal
+    /// in the clip, or the clip's end.
+    Pedal(u8),
+}
+
+pub const PEDAL_UP: u8 = 0;
+pub const PEDAL_DOWN: u8 = 1;
+pub const PEDAL_CHANGE: u8 = 2;
+
+/// Whether the sustain pedal is down at `row` of a clip of `cells`, by its
+/// last pedal at or before `row`.
+pub fn pedal_at(cells: &[Cell], row: usize) -> bool {
+    cells[..=row.min(cells.len().saturating_sub(1))]
+        .iter()
+        .rev()
+        .find_map(Cell::pedal)
+        .is_some_and(|p| p != PEDAL_UP)
 }
 
 /// The knob a track's `Knob` effects turn.
@@ -171,6 +190,14 @@ impl Cell {
             *slot = Some(fx);
         }
         self
+    }
+
+    /// The cell's pedal, if it has one.
+    pub fn pedal(&self) -> Option<u8> {
+        self.fx().find_map(|f| match f {
+            Fx::Pedal(p) => Some(p),
+            _ => None,
+        })
     }
 
     pub fn fx(&self) -> impl Iterator<Item = Fx> + '_ {
@@ -781,6 +808,18 @@ mod tests {
         assert!(song.move_track(1, 1), "staying put is fine");
         assert!(!song.move_track(0, 4));
         assert!(!song.move_track(4, 0));
+    }
+
+    #[test]
+    fn the_pedal_is_whatever_the_last_one_before_said() {
+        let mut cells = vec![Cell::default(); 8];
+        assert!(!pedal_at(&cells, 3), "up when there's none");
+        cells[2] = Cell::default().with_fx(Fx::Pedal(PEDAL_DOWN));
+        cells[5] = Cell::hit(60, 100).with_fx(Fx::Pedal(PEDAL_UP));
+        cells[6] = Cell::default().with_fx(Fx::Pedal(PEDAL_CHANGE));
+        let at: Vec<bool> = (0..8).map(|r| pedal_at(&cells, r)).collect();
+        assert_eq!(at, [false, false, true, true, true, false, true, true]);
+        assert!(pedal_at(&cells, 99), "past the end: the last one");
     }
 
     #[test]
