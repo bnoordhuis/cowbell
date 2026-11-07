@@ -138,6 +138,69 @@ impl From<CellFile> for Cell {
     }
 }
 
+impl From<&Clip> for ClipFile {
+    fn from(c: &Clip) -> Self {
+        ClipFile {
+            start: c.start,
+            rows_per_beat: c.rows_per_beat,
+            rows: c.cells.len(),
+            cells: c
+                .cells
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c != Cell::default())
+                .map(|(row, c)| (row, CellFile::from(c)))
+                .collect(),
+        }
+    }
+}
+
+impl From<ClipFile> for Clip {
+    fn from(c: ClipFile) -> Self {
+        let mut clip = Clip::new(c.start, nearest_resolution(c.rows_per_beat), c.rows);
+        for (row, cell) in c.cells {
+            if let Some(slot) = clip.cells.get_mut(row) {
+                *slot = cell.into();
+            }
+        }
+        clip
+    }
+}
+
+/// A clip on the clipboard, as text, so it pastes into another cowbell too.
+#[derive(Serialize, Deserialize)]
+struct ClipboardFile {
+    cowbell_clip: u32,
+    clip: ClipFile,
+}
+
+/// The most rows a pasted clip may have: 64 bars at the finest grid.
+const MAX_PASTED_ROWS: usize = 64 * 4 * 64;
+
+/// A clip as clipboard text. It starts at 0; pasting puts it somewhere.
+pub fn clip_to_text(clip: &Clip) -> String {
+    let file = ClipboardFile {
+        cowbell_clip: FORMAT,
+        clip: ClipFile {
+            start: 0,
+            ..ClipFile::from(clip)
+        },
+    };
+    ron::ser::to_string(&file).unwrap_or_default()
+}
+
+/// The clip in clipboard text, if it holds one.
+pub fn clip_from_text(text: &str) -> Option<Clip> {
+    let file: ClipboardFile = ron::from_str(text.trim()).ok()?;
+    if file.clip.rows == 0 || file.clip.rows > MAX_PASTED_ROWS {
+        return None;
+    }
+    Some(Clip {
+        start: 0,
+        ..file.clip.into()
+    })
+}
+
 /// The folder for a project's own samples: `song.cowbell` → `song.samples`.
 pub fn samples_dir(project: &Path) -> PathBuf {
     project.with_extension("samples")
@@ -218,22 +281,7 @@ pub fn save(song: &Song, path: &Path) -> Result<(), String> {
             solo: t.solo,
             poly: t.poly,
             automation: t.automation,
-            clips: t
-                .clips
-                .iter()
-                .map(|c| ClipFile {
-                    start: c.start,
-                    rows_per_beat: c.rows_per_beat,
-                    rows: c.cells.len(),
-                    cells: c
-                        .cells
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| **c != Cell::default())
-                        .map(|(row, c)| (row, CellFile::from(c)))
-                        .collect(),
-                })
-                .collect(),
+            clips: t.clips.iter().map(ClipFile::from).collect(),
         })
         .collect();
 
@@ -316,14 +364,8 @@ pub fn load(path: &Path) -> Result<Song, String> {
             track.poly = t.poly;
             track.automation = t.automation;
             for c in t.clips {
-                let mut clip = Clip::new(c.start, nearest_resolution(c.rows_per_beat), c.rows);
-                for (row, cell) in c.cells {
-                    if let Some(slot) = clip.cells.get_mut(row) {
-                        *slot = cell.into();
-                    }
-                }
                 // An overlapping or empty clip can't play; drop it.
-                let _ = track.insert(clip);
+                let _ = track.insert(c.into());
             }
             track
         })
@@ -512,5 +554,22 @@ mod tests {
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.rack.cables.len(), n);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clips_go_through_the_clipboard_as_text() {
+        let mut clip = Clip::beats(5 * 192, 4, 2);
+        clip.cells[1] = Cell::hit(3, 90).with_note(Trigger::new(5, 40));
+        clip.cells[6] = Cell::hit(1, 127).with_fx(Fx::Cut(4));
+        let text = clip_to_text(&clip);
+        let back = clip_from_text(&format!("  {text}\n")).unwrap();
+        assert_eq!(back.start, 0, "pasting decides where");
+        assert_eq!(back.cells, clip.cells);
+        assert_eq!(back.rows_per_beat, 4);
+        assert_eq!(clip_from_text("hello"), None);
+        assert_eq!(clip_from_text(""), None);
+        let empty = text.replace("rows:8", "rows:0");
+        assert_ne!(empty, text);
+        assert_eq!(clip_from_text(&empty), None);
     }
 }

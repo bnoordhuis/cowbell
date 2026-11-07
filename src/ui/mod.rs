@@ -25,7 +25,7 @@ use crate::engine::{Command, Controller, Engine};
 use crate::graph::Graph;
 use crate::project;
 use crate::sample::Sample;
-use crate::song::{Instrument, Song, TICKS_PER_BAR, TRACK_VOLUME, Target, Tick, Track};
+use crate::song::{Clip, Instrument, Song, TICKS_PER_BAR, TRACK_VOLUME, Target, Tick, Track};
 use crate::synthvoice::SynthPatch;
 use edit::{Edit, Select, apply};
 
@@ -88,6 +88,54 @@ enum Discard {
     Open(PathBuf),
     /// Close the window.
     Quit,
+}
+
+/// An editing shortcut pressed.
+#[derive(Debug, PartialEq)]
+enum Shortcut {
+    Undo,
+    Redo,
+    Copy,
+    Cut,
+    /// With the clipboard's text.
+    Paste(String),
+}
+
+const UNDO: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::Z);
+const REDO: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
+    egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+    Key::Z,
+);
+/// Redo as on Windows, and in many Linux programs.
+const REDO_Y: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::Y);
+const COPY: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::C);
+const CUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::X);
+const PASTE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::V);
+
+/// Take this frame's editing shortcuts out of the input, so no widget acts
+/// on them too. Copy, cut and paste arrive as their own events (egui turns
+/// the keys into those); undo and redo as keys.
+fn take_shortcuts(i: &mut egui::InputState) -> Vec<Shortcut> {
+    let mut out = Vec::new();
+    // Redo first: it's undo's key with shift added.
+    while i.consume_shortcut(&REDO) || i.consume_shortcut(&REDO_Y) {
+        out.push(Shortcut::Redo);
+    }
+    while i.consume_shortcut(&UNDO) {
+        out.push(Shortcut::Undo);
+    }
+    i.events.retain(|e| {
+        let s = match e {
+            egui::Event::Copy => Shortcut::Copy,
+            egui::Event::Cut => Shortcut::Cut,
+            egui::Event::Paste(text) => Shortcut::Paste(text.clone()),
+            _ => return true,
+        };
+        out.push(s);
+        false
+    });
+    out
 }
 
 /// Slice detection for samples added from the browser.
@@ -198,6 +246,9 @@ struct App {
     dialog: Option<files::Dialog>,
     /// Asking whether to drop unsaved changes, and what for.
     confirm: Option<Discard>,
+    /// The clip last copied or cut, for the Edit menu's Paste. (The
+    /// system clipboard has it too, as text, for Ctrl+V.)
+    clipboard: Option<Clip>,
     /// What to go on with once the project is saved under a name, when
     /// "Save" in the unsaved-changes dialog needed one.
     after_save: Option<Discard>,
@@ -253,6 +304,7 @@ impl App {
             confirm: None,
             message: None,
             after_save: None,
+            clipboard: None,
             quitting: false,
             title: String::new(),
             gesture: None,
@@ -593,17 +645,31 @@ impl App {
             }
         });
         ui.menu_button("Edit", |ui| {
-            if ui
-                .add_enabled(self.doc.can_undo(), egui::Button::new("Undo"))
-                .clicked()
-            {
+            let ctx = ui.ctx().clone();
+            let item = |ui: &mut egui::Ui, on: bool, name: &str, key: &egui::KeyboardShortcut| {
+                let button = egui::Button::new(name).shortcut_text(ctx.format_shortcut(key));
+                ui.add_enabled(on, button).clicked()
+            };
+            if item(ui, self.doc.can_undo(), "Undo", &UNDO) {
                 self.undo(false);
             }
-            if ui
-                .add_enabled(self.doc.can_redo(), egui::Button::new("Redo"))
-                .clicked()
-            {
+            if item(ui, self.doc.can_redo(), "Redo", &REDO) {
                 self.undo(true);
+            }
+            ui.separator();
+            let clip = self.copyable();
+            if item(ui, clip.is_some(), "Cut clip", &CUT) {
+                self.cut(&ctx);
+            }
+            if item(ui, clip.is_some(), "Copy clip", &COPY) {
+                self.copy(&ctx);
+            }
+            let pasteable = self.clipboard.is_some()
+                && self.arrange.selected_track < self.doc.song.tracks.len();
+            if item(ui, pasteable, "Paste clip", &PASTE)
+                && let Some(clip) = self.clipboard.clone()
+            {
+                self.paste(clip);
             }
         });
     }
@@ -773,13 +839,14 @@ impl App {
         self.devices.end_wheel();
     }
 
-    /// Make an edit as one undo step.
-    fn edit(&mut self, edit: Edit) {
+    /// Make an edit as one undo step. Returns whether it could be made.
+    fn edit(&mut self, edit: Edit) -> bool {
         if edit.is_mixing() {
-            if apply(&mut self.doc.song, &edit).is_ok() {
+            let ok = apply(&mut self.doc.song, &edit).is_ok();
+            if ok {
                 self.doc.changed();
             }
-            return;
+            return ok;
         }
         let before = self.doc.song.clone();
         match apply(&mut self.doc.song, &edit) {
@@ -787,11 +854,77 @@ impl App {
                 self.doc.record(before);
                 self.select(select);
                 self.knob_to_engine(&edit);
+                true
             }
             Err(why) => {
                 self.doc.song = before;
                 self.say(why);
+                false
             }
+        }
+    }
+
+    fn shortcut(&mut self, ctx: &egui::Context, shortcut: Shortcut) {
+        match shortcut {
+            Shortcut::Undo => self.undo(false),
+            Shortcut::Redo => self.undo(true),
+            Shortcut::Copy => {
+                self.copy(ctx);
+            }
+            Shortcut::Cut => self.cut(ctx),
+            Shortcut::Paste(text) => match project::clip_from_text(&text) {
+                Some(clip) => self.paste(clip),
+                None => self.say("nothing to paste: copy a clip first"),
+            },
+        }
+    }
+
+    /// The selected clip, if there is one to copy.
+    fn copyable(&self) -> Option<crate::song::ClipRef> {
+        self.arrange
+            .selected_clip
+            .filter(|&c| self.doc.song.clip(c).is_some())
+    }
+
+    /// Copy the selected clip, to the system clipboard too. Returns it.
+    fn copy(&mut self, ctx: &egui::Context) -> Option<crate::song::ClipRef> {
+        let Some(at) = self.copyable() else {
+            self.say("select a clip to copy");
+            return None;
+        };
+        let clip = self.doc.song.clip(at)?.clone();
+        ctx.copy_text(project::clip_to_text(&clip));
+        self.clipboard = Some(clip);
+        self.say("copied the clip: Ctrl+V pastes it at the playhead");
+        Some(at)
+    }
+
+    fn cut(&mut self, ctx: &egui::Context) {
+        self.finish_gesture();
+        if let Some(at) = self.copy(ctx)
+            && self.edit(Edit::DeleteClip(at))
+        {
+            self.say("cut the clip: Ctrl+V pastes it at the playhead");
+        }
+    }
+
+    /// Paste a clip on the selected track, at the playhead (on the snap
+    /// grid). When stopped, the playhead moves to the clip's end, so
+    /// pasting again carries on from there.
+    fn paste(&mut self, clip: Clip) {
+        self.finish_gesture();
+        let track = self.arrange.selected_track;
+        if track >= self.doc.song.tracks.len() {
+            self.say("add a track to paste into");
+            return;
+        }
+        let snap = self.arrange.snap.max(1);
+        let start = self.controller.position() / snap * snap;
+        let end = start + clip.len();
+        if self.edit(Edit::PasteClip(track, Clip { start, ..clip }))
+            && !self.controller.is_playing()
+        {
+            let _ = self.controller.send(Command::Locate(end));
         }
     }
 
@@ -1080,6 +1213,11 @@ impl eframe::App for App {
         {
             self.play_or_stop();
         }
+        if self.dialog.is_none() && self.confirm.is_none() && !ctx.egui_wants_keyboard_input() {
+            for s in ctx.input_mut(take_shortcuts) {
+                self.shortcut(&ctx, s);
+            }
+        }
         self.sync_engine();
 
         let title = format!("{} - cowbell", self.project_name());
@@ -1161,5 +1299,50 @@ mod tests {
     fn the_browser_starts_somewhere_sensible() {
         // Tests run from the source tree, which has the built-in samples.
         assert_eq!(samples_folder(None), Path::new("assets/drums"));
+    }
+
+    #[test]
+    fn editing_shortcuts_are_taken_from_the_input() {
+        let ctx = egui::Context::default();
+        let key = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let ctrl = egui::Modifiers::COMMAND;
+        let ctrl_shift = ctrl.plus(egui::Modifiers::SHIFT);
+        let input = egui::RawInput {
+            events: vec![
+                key(Key::Z, ctrl),
+                key(Key::Z, ctrl_shift),
+                key(Key::Y, ctrl),
+                key(Key::Z, egui::Modifiers::NONE),
+                egui::Event::Copy,
+                egui::Event::Cut,
+                egui::Event::Paste("clip".into()),
+            ],
+            ..Default::default()
+        };
+        let mut taken = Vec::new();
+        let mut left = 0;
+        let mut full = ctx.run_ui(input, |ui| {
+            taken = ui.ctx().input_mut(take_shortcuts);
+            left = ui.ctx().input(|i| i.events.len());
+        });
+        full.textures_delta.clear();
+        assert_eq!(
+            taken,
+            vec![
+                Shortcut::Redo,
+                Shortcut::Redo,
+                Shortcut::Undo,
+                Shortcut::Copy,
+                Shortcut::Cut,
+                Shortcut::Paste("clip".into())
+            ]
+        );
+        assert_eq!(left, 1, "a plain Z is left alone");
     }
 }

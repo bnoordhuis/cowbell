@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::engine::MAX_TRACKS;
 use crate::rack::{DeviceId, Kind};
-use crate::song::{Cell, ClipRef, Instrument, Song, Tick};
+use crate::song::{Cell, Clip, ClipRef, Instrument, Song, Tick};
 
 /// One change to the song.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,6 +29,8 @@ pub enum Edit {
     },
     DuplicateClip(ClipRef),
     DeleteClip(ClipRef),
+    /// Put a copy of a clip on a track, starting where the clip says.
+    PasteClip(usize, Clip),
     /// Replace a clip's cells; there must be as many as it has rows.
     SetCells(ClipRef, Vec<Cell>),
     /// Change a clip's grid, in rows per beat.
@@ -108,6 +110,12 @@ pub fn apply(song: &mut Song, edit: &Edit) -> Result<Select, String> {
         Edit::DeleteClip(clip) => {
             song.delete_clip(clip);
             Ok(Select::Track(clip.0))
+        }
+        Edit::PasteClip(track, ref clip) => {
+            let t = song.tracks.get_mut(track).ok_or_else(no_track)?;
+            t.insert(clip.clone())
+                .map(|i| Select::Clip((track, i)))
+                .map_err(|_| "can't paste there: there's a clip in the way".to_owned())
         }
         Edit::SetCells(at, ref cells) => {
             let clip = song
@@ -220,6 +228,26 @@ mod tests {
         let a = Track::new("a", 0).with_clip(Clip::beats(0, 4, 4));
         let b = Track::new("b", 0).with_clip(Clip::beats(0, 4, 4));
         Song::new(120.0, Vec::new(), vec![a, b])
+    }
+
+    #[test]
+    fn pasted_clips_land_where_they_say_if_theres_room() {
+        let mut s = song();
+        let mut clip = Clip::beats(192, 4, 2);
+        clip.cells[0] = Cell::hit(2, 90);
+        let paste = Edit::PasteClip(1, clip.clone());
+        assert!(
+            apply(&mut s, &paste).is_err(),
+            "the first clip is in the way"
+        );
+        let later = Clip {
+            start: 4 * 192,
+            ..clip
+        };
+        let paste = Edit::PasteClip(1, later.clone());
+        assert_eq!(apply(&mut s, &paste), Ok(Select::Clip((1, 1))));
+        assert_eq!(s.tracks[1].clips[1], later);
+        assert!(apply(&mut s, &Edit::PasteClip(7, later)).is_err());
     }
 
     #[test]
