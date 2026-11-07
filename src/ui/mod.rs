@@ -11,6 +11,7 @@ mod knob;
 mod rack;
 #[cfg(feature = "screenshot")]
 mod screenshot;
+mod settings;
 mod steps;
 mod track;
 
@@ -50,10 +51,6 @@ mod color {
     ];
 }
 
-/// How much bigger than egui's usual size everything is drawn: text,
-/// buttons, lanes and all. Ctrl+= and Ctrl+- change it while running.
-const ZOOM: f32 = 1.3;
-
 /// Open the window. `path` is where the project is saved; it needn't exist
 /// yet.
 pub fn run(song: Song, path: Option<PathBuf>) -> Result<(), String> {
@@ -69,8 +66,21 @@ pub fn run(song: Song, path: Option<PathBuf>) -> Result<(), String> {
         "cowbell",
         options,
         Box::new(|cc| {
-            cc.egui_ctx.set_zoom_factor(ZOOM);
-            Ok(Box::new(App::new(song, path)))
+            // How much bigger than egui's usual size everything is drawn:
+            // text, buttons, lanes and all. Ctrl+= and Ctrl+- change it, and
+            // it's remembered. Not for screenshots: they should come out the
+            // same whatever was used last.
+            #[cfg(feature = "screenshot")]
+            let settings_path =
+                settings::path().filter(|_| screenshot::Screenshot::from_env().is_none());
+            #[cfg(not(feature = "screenshot"))]
+            let settings_path = settings::path();
+            let zoom = settings::load(settings_path.as_deref()).zoom;
+            cc.egui_ctx.set_zoom_factor(zoom);
+            let mut app = App::new(song, path);
+            app.settings_path = settings_path;
+            app.saved_zoom = zoom;
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| e.to_string())
@@ -154,15 +164,24 @@ fn browser_strip(ui: &mut egui::Ui, open: bool) -> bool {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let text_color = if hovered { color::TEXT } else { color::MUTED };
-    let arrow = if open { "‹" } else { "›" };
+    // An upright chevron at the top, pointing the way the panel will go:
+    // out to the right when folded, back in when open.
+    let tip = egui::pos2(rect.center().x, rect.top() + 18.0);
+    let (dx, dy) = (if open { 3.5 } else { -3.5 }, 6.0);
+    let tip = tip + vec2(-dx, 0.0);
+    let stroke = egui::Stroke::new(2.0, text_color);
+    ui.painter()
+        .line_segment([tip + vec2(dx * 2.0, -dy), tip], stroke);
+    ui.painter()
+        .line_segment([tip, tip + vec2(dx * 2.0, dy)], stroke);
     let galley = ui.painter().layout_no_wrap(
-        format!("INSTRUMENTS · SAMPLES   {arrow}"),
+        "INSTRUMENTS · SAMPLES".to_owned(),
         FontId::proportional(13.0),
         text_color,
     );
     // Turned a quarter clockwise, the text runs down from its top-left
     // corner and its height lies to the left of it.
-    let at = egui::pos2(rect.center().x + galley.size().y / 2.0, rect.top() + 14.0);
+    let at = egui::pos2(rect.center().x + galley.size().y / 2.0, rect.top() + 38.0);
     ui.painter().add(
         egui::epaint::TextShape::new(at, galley, text_color)
             .with_angle(std::f32::consts::FRAC_PI_2),
@@ -317,6 +336,10 @@ struct App {
     browser: browser::Browser,
     /// Whether the browser is open, or folded into a strip at the side.
     browser_open: bool,
+    /// Where settings are kept (none: they aren't), and the zoom last
+    /// saved there.
+    settings_path: Option<PathBuf>,
+    saved_zoom: f32,
     dialog: Option<files::Dialog>,
     /// Asking whether to drop unsaved changes, and what for.
     confirm: Option<Discard>,
@@ -376,6 +399,8 @@ impl App {
             loop_memory,
             browser: browser::Browser::new(&samples_folder(path.as_deref())),
             browser_open: false,
+            settings_path: None,
+            saved_zoom: settings::Settings::default().zoom,
             dialog: None,
             confirm: None,
             message: None,
@@ -706,6 +731,20 @@ impl App {
         }
         if key(ctrl, Key::ArrowDown) {
             self.go_to_track(track + 1);
+        }
+    }
+
+    /// Save the zoom when Ctrl+= or Ctrl+- changed it, for next time.
+    fn remember_zoom(&mut self, ctx: &egui::Context) {
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.saved_zoom).abs() < 1e-4 {
+            return;
+        }
+        self.saved_zoom = zoom;
+        if let Some(path) = &self.settings_path
+            && let Err(e) = settings::save(path, &settings::Settings { zoom })
+        {
+            self.say(format!("couldn't save the zoom: {e}"));
         }
     }
 
@@ -1440,6 +1479,8 @@ impl eframe::App for App {
             }
         }
         self.sync_engine();
+
+        self.remember_zoom(&ctx);
 
         let title = format!("{} - cowbell", self.project_name());
         if title != self.title {
