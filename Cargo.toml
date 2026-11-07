@@ -10,8 +10,9 @@ license = "MIT OR Apache-2.0"
 default = ["ui"]
 # The UI. Implies live audio.
 ui = ["dep:eframe", "live"]
-# Live audio output via cpal. Needs ALSA headers (libasound2-dev) on Linux.
-live = ["dep:cpal"]
+# Live audio output via cpal, and MIDI input via midir. Needs ALSA headers
+# (libasound2-dev) on Linux.
+live = ["dep:cpal", "dep:midir"]
 # Dev only: COWBELL_SCREENSHOT=out.ppm saves a screenshot and exits. See
 # src/ui/screenshot.rs.
 screenshot = ["ui"]
@@ -26,6 +27,7 @@ eframe = { version = "=0.37.0", optional = true, default-features = false, featu
     "x11",
 ] }
 hound = "=3.5.1"
+midir = { version = "=0.11.1", optional = true }
 ron = "=0.12.3"
 rtrb = "=0.4.1"
 serde = { version = "=1.0.229", features = ["derive"] }

@@ -25,6 +25,7 @@ use crate::audio::{self, Output};
 use crate::document::Document;
 use crate::engine::{Command, Controller, Engine};
 use crate::graph::Graph;
+use crate::midi;
 use crate::project;
 use crate::sample::Sample;
 use crate::song::{Clip, Instrument, Song, TICKS_PER_BAR, TRACK_VOLUME, Target, Tick, Track};
@@ -75,11 +76,21 @@ pub fn run(song: Song, path: Option<PathBuf>) -> Result<(), String> {
                 settings::path().filter(|_| screenshot::Screenshot::from_env().is_none());
             #[cfg(not(feature = "screenshot"))]
             let settings_path = settings::path();
-            let zoom = settings::load(settings_path.as_deref()).zoom;
-            cc.egui_ctx.set_zoom_factor(zoom);
+            let settings = settings::load(settings_path.as_deref());
+            cc.egui_ctx.set_zoom_factor(settings.zoom);
             let mut app = App::new(song, path);
             app.settings_path = settings_path;
-            app.saved_zoom = zoom;
+            app.settings = settings;
+            // Screenshots don't listen: they should come out the same
+            // whatever is plugged in.
+            #[cfg(feature = "screenshot")]
+            let listen = app.screenshot.is_none();
+            #[cfg(not(feature = "screenshot"))]
+            let listen = true;
+            if listen {
+                let choice = app.settings.midi.clone();
+                app.listen(&choice);
+            }
             Ok(Box::new(app))
         }),
     )
@@ -336,10 +347,17 @@ struct App {
     browser: browser::Browser,
     /// Whether the browser is open, or folded into a strip at the side.
     browser_open: bool,
-    /// Where settings are kept (none: they aren't), and the zoom last
+    /// Where settings are kept (none: they aren't), and what was last
     /// saved there.
     settings_path: Option<PathBuf>,
-    saved_zoom: f32,
+    settings: settings::Settings,
+    /// The MIDI keyboard, and the track the engine was last told it plays.
+    midi: midi::Input,
+    keyboard: Option<Option<usize>>,
+    /// The MIDI inputs there were when the MIDI menu opened, and whether
+    /// it's open.
+    midi_ports: Vec<String>,
+    midi_menu: bool,
     dialog: Option<files::Dialog>,
     /// Asking whether to drop unsaved changes, and what for.
     confirm: Option<Discard>,
@@ -382,6 +400,7 @@ impl App {
         };
         #[cfg(not(feature = "screenshot"))]
         let view = View::Arrange;
+        let keys = controller.keys();
         #[allow(unused_mut)]
         let mut app = App {
             doc: Document::new(song),
@@ -402,7 +421,11 @@ impl App {
             browser: browser::Browser::new(&samples_folder(path.as_deref())),
             browser_open: false,
             settings_path: None,
-            saved_zoom: settings::Settings::default().zoom,
+            settings: settings::Settings::default(),
+            midi: midi::Input::new(keys),
+            keyboard: None,
+            midi_ports: Vec::new(),
+            midi_menu: false,
             dialog: None,
             confirm: None,
             message: None,
@@ -754,14 +777,53 @@ impl App {
     /// Save the zoom when Ctrl+= or Ctrl+- changed it, for next time.
     fn remember_zoom(&mut self, ctx: &egui::Context) {
         let zoom = ctx.zoom_factor();
-        if (zoom - self.saved_zoom).abs() < 1e-4 {
+        if (zoom - self.settings.zoom).abs() < 1e-4 {
             return;
         }
-        self.saved_zoom = zoom;
+        self.settings.zoom = zoom;
+        self.save_settings();
+    }
+
+    fn save_settings(&mut self) {
         if let Some(path) = &self.settings_path
-            && let Err(e) = settings::save(path, &settings::Settings { zoom })
+            && let Err(e) = settings::save(path, &self.settings)
         {
-            self.say(format!("couldn't save the zoom: {e}"));
+            self.say(format!("couldn't save the settings: {e}"));
+        }
+    }
+
+    /// Listen to the MIDI keyboard `choice` says. Only says so if it
+    /// couldn't.
+    fn listen(&mut self, choice: &midi::Choice) -> Option<String> {
+        match self.midi.listen(choice) {
+            Ok(port) => port,
+            Err(e) => {
+                self.say(format!("MIDI: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Switch to another MIDI keyboard (or none), and remember it.
+    fn choose_midi(&mut self, choice: midi::Choice) {
+        if let Some(port) = self.listen(&choice) {
+            self.say(format!(
+                "playing the selected track from {}",
+                midi::base_name(&port)
+            ));
+        } else if choice == midi::Choice::Any {
+            self.say("no MIDI keyboard found");
+        }
+        self.settings.midi = choice;
+        self.save_settings();
+    }
+
+    /// Tell the engine which track the keyboard plays: the selected one.
+    fn sync_keyboard(&mut self) {
+        let t = self.arrange.selected_track;
+        let track = (t < self.doc.song.tracks.len()).then_some(t);
+        if self.keyboard != Some(track) && self.controller.send(Command::Keyboard(track)).is_ok() {
+            self.keyboard = Some(track);
         }
     }
 
@@ -867,12 +929,49 @@ impl App {
         });
     }
 
+    /// The MIDI keyboard to play the selected track from.
+    fn midi_menu(&mut self, ui: &mut egui::Ui) {
+        let mut open = false;
+        let mut pick = None;
+        ui.menu_button("MIDI", |ui| {
+            open = true;
+            if !self.midi_menu {
+                // Looked for as it opens, so a keyboard just plugged in shows.
+                self.midi_ports = midi::Input::ports().unwrap_or_default();
+            }
+            let now = self.midi.port().map_or_else(
+                || "not listening".to_owned(),
+                |p| format!("playing from {}", midi::base_name(p)),
+            );
+            ui.label(egui::RichText::new(now).color(color::MUTED));
+            ui.separator();
+            let mut choice = |ui: &mut egui::Ui, c: midi::Choice, name: &str| {
+                if ui.radio(self.settings.midi == c, name).clicked() {
+                    pick = Some(c);
+                }
+            };
+            choice(ui, midi::Choice::Any, "Any keyboard");
+            for port in &self.midi_ports {
+                let name = midi::base_name(port);
+                choice(ui, midi::Choice::Port(name.to_owned()), name);
+            }
+            choice(ui, midi::Choice::Off, "Off");
+            ui.separator();
+            ui.label(egui::RichText::new("plays the selected track").color(color::MUTED));
+        });
+        self.midi_menu = open;
+        if let Some(c) = pick {
+            self.choose_midi(c);
+        }
+    }
+
     fn transport(&mut self, ui: &mut egui::Ui) {
         let playing = self.controller.is_playing();
         let pos = self.controller.position();
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             self.menus(ui);
+            self.midi_menu(ui);
             ui.add_space(16.0);
 
             if icon_button(ui, Icon::ToStart, false)
@@ -1577,6 +1676,7 @@ impl eframe::App for App {
             }
         }
         self.sync_engine();
+        self.sync_keyboard();
 
         self.remember_zoom(&ctx);
 

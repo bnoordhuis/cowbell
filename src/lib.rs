@@ -8,6 +8,7 @@ pub mod document;
 pub mod engine;
 pub mod export;
 pub mod graph;
+pub mod midi;
 pub mod piano;
 pub mod project;
 pub mod rack;

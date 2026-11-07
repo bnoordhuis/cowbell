@@ -7,8 +7,9 @@
 //! frees memory: a replaced song or graph is sent back over a queue so the
 //! controller thread can drop it.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use std::sync::{Arc, Mutex};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -66,7 +67,31 @@ pub enum Command {
         param: usize,
         value: f32,
     },
+    /// The track a keyboard plays (see [`Key`]), if any. Keys held on the
+    /// one before are let go.
+    Keyboard(Option<usize>),
 }
+
+/// What a keyboard does: from MIDI (see [`crate::midi`]), straight to the
+/// audio thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    On {
+        note: u8,
+        velocity: u8,
+    },
+    Off {
+        note: u8,
+    },
+    /// The sustain pedal, down or up.
+    Pedal(bool),
+    /// Let go of everything.
+    AllOff,
+}
+
+/// Where keyboard events go in. Whoever reads the keyboard locks it; the
+/// audio thread only ever reads the other end, so never waits on it.
+pub type Keys = Arc<Mutex<Producer<Key>>>;
 
 /// Things the engine is done with, for the controller to free.
 pub enum Garbage {
@@ -107,6 +132,10 @@ pub struct Engine {
     preview: Option<Arc<Sample>>,
     preview_voice: Voice,
     commands: Consumer<Command>,
+    keys: Consumer<Key>,
+    /// The track the keyboard plays, and whether its pedal is down.
+    keyboard: Option<usize>,
+    foot: bool,
     trash: Producer<Garbage>,
     shared_pos: Arc<AtomicU64>,
     shared_playing: Arc<AtomicBool>,
@@ -114,12 +143,18 @@ pub struct Engine {
 
 pub struct Controller {
     commands: Producer<Command>,
+    keys: Keys,
     trash: Consumer<Garbage>,
     shared_pos: Arc<AtomicU64>,
     shared_playing: Arc<AtomicBool>,
 }
 
 impl Controller {
+    /// Where to send keyboard events.
+    pub fn keys(&self) -> Keys {
+        self.keys.clone()
+    }
+
     /// Send a command to the audio thread. Gives it back if the queue is full.
     pub fn send(&mut self, cmd: Command) -> Result<(), Command> {
         self.collect_garbage();
@@ -159,6 +194,7 @@ impl Engine {
     pub fn new(out_rate: u32, song: Song) -> (Engine, Controller) {
         let (cmd_tx, cmd_rx) = RingBuffer::new(64);
         let (trash_tx, trash_rx) = RingBuffer::new(64);
+        let (keys_tx, keys_rx) = RingBuffer::new(256);
         let shared_pos = Arc::new(AtomicU64::new(0));
         let shared_playing = Arc::new(AtomicBool::new(false));
         let mut graph = Box::new(Graph::build(&song.rack, out_rate));
@@ -180,12 +216,16 @@ impl Engine {
             preview: None,
             preview_voice: Voice::default(),
             commands: cmd_rx,
+            keys: keys_rx,
+            keyboard: None,
+            foot: false,
             trash: trash_tx,
             shared_pos: shared_pos.clone(),
             shared_playing: shared_playing.clone(),
         };
         let controller = Controller {
             commands: cmd_tx,
+            keys: Arc::new(Mutex::new(keys_tx)),
             trash: trash_rx,
             shared_pos,
             shared_playing,
@@ -338,6 +378,47 @@ impl Engine {
                     param,
                     value,
                 } => self.graph.set_param(device, param, value),
+                Command::Keyboard(track) => {
+                    let track = track.filter(|&t| t < MAX_TRACKS);
+                    if track != self.keyboard {
+                        if let Some(old) = self.keyboard {
+                            self.synths[old].keys_off();
+                        }
+                        if let Some(t) = track {
+                            self.synths[t].set_foot(self.foot);
+                        }
+                        self.keyboard = track;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Play what came in from the keyboard on its track, if that plays a
+    /// synth.
+    fn handle_keys(&mut self) {
+        while let Ok(key) = self.keys.pop() {
+            if let Key::Pedal(down) = key {
+                self.foot = down;
+            }
+            let Some(t) = self
+                .keyboard
+                .filter(|&t| t < self.song.tracks.len().min(MAX_TRACKS))
+            else {
+                continue;
+            };
+            let instrument = self.song.tracks[t].instrument;
+            let synth = &mut self.synths[t];
+            match key {
+                Key::On { note, velocity } => {
+                    if let Some(Instrument::Synth(_)) = self.song.instruments.get(instrument) {
+                        let freq = self.song.tuning.freq(note.min(127));
+                        synth.key_on(instrument, note, freq, velocity, self.out_rate);
+                    }
+                }
+                Key::Off { note } => synth.key_off(note),
+                Key::Pedal(down) => synth.set_foot(down),
+                Key::AllOff => synth.keys_off(),
             }
         }
     }
@@ -577,6 +658,8 @@ impl Engine {
     pub fn process(&mut self, out: &mut [f32]) {
         self.handle_commands();
         for block in out.chunks_mut(2 * BLOCK) {
+            // Keys every block, to keep the lag down to one.
+            self.handle_keys();
             let frames = block.len() / 2;
             self.render_tracks(frames);
             self.graph.process(frames);

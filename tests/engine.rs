@@ -658,3 +658,48 @@ fn a_poly_track_steals_its_oldest_voice() {
         "the last hit took the oldest voice"
     );
 }
+
+#[test]
+fn a_keyboard_plays_the_track_it_is_told_to() {
+    use cowbell::engine::Key;
+    use cowbell::synthvoice::{SynthKind, SynthPatch};
+    let synth = Instrument::Synth(Arc::new(SynthPatch::new(SynthKind::Fm, "fm")));
+    let tracks = vec![Track::new("a", 0), Track::new("b", 0)];
+    let song = Song::new(120.0, vec![synth], tracks);
+    let (mut engine, mut c) = Engine::new(RATE, song);
+    let keys = c.keys();
+    let press = |key| keys.lock().unwrap().push(key).unwrap();
+    let level = |engine: &mut Engine, frames: usize| {
+        let mut out = vec![0.0; 2 * frames];
+        engine.process(&mut out);
+        out.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    };
+    press(Key::On {
+        note: 60,
+        velocity: 100,
+    });
+    assert_eq!(level(&mut engine, 4800), 0.0, "no track to play yet");
+    assert!(c.send(Command::Keyboard(Some(1))).is_ok());
+    level(&mut engine, 256);
+    press(Key::On {
+        note: 60,
+        velocity: 100,
+    });
+    assert!(level(&mut engine, 4800) > 0.01, "playing, stopped or not");
+    press(Key::Pedal(true));
+    press(Key::Off { note: 60 });
+    level(&mut engine, 48_000 * 2);
+    assert!(level(&mut engine, 4800) > 0.001, "held by the pedal");
+    press(Key::Pedal(false));
+    level(&mut engine, 48_000 * 2);
+    assert_eq!(level(&mut engine, 4800), 0.0, "let go");
+    // Another track: held keys on the first are let go.
+    press(Key::On {
+        note: 64,
+        velocity: 100,
+    });
+    level(&mut engine, 256);
+    assert!(c.send(Command::Keyboard(Some(0))).is_ok());
+    level(&mut engine, 48_000 * 2);
+    assert_eq!(level(&mut engine, 4800), 0.0);
+}

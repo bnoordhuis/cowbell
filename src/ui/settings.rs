@@ -1,4 +1,5 @@
-//! Settings that outlast a run: for now, how big the UI is drawn.
+//! Settings that outlast a run: how big the UI is drawn, and which MIDI
+//! keyboard to listen to.
 //!
 //! They live in `$XDG_CONFIG_HOME/cowbell/settings.ron`, or
 //! `~/.config/cowbell/settings.ron` without it. A missing or unreadable
@@ -13,11 +14,15 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     /// egui's zoom factor: Ctrl+= and Ctrl+- change it.
     pub zoom: f32,
+    pub midi: crate::midi::Choice,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { zoom: 1.3 }
+        Settings {
+            zoom: 1.3,
+            midi: crate::midi::Choice::Any,
+        }
     }
 }
 
@@ -69,8 +74,12 @@ mod tests {
         let file = dir.join("cowbell").join("settings.ron");
         assert_eq!(load(Some(&file)), Settings::default(), "no file yet");
         assert_eq!(load(None), Settings::default(), "nowhere to look");
-        save(&file, &Settings { zoom: 1.7 }).unwrap();
-        assert_eq!(load(Some(&file)).zoom, 1.7);
+        let saved = Settings {
+            zoom: 1.7,
+            midi: crate::midi::Choice::Port("Keys 1".into()),
+        };
+        save(&file, &saved).unwrap();
+        assert_eq!(load(Some(&file)), saved);
         std::fs::write(&file, "(zoom: 40.0)").unwrap();
         assert_eq!(load(Some(&file)).zoom, 5.0, "kept in range");
         std::fs::write(&file, "()").unwrap();

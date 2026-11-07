@@ -200,6 +200,8 @@ pub struct SynthVoice {
     /// Let go while the pedal was down: released when it comes up.
     sustained: bool,
     piano: piano::Voice,
+    /// The key held down on a MIDI keyboard that plays it, if one does.
+    key: Option<u8>,
     /// The note the piano strings were last struck for; a new one (or a
     /// glide, which a piano can't do) strikes them again.
     struck: Option<f64>,
@@ -459,7 +461,10 @@ pub struct SynthTrack {
     /// Knob values set by automation, overriding the patch's; NaN where
     /// there's none.
     overrides: [f32; MAX_PARAMS],
+    /// The pedal as the song has it, and as a keyboard's foot pedal does:
+    /// it's down if either is.
     pedal: bool,
+    foot: bool,
     /// The soundboard and sympathetic strings piano notes go through, and
     /// the knob values of the piano last played.
     body: piano::Body,
@@ -473,6 +478,7 @@ impl Default for SynthTrack {
             held: [None; MAX_CHORD],
             overrides: [f32::NAN; MAX_PARAMS],
             pedal: false,
+            foot: false,
             body: piano::Body::default(),
             body_values: [0.0; MAX_PARAMS],
         }
@@ -495,14 +501,31 @@ impl SynthTrack {
         self.voices.iter().any(SynthVoice::is_active) || self.body.is_active()
     }
 
+    /// The song's pedal.
     pub fn pedal(&self) -> bool {
         self.pedal
     }
 
-    /// Put the sustain pedal down or let it up. Notes let go while it was
-    /// down are released when it comes up.
+    fn pedal_down(&self) -> bool {
+        self.pedal || self.foot
+    }
+
+    /// Put the song's sustain pedal down or let it up. Notes let go while
+    /// it was down are released when it comes up (unless the keyboard's is
+    /// down).
     pub fn set_pedal(&mut self, down: bool) {
         self.pedal = down;
+        self.apply_pedal();
+    }
+
+    /// The same for a keyboard's foot pedal.
+    pub fn set_foot(&mut self, down: bool) {
+        self.foot = down;
+        self.apply_pedal();
+    }
+
+    fn apply_pedal(&mut self) {
+        let down = self.pedal_down();
         for v in &mut self.voices {
             v.pedal = down;
             if !down && v.sustained {
@@ -511,11 +534,38 @@ impl SynthTrack {
         }
     }
 
-    /// Let the pedal up and straight down again: what was ringing on
-    /// stops, the notes still held don't.
+    /// Let the song's pedal up and straight down again: what was ringing
+    /// on stops, the notes still held don't.
     pub fn change_pedal(&mut self) {
         self.set_pedal(false);
         self.set_pedal(true);
+    }
+
+    /// A key went down on a keyboard: play `freq` until it comes up.
+    pub fn key_on(&mut self, instrument: usize, key: u8, freq: f64, velocity: u8, rate: f64) {
+        // The same key again (its note-off got lost, say): that one goes.
+        self.key_off(key);
+        let v = self.free_voice(&[None; MAX_CHORD], &[None; MAX_CHORD], VOICES);
+        self.voices[v].note_on(instrument, freq, velocity, 0.0, rate);
+        self.voices[v].key = Some(key);
+    }
+
+    /// The key came up: let its note go (into the pedal, if it's down).
+    pub fn key_off(&mut self, key: u8) {
+        for v in self.voices.iter_mut().filter(|v| v.key == Some(key)) {
+            v.key = None;
+            v.note_off_in(0.0);
+        }
+    }
+
+    /// Let go of every key, and the foot pedal.
+    pub fn keys_off(&mut self) {
+        for v in &mut self.voices {
+            if v.key.take().is_some() {
+                v.note_off_in(0.0);
+            }
+        }
+        self.set_foot(false);
     }
 
     pub fn active_voices(&self) -> usize {
@@ -527,6 +577,7 @@ impl SynthTrack {
         self.voices.iter_mut().for_each(SynthVoice::stop);
         self.held = [None; MAX_CHORD];
         self.overrides = [f32::NAN; MAX_PARAMS];
+        // The foot stays where it is: it's still on the pedal.
         self.set_pedal(false);
         self.body.silence();
     }
@@ -567,7 +618,7 @@ impl SynthTrack {
     ) {
         let freqs = &freqs[..freqs.len().min(MAX_CHORD)];
         // With the pedal down, what's let go rings on: it needs room.
-        let range = if self.pedal {
+        let range = if self.pedal_down() {
             VOICES
         } else {
             POLYPHONY.max(freqs.len() + 1).min(VOICES)
@@ -652,7 +703,7 @@ impl SynthTrack {
             .min_by(|&a, &b| self.voices[a].amp.total_cmp(&self.voices[b].amp))
             .unwrap_or(0);
         self.voices[i].reset();
-        self.voices[i].pedal = self.pedal;
+        self.voices[i].pedal = self.pedal_down();
         i
     }
 
@@ -698,7 +749,9 @@ impl SynthTrack {
             }
         }
         if pianos != [0.0; 2] || self.body.is_active() {
-            let b = self.body.next_frame(pianos, &self.body_values, self.pedal);
+            let b = self
+                .body
+                .next_frame(pianos, &self.body_values, self.pedal_down());
             out = [out[0] + b[0], out[1] + b[1]];
         }
         out
@@ -941,6 +994,37 @@ mod tests {
         t.set_pedal(false);
         run(&mut t, &patch, 48_000);
         assert_eq!(t.active_voices(), 1, "the held note");
+    }
+
+    #[test]
+    fn keys_hold_their_notes_and_the_foot_pedal_adds_to_the_songs() {
+        let (mut t, patch) = piano_track();
+        t.key_on(0, 60, 261.6, 100, RATE);
+        t.key_on(0, 64, 329.6, 100, RATE);
+        run(&mut t, &patch, 48_000);
+        assert_eq!(t.active_voices(), 2, "held as long as the keys are");
+        t.key_off(60);
+        run(&mut t, &patch, 48_000);
+        assert_eq!(t.active_voices(), 1, "let go");
+
+        t.set_foot(true);
+        t.key_off(64);
+        t.set_pedal(false);
+        run(&mut t, &patch, 9600);
+        assert_eq!(t.active_voices(), 1, "the foot still holds it");
+        t.set_pedal(true);
+        t.set_foot(false);
+        run(&mut t, &patch, 9600);
+        assert_eq!(t.active_voices(), 1, "now the song's pedal does");
+        t.set_pedal(false);
+        run(&mut t, &patch, 48_000);
+        assert_eq!(t.active_voices(), 0);
+
+        t.key_on(0, 60, 261.6, 100, RATE);
+        t.key_on(0, 60, 261.6, 100, RATE);
+        t.keys_off();
+        run(&mut t, &patch, 48_000);
+        assert_eq!(t.active_voices(), 0, "a key struck twice, let go once");
     }
 
     #[test]
