@@ -201,6 +201,54 @@ pub fn clip_from_text(text: &str) -> Option<Clip> {
     })
 }
 
+/// Steps from the clip editor on the clipboard, as text.
+#[derive(Serialize, Deserialize)]
+struct StepsFile {
+    cowbell_steps: u32,
+    synth: bool,
+    /// The lowest and highest lane; none for every lane.
+    values: Option<(u16, u16)>,
+    rows: usize,
+    cells: BTreeMap<usize, CellFile>,
+}
+
+/// Copied steps as clipboard text.
+pub fn steps_to_text(steps: &crate::selection::Steps) -> String {
+    let file = StepsFile {
+        cowbell_steps: FORMAT,
+        synth: steps.synth,
+        values: steps.values.as_ref().map(|v| (*v.start(), *v.end())),
+        rows: steps.cells.len(),
+        cells: steps
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c != Cell::default())
+            .map(|(row, c)| (row, CellFile::from(c)))
+            .collect(),
+    };
+    ron::ser::to_string(&file).unwrap_or_default()
+}
+
+/// The steps in clipboard text, if it holds some.
+pub fn steps_from_text(text: &str) -> Option<crate::selection::Steps> {
+    let file: StepsFile = ron::from_str(text.trim()).ok()?;
+    if file.rows == 0 || file.rows > MAX_PASTED_ROWS {
+        return None;
+    }
+    let mut cells = vec![Cell::default(); file.rows];
+    for (row, cell) in file.cells {
+        if let Some(slot) = cells.get_mut(row) {
+            *slot = cell.into();
+        }
+    }
+    Some(crate::selection::Steps {
+        synth: file.synth,
+        values: file.values.filter(|(a, b)| a <= b).map(|(a, b)| a..=b),
+        cells,
+    })
+}
+
 /// The folder for a project's own samples: `song.cowbell` → `song.samples`.
 pub fn samples_dir(project: &Path) -> PathBuf {
     project.with_extension("samples")
@@ -571,5 +619,35 @@ mod tests {
         let empty = text.replace("rows:8", "rows:0");
         assert_ne!(empty, text);
         assert_eq!(clip_from_text(&empty), None);
+    }
+
+    #[test]
+    fn steps_go_through_the_clipboard_as_text() {
+        use crate::selection::Steps;
+        let steps = Steps {
+            synth: true,
+            values: Some(60..=64),
+            cells: vec![
+                Cell::hit(60, 90),
+                Cell::default(),
+                Cell::hit(64, 70).with_note(Trigger::new(62, 50)),
+            ],
+        };
+        assert_eq!(steps_from_text(&steps_to_text(&steps)), Some(steps.clone()));
+        let whole = Steps {
+            values: None,
+            ..steps
+        };
+        assert_eq!(steps_from_text(&steps_to_text(&whole)), Some(whole));
+        assert_eq!(steps_from_text("hello"), None);
+        assert_eq!(
+            clip_from_text(&steps_to_text(&Steps {
+                synth: false,
+                values: None,
+                cells: vec![Cell::default()],
+            })),
+            None,
+            "steps aren't a clip"
+        );
     }
 }

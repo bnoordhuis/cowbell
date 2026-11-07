@@ -346,6 +346,8 @@ struct App {
     /// The clip last copied or cut, for the Edit menu's Paste. (The
     /// system clipboard has it too, as text, for Ctrl+V.)
     clipboard: Option<Clip>,
+    /// The same for steps copied in the clip editor.
+    step_clipboard: Option<crate::selection::Steps>,
     /// What to go on with once the project is saved under a name, when
     /// "Save" in the unsaved-changes dialog needed one.
     after_save: Option<Discard>,
@@ -406,6 +408,7 @@ impl App {
             message: None,
             after_save: None,
             clipboard: None,
+            step_clipboard: None,
             quitting: false,
             title: String::new(),
             gesture: None,
@@ -714,10 +717,24 @@ impl App {
         if !self.view.is_track() {
             return;
         }
-        // Esc also closes an open menu; let it do just that.
+        // Esc also closes an open menu; let it do just that. In the editor
+        // it lets go of a selection before it goes back.
         if !ctx.any_popup_open() && key(egui::Modifiers::NONE, Key::Escape) {
-            self.view = View::Arrange;
+            if !(self.view == View::Editor && self.steps.clear_selection()) {
+                self.view = View::Arrange;
+            }
             return;
+        }
+        if self.view == View::Editor {
+            if key(ctrl, Key::A)
+                && let Some(at) = self.open_clip()
+            {
+                self.steps.select_all(&self.doc.song, at);
+            }
+            if key(egui::Modifiers::NONE, Key::Delete) || key(egui::Modifiers::NONE, Key::Backspace)
+            {
+                self.delete_steps();
+            }
         }
         if self.view == View::Editor && key(ctrl, Key::ArrowLeft) {
             self.step_clip(-1);
@@ -815,6 +832,24 @@ impl App {
                 self.undo(true);
             }
             ui.separator();
+            if self.view == View::Editor {
+                let selected = self
+                    .open_clip()
+                    .is_some_and(|at| self.steps.selection(at).is_some());
+                if item(ui, selected, "Cut steps", &CUT) {
+                    self.copy_steps(&ctx, true);
+                }
+                if item(ui, selected, "Copy steps", &COPY) {
+                    self.copy_steps(&ctx, false);
+                }
+                let pasteable = self.step_clipboard.is_some() && self.open_clip().is_some();
+                if item(ui, pasteable, "Paste steps", &PASTE)
+                    && let Some(steps) = self.step_clipboard.clone()
+                {
+                    self.paste_steps(&steps);
+                }
+                return;
+            }
             let clip = self.copyable();
             if item(ui, clip.is_some(), "Cut clip", &CUT) {
                 self.cut(&ctx);
@@ -947,7 +982,7 @@ impl App {
                 "space plays and stops · home goes to the start · drag clips to move them, their right edge to resize · double-click an empty spot for a new clip · right-click clips and tracks for more · drag empty space to move around · ctrl+scroll to zoom"
             }
             View::Editor => {
-                "tab: devices · shift+tab: arrangement · esc: arrangement · ctrl+left and right: other clips · ctrl+up and down: other tracks · click or drag to add and remove hits · right-click a hit to roll it · scroll over a hit for velocity · click a lane name to hear it"
+                "tab: devices · shift+tab: arrangement · esc: arrangement · shift+drag or drag the beat numbers to select, ctrl+c/x/v copy, cut and paste · ctrl+left and right: other clips · ctrl+up and down: other tracks · click or drag to add and remove hits · right-click a hit to roll it · scroll over a hit for velocity · click a lane name to hear it"
             }
             View::Devices => {
                 "tab: arrangement · shift+tab: editor · esc: arrangement · ctrl+up and down: other tracks · drag or scroll knobs (shift: fine) · click switches · double-click resets"
@@ -1050,18 +1085,81 @@ impl App {
         }
     }
 
+    /// Copy, cut and paste work on steps in the editor, on clips
+    /// elsewhere.
     fn shortcut(&mut self, ctx: &egui::Context, shortcut: Shortcut) {
+        let editor = self.view == View::Editor;
         match shortcut {
             Shortcut::Undo => self.undo(false),
             Shortcut::Redo => self.undo(true),
+            Shortcut::Copy if editor => self.copy_steps(ctx, false),
+            Shortcut::Cut if editor => self.copy_steps(ctx, true),
             Shortcut::Copy => {
                 self.copy(ctx);
             }
             Shortcut::Cut => self.cut(ctx),
+            Shortcut::Paste(text) if editor => match project::steps_from_text(&text) {
+                Some(steps) => self.paste_steps(&steps),
+                None if project::clip_from_text(&text).is_some() => {
+                    self.say("that's a clip: paste it in the arrangement")
+                }
+                None => self.say("nothing to paste: select steps and copy them first"),
+            },
             Shortcut::Paste(text) => match project::clip_from_text(&text) {
                 Some(clip) => self.paste(clip),
+                None if project::steps_from_text(&text).is_some() => {
+                    self.say("those are steps: paste them in the editor")
+                }
                 None => self.say("nothing to paste: copy a clip first"),
             },
+        }
+    }
+
+    /// Copy the steps selected in the editor, to the system clipboard too;
+    /// with `cut`, clear them as well.
+    fn copy_steps(&mut self, ctx: &egui::Context, cut: bool) {
+        self.finish_gesture();
+        let Some(at) = self.open_clip() else {
+            return;
+        };
+        let Some(steps) = self.steps.copy(&self.doc.song, at) else {
+            self.say("select steps first: shift+drag, or drag along the beat numbers");
+            return;
+        };
+        ctx.copy_text(project::steps_to_text(&steps));
+        let rows = steps.cells.len();
+        self.step_clipboard = Some(steps);
+        if cut && let Some(edit) = self.steps.delete(&self.doc.song, at) {
+            self.edit(edit);
+            self.say(format!("cut {rows} steps"));
+        } else {
+            self.say(format!(
+                "copied {rows} steps: Ctrl+V pastes them where the pointer is"
+            ));
+        }
+    }
+
+    fn paste_steps(&mut self, steps: &crate::selection::Steps) {
+        self.finish_gesture();
+        let Some(at) = self.open_clip() else {
+            self.say("open a clip to paste into");
+            return;
+        };
+        match self.steps.paste(&self.doc.song, at, steps) {
+            Ok(edit) => {
+                self.edit(edit);
+            }
+            Err(why) => self.say(why),
+        }
+    }
+
+    /// Clear the steps selected in the editor.
+    fn delete_steps(&mut self) {
+        self.finish_gesture();
+        if let Some(at) = self.open_clip()
+            && let Some(edit) = self.steps.delete(&self.doc.song, at)
+        {
+            self.edit(edit);
         }
     }
 

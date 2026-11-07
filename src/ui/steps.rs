@@ -7,6 +7,10 @@
 //! scroll over a hit to change its velocity, scroll elsewhere to see other
 //! lanes. Click a lane's label to hear it.
 //!
+//! Shift+drag over the grid to select steps in some lanes, or drag along
+//! the beat numbers to select whole steps; the window copies, cuts, pastes
+//! and clears them (see [`StepView::copy`]).
+//!
 //! Like the arrangement, it doesn't change the song itself: it reports
 //! edits in its [`Output`].
 
@@ -20,6 +24,7 @@ use super::edit::Edit;
 use super::{color, knob};
 use crate::rack::{Curve, ParamSpec};
 use crate::sample::Sample;
+use crate::selection::{self, Selection, Steps};
 use crate::song::{Cell, ClipRef, Fx, Instrument, MAX_FX, Song, Trigger};
 use crate::tuning::{HIGHEST_NOTE, LOWEST_NOTE, note_name};
 
@@ -70,6 +75,13 @@ pub struct StepView {
     /// New hits get this velocity; the wheel sets it.
     velocity: u8,
     peaks: PeakCache,
+    /// The steps selected, and in which clip.
+    selection: Option<(ClipRef, Selection)>,
+    /// Dragging out a selection: from which lane (index) and row, and
+    /// whether along the beat numbers (every lane).
+    selecting: Option<(ClipRef, usize, usize, bool)>,
+    /// The row under the pointer, where a paste goes.
+    hover_row: Option<(ClipRef, usize)>,
 }
 
 impl Default for StepView {
@@ -85,6 +97,9 @@ impl Default for StepView {
             cursor: None,
             velocity: 110,
             peaks: PeakCache::default(),
+            selection: None,
+            selecting: None,
+            hover_row: None,
         }
     }
 }
@@ -127,6 +142,14 @@ enum Kind {
         velocity: u8,
         poly: bool,
     },
+}
+
+/// Whether clip `at` plays a synth: its lanes are notes, not slices.
+fn is_synth(song: &Song, at: ClipRef) -> bool {
+    song.tracks
+        .get(at.0)
+        .and_then(|t| song.instruments.get(t.instrument))
+        .is_some_and(Instrument::is_synth)
 }
 
 fn has_cut(c: &Cell) -> bool {
@@ -642,6 +665,25 @@ impl StepView {
             }
         }
 
+        // The selection, over the hits so they show through.
+        if let Some(sel) = self.selection(at) {
+            let rows = sel.rows.start.max(g.first_col)..sel.rows.end.min(g.first_col + cols);
+            let shown = g.first_lane..g.first_lane + lanes;
+            let in_it: Vec<usize> = shown
+                .filter(|&l| sel.values.as_ref().is_none_or(|v| v.contains(&g.lanes[l])))
+                .collect();
+            if let (Some(&top), Some(&bottom)) = (in_it.first(), in_it.last())
+                && !rows.is_empty()
+            {
+                let r = Rect::from_min_max(
+                    pos2(g.col_x(rows.start), g.lane_y(top).unwrap()),
+                    pos2(g.col_x(rows.end), g.lane_y(bottom).unwrap() + g.lane_h),
+                );
+                p.rect_filled(r, 2.0, color::ACCENT.gamma_multiply(0.12));
+                p.rect_stroke(r, 2.0, Stroke::new(1.5, color::ACCENT), StrokeKind::Inside);
+            }
+        }
+
         // Playhead.
         if let Some(row) = playhead.filter(|r| (g.first_col..g.first_col + cols).contains(r)) {
             let r = Rect::from_min_size(
@@ -756,6 +798,9 @@ impl StepView {
             let w = g.visible_cols() as f32 * g.col_w;
             Rect::from_min_size(g.grid.min, vec2(w, h)).contains(p)
         };
+        self.hover_row = hover
+            .filter(|&p| in_area && in_grid(p))
+            .map(|p| (at, g.cell_at(p).1));
         let end_wheel = |this: &mut Self, out: &mut Output| {
             if std::mem::take(&mut this.wheeling) {
                 out.end_first = true;
@@ -768,12 +813,24 @@ impl StepView {
             && let Some(p) = hover
         {
             end_wheel(self, out);
+            let beats = Rect::from_min_max(
+                pos2(g.grid.left(), g.grid.top() - HEADER),
+                pos2(
+                    g.grid.left() + g.visible_cols() as f32 * g.col_w,
+                    g.grid.top(),
+                ),
+            );
             if g.labels.contains(p) {
                 let lane = g.cell_at(p).0;
                 if g.lane_y(lane).is_some_and(|y| p.y < y + g.lane_h) {
                     out.audition = Some((instrument, g.lanes[lane]));
                 }
+            } else if beats.contains(p) || (shift && in_grid(p)) {
+                // Selecting, along the beat numbers or with shift.
+                let (lane, row) = g.cell_at(p);
+                self.selecting = Some((at, lane, row, beats.contains(p)));
             } else if in_grid(p) {
+                self.selection = None;
                 let (lane, row) = g.cell_at(p);
                 let v = g.lanes[lane];
                 let kind = if cells[row].note(v).is_some() {
@@ -809,6 +866,21 @@ impl StepView {
                     base: cells.to_vec(),
                     kind,
                 });
+            }
+        }
+
+        // Dragging out a selection.
+        if let Some((clip, from_lane, from_row, whole)) = self.selecting {
+            if clip != at || !down {
+                self.selecting = None;
+            } else if let Some(p) = hover {
+                let (lane, row) = g.cell_at(p);
+                let rows = from_row.min(row)..from_row.max(row) + 1;
+                let values = (!whole).then(|| {
+                    let (a, b) = (g.lanes[from_lane], g.lanes[lane]);
+                    a.min(b)..=a.max(b)
+                });
+                self.selection = Some((at, Selection { rows, values }));
             }
         }
 
@@ -906,6 +978,70 @@ impl StepView {
                 }
             }
         }
+    }
+
+    /// The selection in clip `at`, if there is one.
+    pub fn selection(&self, at: ClipRef) -> Option<&Selection> {
+        self.selection
+            .as_ref()
+            .filter(|(c, _)| *c == at)
+            .map(|(_, s)| s)
+    }
+
+    /// Select every step of clip `at`.
+    pub fn select_all(&mut self, song: &Song, at: ClipRef) {
+        if let Some(clip) = song.clip(at) {
+            let all = Selection {
+                rows: 0..clip.cells.len(),
+                values: None,
+            };
+            self.selection = Some((at, all));
+        }
+    }
+
+    /// Forget the selection. Returns whether there was one.
+    pub fn clear_selection(&mut self) -> bool {
+        self.selecting = None;
+        self.selection.take().is_some()
+    }
+
+    /// The selected steps of clip `at`.
+    pub fn copy(&self, song: &Song, at: ClipRef) -> Option<Steps> {
+        let sel = self.selection(at)?;
+        let clip = song.clip(at)?;
+        Some(selection::copy(&clip.cells, sel, is_synth(song, at)))
+    }
+
+    /// Clear the selected steps of clip `at`: the edit that does it.
+    pub fn delete(&self, song: &Song, at: ClipRef) -> Option<Edit> {
+        let sel = self.selection(at)?;
+        let clip = song.clip(at)?;
+        Some(Edit::SetCells(at, selection::clear(&clip.cells, sel)))
+    }
+
+    /// Paste `steps` into clip `at`: at the step under the pointer, else
+    /// the last one touched, else the selection's start. What's pasted is
+    /// selected.
+    pub fn paste(&mut self, song: &Song, at: ClipRef, steps: &Steps) -> Result<Edit, String> {
+        let clip = song.clip(at).ok_or("no clip open")?;
+        if steps.synth != is_synth(song, at) {
+            return Err(if steps.synth {
+                "can't paste notes into a sample clip".into()
+            } else {
+                "can't paste slices into a synth clip".into()
+            });
+        }
+        let row = self
+            .hover_row
+            .filter(|(c, _)| *c == at)
+            .map(|(_, r)| r)
+            .or(self.cursor)
+            .or_else(|| self.selection(at).map(|s| s.rows.start))
+            .unwrap_or(0);
+        let (cells, filled) = selection::paste(&clip.cells, steps, row);
+        self.cursor = Some(row);
+        self.selection = Some((at, filled));
+        Ok(Edit::SetCells(at, cells))
     }
 
     /// Whether a run of wheel turns is waiting to be made one undo step.
@@ -1150,6 +1286,8 @@ mod tests {
             gesture: Option<Song>,
             undo: Vec<Song>,
             auditions: Vec<(usize, u16)>,
+            /// Shift held for the next frames.
+            shift: bool,
         }
 
         const SCREEN: Rect = Rect::from_min_max(Pos2::ZERO, pos2(1400.0, 800.0));
@@ -1171,12 +1309,34 @@ mod tests {
                     gesture: None,
                     undo: Vec::new(),
                     auditions: Vec::new(),
+                    shift: false,
                 };
                 h.frame(vec![]);
                 h
             }
 
+            /// A point on the beat numbers, over `row`.
+            fn beat(&mut self, row: usize) -> Pos2 {
+                let cells = self.song.tracks[0].clips[0].cells.clone();
+                let synth = self.song.instruments[0].is_synth();
+                let sample = match &self.song.instruments[0] {
+                    Instrument::Sampler(s) => Some(s.clone()),
+                    Instrument::Synth(_) => None,
+                };
+                let g = self
+                    .view
+                    .layout((0, 0), &cells, SCREEN, synth, sample.as_deref());
+                pos2(g.col_x(row) + g.col_w / 2.0, g.grid.top() - HEADER / 2.0)
+            }
+
             fn frame(&mut self, events: Vec<Event>) {
+                let modifiers = if self.shift {
+                    Modifiers::SHIFT
+                } else {
+                    Modifiers::NONE
+                };
+                let mut events = events;
+                events.insert(0, Event::ModifiersChanged(modifiers));
                 let input = RawInput {
                     screen_rect: Some(SCREEN),
                     events,
@@ -1241,7 +1401,11 @@ mod tests {
                     pos,
                     button: PointerButton::Primary,
                     pressed,
-                    modifiers: Modifiers::NONE,
+                    modifiers: if self.shift {
+                        Modifiers::SHIFT
+                    } else {
+                        Modifiers::NONE
+                    },
                 }]);
             }
 
@@ -1265,6 +1429,80 @@ mod tests {
                     .map(|c| c.first().map(|t| t.slice))
                     .collect()
             }
+        }
+
+        #[test]
+        fn shift_drag_selects_lanes_and_steps_without_painting() {
+            let mut h = Harness::new(false);
+            let (from, to) = (h.at(1, 2), h.at(2, 5));
+            h.shift = true;
+            h.drag(&[from, to]);
+            h.shift = false;
+            assert!(h.cells().iter().all(|c| !c.has_hit()), "nothing painted");
+            assert_eq!(
+                h.view.selection((0, 0)),
+                Some(&Selection {
+                    rows: 2..6,
+                    values: Some(1..=2)
+                })
+            );
+            // A plain click paints again, and lets go of the selection.
+            let at = h.at(0, 0);
+            h.drag(&[at]);
+            assert!(h.cells()[0].has_hit());
+            assert_eq!(h.view.selection((0, 0)), None);
+        }
+
+        #[test]
+        fn dragging_along_the_beat_numbers_selects_whole_steps() {
+            let mut h = Harness::new(false);
+            let (from, to) = (h.beat(6), h.beat(3));
+            h.drag(&[from, to]);
+            assert_eq!(
+                h.view.selection((0, 0)),
+                Some(&Selection {
+                    rows: 3..7,
+                    values: None
+                })
+            );
+        }
+
+        #[test]
+        fn steps_paste_where_the_pointer_is() {
+            let mut h = Harness::new(false);
+            for (v, row) in [(1, 0), (2, 1), (3, 1)] {
+                let at = h.at(v, row);
+                h.drag(&[at]);
+            }
+            h.view.selection = Some((
+                (0, 0),
+                Selection {
+                    rows: 0..2,
+                    values: Some(1..=2),
+                },
+            ));
+            let steps = h.view.copy(&h.song, (0, 0)).unwrap();
+            assert_eq!(steps.cells.len(), 2);
+            let over = h.at(0, 8);
+            h.frame(vec![Event::PointerMoved(over)]);
+            let edit = h.view.paste(&h.song, (0, 0), &steps).unwrap();
+            edit::apply(&mut h.song, &edit).unwrap();
+            assert_eq!(h.triggers()[8], Some(1));
+            let row9: Vec<u16> = h.cells()[9].hits().map(|t| t.slice).collect();
+            assert_eq!(row9, [2], "slice 3 wasn't selected");
+            assert_eq!(
+                h.view.selection((0, 0)).unwrap().rows,
+                8..10,
+                "what's pasted is selected"
+            );
+            // Not into a synth clip.
+            let synth = Harness::new(true);
+            assert!(h.view.paste(&synth.song, (0, 0), &steps).is_err());
+            // Clearing takes the selected notes out.
+            let edit = h.view.delete(&h.song, (0, 0)).unwrap();
+            edit::apply(&mut h.song, &edit).unwrap();
+            assert!(!h.cells()[8].has_hit() && !h.cells()[9].has_hit());
+            assert!(h.cells()[1].has_hit(), "the original stays");
         }
 
         #[test]

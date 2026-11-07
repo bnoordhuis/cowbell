@@ -11,6 +11,7 @@ pub mod graph;
 pub mod project;
 pub mod rack;
 pub mod sample;
+pub mod selection;
 pub mod song;
 pub mod synth;
 pub mod synthvoice;
