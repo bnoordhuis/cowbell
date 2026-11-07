@@ -12,6 +12,7 @@ mod rack;
 #[cfg(feature = "screenshot")]
 mod screenshot;
 mod steps;
+mod track;
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -78,10 +79,12 @@ pub fn run(song: Song, path: Option<PathBuf>) -> Result<(), String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
     Arrange,
+    /// The selected track's clip, or its devices, filling the window.
+    Track,
     Rack,
 }
 
-/// The bottom panel's tabs.
+/// The track screen's tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Clip,
@@ -119,6 +122,18 @@ const REDO_Y: egui::KeyboardShortcut =
 const COPY: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::C);
 const CUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::X);
 const PASTE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::V);
+
+/// egui moves the focus between widgets with Tab (and the arrows) before
+/// the app sees the key. For keys that are the app's, undo that: no widget
+/// gets focus from it, and none keeps it.
+fn no_focus_move(ctx: &egui::Context) {
+    ctx.memory_mut(|m| {
+        m.move_focus(egui::FocusDirection::None);
+        if let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+    });
+}
 
 /// Take this frame's editing shortcuts out of the input, so no widget acts
 /// on them too. Copy, cut and paste arrive as their own events (egui turns
@@ -241,7 +256,7 @@ struct App {
     view: View,
     arrange: arrange::ArrangeView,
     rack_view: rack::RackView,
-    /// The bottom panel: which tab, and the views on it.
+    /// The track screen: which tab, and the views on it.
     tab: Tab,
     steps: steps::StepView,
     devices: devices::DevicesView,
@@ -284,6 +299,7 @@ impl App {
         #[cfg(feature = "screenshot")]
         let view = match std::env::var("COWBELL_VIEW").as_deref() {
             Ok("rack") => View::Rack,
+            Ok("track") => View::Track,
             _ => View::Arrange,
         };
         #[cfg(not(feature = "screenshot"))]
@@ -603,6 +619,53 @@ impl App {
         }
     }
 
+    /// Tab flips between the arrangement and the track screen, Shift+Tab
+    /// between the clip and the devices, Esc goes back to the arrangement,
+    /// and on the track screen Ctrl+arrows go to other clips and tracks.
+    fn view_keys(&mut self, ctx: &egui::Context) {
+        let shift = egui::Modifiers::SHIFT;
+        let ctrl = egui::Modifiers::COMMAND;
+        let key = |m, k| ctx.input_mut(|i| i.consume_key(m, k));
+        let no_focus_move = || no_focus_move(ctx);
+        // Shift+Tab first: Tab alone would take it too.
+        if key(shift, Key::Tab) {
+            no_focus_move();
+            self.tab = match self.tab {
+                Tab::Clip => Tab::Devices,
+                Tab::Devices => Tab::Clip,
+            };
+            self.show_track();
+        } else if key(egui::Modifiers::NONE, Key::Tab) {
+            no_focus_move();
+            if self.view == View::Track {
+                self.view = View::Arrange;
+            } else {
+                self.show_track();
+            }
+        }
+        if self.view != View::Track {
+            return;
+        }
+        // Esc also closes an open menu; let it do just that.
+        if !ctx.any_popup_open() && key(egui::Modifiers::NONE, Key::Escape) {
+            self.view = View::Arrange;
+            return;
+        }
+        if key(ctrl, Key::ArrowLeft) {
+            self.step_clip(-1);
+        }
+        if key(ctrl, Key::ArrowRight) {
+            self.step_clip(1);
+        }
+        let track = self.arrange.selected_track;
+        if key(ctrl, Key::ArrowUp) && track > 0 {
+            self.go_to_track(track - 1);
+        }
+        if key(ctrl, Key::ArrowDown) {
+            self.go_to_track(track + 1);
+        }
+    }
+
     /// Move the playhead to the start: of the loop, if there is one.
     fn go_to_start(&mut self) {
         let start = self.doc.song.loop_range.as_ref().map_or(0, |r| r.start);
@@ -752,7 +815,15 @@ impl App {
                 });
             ui.checkbox(&mut self.follow, "Follow");
             ui.add_space(16.0);
-            ui.selectable_value(&mut self.view, View::Arrange, "Arrange");
+            ui.selectable_value(&mut self.view, View::Arrange, "Arrange")
+                .on_hover_text("The tracks and their clips (Tab flips to Track)");
+            if ui
+                .selectable_label(self.view == View::Track, "Track")
+                .on_hover_text("The selected clip or the track's devices (Tab flips back)")
+                .clicked()
+            {
+                self.show_track();
+            }
             ui.selectable_value(&mut self.view, View::Rack, "Rack");
             ui.add_space(16.0);
             ui.label(RichText::new(self.project_name()).color(color::MUTED));
@@ -782,6 +853,12 @@ impl App {
         let hints = match self.view {
             View::Arrange => {
                 "space plays and stops · home goes to the start · drag clips to move them, their right edge to resize · double-click an empty spot for a new clip · right-click clips and tracks for more · drag empty space to move around · ctrl+scroll to zoom"
+            }
+            View::Track if self.tab == Tab::Clip => {
+                "tab: back to the arrangement · shift+tab: devices · ctrl+left and right: other clips · ctrl+up and down: other tracks · click or drag to add and remove hits · right-click a hit to roll it · scroll over a hit for velocity · click a lane name to hear it"
+            }
+            View::Track => {
+                "tab: back to the arrangement · shift+tab: the clip · ctrl+up and down: other tracks · drag or scroll knobs (shift: fine) · click switches · double-click resets"
             }
             View::Rack => {
                 "drag between jacks to patch · drag a plug out to unplug · drag or scroll knobs (shift: fine) · click switches · double-click resets · right-click a knob to automate it"
@@ -819,6 +896,7 @@ impl App {
         }
         if out.open_clip {
             self.tab = Tab::Clip;
+            self.view = View::Track;
         }
         self.changes(out.edits, out.live, false, out.gesture_done);
         if playing || ui.input(|i| i.pointer.any_down()) {
@@ -1006,73 +1084,146 @@ impl App {
         });
     }
 
-    /// The bottom panel: the selected clip in the clip editor, or the
-    /// selected track's devices.
-    fn editor_panel(&mut self, ui: &mut egui::Ui) {
+    /// Show the track screen. With no clip open, the selected track's clip
+    /// nearest the playhead opens.
+    fn show_track(&mut self) {
+        self.view = View::Track;
+        if self.open_clip().is_none() {
+            let (track, pos) = (self.arrange.selected_track, self.controller.position());
+            if let Some(c) = track::clip_near(&self.doc.song, track, pos) {
+                self.select(Select::Clip(c));
+            }
+        }
+    }
+
+    /// The clip open in the clip editor: the selected one, if it exists.
+    fn open_clip(&self) -> Option<crate::song::ClipRef> {
+        self.arrange
+            .selected_clip
+            .filter(|&c| self.doc.song.clip(c).is_some())
+    }
+
+    /// Open the clip `delta` places along the track.
+    fn step_clip(&mut self, delta: isize) {
+        let track = self.arrange.selected_track;
+        if let Some(c) = track::step_clip(&self.doc.song, track, self.open_clip(), delta) {
+            self.select(Select::Clip(c));
+        }
+    }
+
+    /// Go to track `track`, opening its clip nearest the open one (or the
+    /// playhead).
+    fn go_to_track(&mut self, track: usize) {
+        if track >= self.doc.song.tracks.len() {
+            return;
+        }
+        let at = self
+            .open_clip()
+            .and_then(|c| self.doc.song.clip(c))
+            .map_or_else(|| self.controller.position(), |c| c.start);
+        match track::clip_near(&self.doc.song, track, at) {
+            Some(c) => self.select(Select::Clip(c)),
+            None => self.select(Select::Track(track)),
+        }
+    }
+
+    /// The track screen: the selected clip in the clip editor, or the
+    /// selected track's devices, with ways to get to the others.
+    fn track_view(&mut self, ui: &mut egui::Ui) {
         let song = &self.doc.song;
         let track = self.arrange.selected_track;
-        let clip = self
-            .arrange
-            .selected_clip
-            .filter(|&c| song.clip(c).is_some());
+        let clip = self.open_clip();
         let mut grid = None;
+        let mut go_track = None;
+        let mut step = 0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            ui.selectable_value(&mut self.tab, Tab::Clip, RichText::new("Clip editor").size(15.0));
-            ui.selectable_value(&mut self.tab, Tab::Devices, RichText::new("Devices").size(15.0));
+            ui.selectable_value(&mut self.tab, Tab::Clip, RichText::new("Clip").size(15.0))
+                .on_hover_text("Shift+Tab flips between the clip and the devices");
+            ui.selectable_value(
+                &mut self.tab,
+                Tab::Devices,
+                RichText::new("Devices").size(15.0),
+            )
+            .on_hover_text("Shift+Tab flips between the clip and the devices");
             ui.add_space(16.0);
-            let name = song.tracks.get(track).map_or("", |t| t.name.as_str());
-            match (self.tab, clip.and_then(|c| song.clip(c).map(|x| (c, x)))) {
-                (Tab::Clip, Some((at, c))) => {
-                    ui.label(
-                        RichText::new(format!(
-                            "{name} · bar {} · {} rows",
-                            arrange::position_text(c.start),
-                            c.cells.len()
-                        ))
-                        .color(color::MUTED),
-                    );
-                    let mut rpb = c.rows_per_beat;
-                    egui::ComboBox::from_id_salt("grid")
-                        .selected_text(format!("{rpb} rows per beat"))
-                        .show_ui(ui, |ui| {
-                            for r in crate::song::RESOLUTIONS {
-                                ui.selectable_value(&mut rpb, r, format!("{r} rows per beat"));
-                            }
-                        });
-                    if rpb != c.rows_per_beat {
-                        grid = Some(Edit::Resolution(at, rpb));
+            let name = song
+                .tracks
+                .get(track)
+                .map_or("no tracks", |t| t.name.as_str());
+            egui::ComboBox::from_id_salt("track")
+                .selected_text(
+                    RichText::new(name).color(color::TRACKS[track % color::TRACKS.len()]),
+                )
+                .show_ui(ui, |ui| {
+                    for (i, t) in song.tracks.iter().enumerate() {
+                        if ui.selectable_label(i == track, &t.name).clicked() && i != track {
+                            go_track = Some(i);
+                        }
                     }
-                    ui.add_space(16.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(
-                                "click or drag to add and remove hits · right-click a hit to roll it · scroll over a hit for velocity · click a lane name to hear it",
-                            )
-                            .color(color::DIM),
-                        )
-                        .truncate(),
-                    );
+                })
+                .response
+                .on_hover_text("Ctrl+Up and Ctrl+Down for the track above or below");
+            if self.tab != Tab::Clip {
+                return;
+            }
+            let clips = song.tracks.get(track).map_or(0, |t| t.clips.len());
+            let index = clip.map(|c| c.1);
+            if ui
+                .add_enabled(index.is_some_and(|i| i > 0), egui::Button::new("‹"))
+                .on_hover_text("The clip before (Ctrl+Left)")
+                .clicked()
+            {
+                step = -1;
+            }
+            if ui
+                .add_enabled(index.is_some_and(|i| i + 1 < clips), egui::Button::new("›"))
+                .on_hover_text("The clip after (Ctrl+Right)")
+                .clicked()
+            {
+                step = 1;
+            }
+            if let Some((at, c)) = clip.and_then(|c| song.clip(c).map(|x| (c, x))) {
+                ui.label(
+                    RichText::new(format!(
+                        "clip {} of {clips} · bar {} · {} rows",
+                        at.1 + 1,
+                        arrange::position_text(c.start),
+                        c.cells.len()
+                    ))
+                    .color(color::MUTED),
+                );
+                let mut rpb = c.rows_per_beat;
+                egui::ComboBox::from_id_salt("grid")
+                    .selected_text(format!("{rpb} rows per beat"))
+                    .show_ui(ui, |ui| {
+                        for r in crate::song::RESOLUTIONS {
+                            ui.selectable_value(&mut rpb, r, format!("{r} rows per beat"));
+                        }
+                    });
+                if rpb != c.rows_per_beat {
+                    grid = Some(Edit::Resolution(at, rpb));
                 }
-                (Tab::Devices, _) if !name.is_empty() => {
-                    ui.label(RichText::new(format!("{name} · instrument and effects")).color(color::MUTED));
-                    ui.add_space(16.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(
-                                "drag or scroll knobs (shift: fine) · click switches · double-click resets",
-                            )
-                            .color(color::DIM),
-                        )
-                        .truncate(),
-                    );
-                }
-                _ => {}
             }
         });
+        if self.tab == Tab::Clip && track < song.tracks.len() {
+            ui.add_space(4.0);
+            let pos = self.controller.position();
+            if let Some(c) = track::strip(ui, song, track, clip, pos) {
+                self.select(Select::Clip(c));
+            }
+        }
         if let Some(edit) = grid {
             self.changes(vec![edit], None, false, false);
         }
+        if let Some(t) = go_track {
+            self.go_to_track(t);
+        }
+        if step != 0 {
+            self.step_clip(step);
+        }
+        let clip = self.open_clip();
+        let track = self.arrange.selected_track;
         ui.separator();
         let (_, rect) = ui.allocate_space(ui.available_size());
         let mut content = ui.new_child(egui::UiBuilder::new().max_rect(rect));
@@ -1080,11 +1231,14 @@ impl App {
         match self.tab {
             Tab::Clip => {
                 let Some(at) = clip else {
+                    let has_clips = song.tracks.get(track).is_some_and(|t| !t.clips.is_empty());
+                    let text = if has_clips {
+                        "Pick a clip in the strip above, or with Ctrl+Left and Ctrl+Right."
+                    } else {
+                        "This track has no clips yet. Double-click an empty spot in its lane in the arrangement for one."
+                    };
                     content.centered_and_justified(|ui| {
-                        ui.label(
-                            RichText::new("Select a clip to edit it here, or double-click an empty spot in a lane for a new one.")
-                                .color(color::MUTED),
-                        );
+                        ui.label(RichText::new(text).color(color::MUTED));
                     });
                     return;
                 };
@@ -1229,16 +1383,19 @@ impl eframe::App for App {
             });
         }
         // Space plays and stops and Home goes back to the start, unless
-        // they're being typed into a dialog. They're taken here, before any
-        // widget sees them, so a button that has focus from a click doesn't
-        // press itself again.
-        if self.dialog.is_none() && self.confirm.is_none() && !ctx.egui_wants_keyboard_input() {
+        // they're being typed into a text field or a dialog is up. They're
+        // taken here, before any widget sees them, so a button that has
+        // focus doesn't press itself again. (Any focused widget counts as
+        // egui wanting the keyboard, so that's not the test: a Tab that
+        // gave a button focus would stop the next Tab from working.)
+        if self.dialog.is_none() && self.confirm.is_none() && !ctx.text_edit_focused() {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Space)) {
                 self.play_or_stop();
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Home)) {
                 self.go_to_start();
             }
+            self.view_keys(&ctx);
             for s in ctx.input_mut(take_shortcuts) {
                 self.shortcut(&ctx, s);
             }
@@ -1268,17 +1425,6 @@ impl eframe::App for App {
             .frame(frame(color::PANEL))
             .show(ui, |ui| self.status(ui));
         if self.view == View::Arrange {
-            // At most a share of the window, so the tracks keep room even
-            // when the window is small for its zoom. (The default size is
-            // taken once, before the window has its real size.)
-            let most = (ctx.content_rect().height() * 0.45).max(160.0);
-            egui::Panel::bottom("editor")
-                .resizable(true)
-                .default_size(330.0)
-                .max_size(most)
-                .min_size(160.0)
-                .frame(frame(color::BG).inner_margin(egui::Margin::symmetric(10, 6)))
-                .show(ui, |ui| self.editor_panel(ui));
             let pick = egui::Panel::left("browser")
                 .resizable(true)
                 .default_size(250.0)
@@ -1297,6 +1443,11 @@ impl eframe::App for App {
             .frame(frame(color::BG))
             .show(ui, |ui| match self.view {
                 View::Arrange => self.arrange(ui),
+                View::Track => {
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| self.track_view(ui));
+                }
                 View::Rack => self.rack(ui),
             });
         self.dialogs(&ctx);
@@ -1374,5 +1525,43 @@ mod tests {
             ]
         );
         assert_eq!(left, 1, "a plain Z is left alone");
+    }
+
+    #[test]
+    fn tab_doesnt_give_a_button_focus_when_the_app_takes_it() {
+        let ctx = egui::Context::default();
+        let tab = || egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let frame = |input, take: bool| {
+            let mut full = ctx.run_ui(input, |ui| {
+                if take {
+                    no_focus_move(ui.ctx());
+                }
+                let _ = ui.button("File");
+            });
+            full.textures_delta.clear();
+        };
+        frame(egui::RawInput::default(), false);
+        frame(tab(), false);
+        assert!(
+            ctx.memory(|m| m.focused().is_some()),
+            "egui's own Tab focuses it"
+        );
+        frame(tab(), true);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            None,
+            "and taking Tab undoes that"
+        );
+        frame(tab(), true);
+        assert_eq!(ctx.memory(|m| m.focused()), None, "every time");
     }
 }

@@ -57,6 +57,10 @@ pub struct StepView {
     /// The clip and kind the scroll was set for: another clip gets its
     /// lanes centred again.
     scrolled_for: Option<(ClipRef, bool)>,
+    /// The lane to keep in the middle until the lanes are scrolled by hand:
+    /// the view's height can change after a clip opens (the window's first
+    /// frames, a resize), and its notes should stay in sight.
+    centre_lane: Option<usize>,
     /// First row shown.
     col_scroll: usize,
     /// The row last touched, outlined.
@@ -74,6 +78,7 @@ impl Default for StepView {
             wheeling: false,
             lane_scroll: 0,
             scrolled_for: None,
+            centre_lane: None,
             col_scroll: 0,
             cursor: None,
             velocity: 110,
@@ -652,6 +657,7 @@ impl StepView {
             self.col_scroll = 0;
             self.cursor = None;
             self.gesture = None;
+            self.centre_lane = None;
             if synth {
                 let mut notes: Vec<u16> = cells
                     .iter()
@@ -659,9 +665,11 @@ impl StepView {
                     .collect();
                 notes.sort_unstable();
                 let centre = notes.get(notes.len() / 2).copied().unwrap_or(HOME_NOTE);
-                let lane = lanes.iter().position(|&v| v == centre).unwrap_or(0);
-                self.lane_scroll = lane.saturating_sub(fit / 2);
+                self.centre_lane = lanes.iter().position(|&v| v == centre);
             }
+        }
+        if let Some(lane) = self.centre_lane {
+            self.lane_scroll = lane.saturating_sub(fit / 2);
         }
         self.lane_scroll = self.lane_scroll.min(lanes.len().saturating_sub(fit));
 
@@ -862,6 +870,7 @@ impl StepView {
                 if dy != 0.0 {
                     let lanes = (-dy / g.lane_h).round() as isize;
                     self.lane_scroll = (self.lane_scroll as isize + lanes).max(0) as usize;
+                    self.centre_lane = None;
                 }
             }
         }

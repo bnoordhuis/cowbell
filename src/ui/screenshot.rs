@@ -1,8 +1,9 @@
 //! Dev-only screenshots, for checking the UI without a person at the screen.
 //!
 //! `COWBELL_SCREENSHOT=out.ppm` saves the window as a binary PPM and exits.
-//! `COWBELL_VIEW=rack` shows the rack instead of the arrangement,
-//! `COWBELL_SELECT=track,clip` selects a clip for the clip editor, and
+//! `COWBELL_VIEW=rack` or `COWBELL_VIEW=track` shows the rack or the track
+//! screen instead of the arrangement,
+//! `COWBELL_SELECT=track,clip` selects a clip for the clip editor,
 //! `COWBELL_TAB=devices` shows the devices tab instead, and
 //! `COWBELL_DIALOG=open|save|export` opens a file dialog.
 
