@@ -510,7 +510,9 @@ impl Song {
     }
 
     /// A copy of a track, clips and all, just below it. Its rack device
-    /// starts with the same settings and goes into a free mixer channel.
+    /// starts with the same settings and goes into a free mixer channel. A
+    /// synth gets its own copy of the patch, so turning one's knobs leaves
+    /// the other alone; samples don't change, so the copy shares them.
     pub fn duplicate_track(&mut self, track: usize) -> Option<usize> {
         if self.tracks.len() >= MAX_TRACKS {
             return None;
@@ -518,6 +520,12 @@ impl Song {
         let mut copy = self.tracks.get(track)?.clone();
         copy.name.push_str(" copy");
         copy.solo = false;
+        if let Some(Instrument::Synth(patch)) = self.instruments.get(copy.instrument) {
+            let mut patch = SynthPatch::clone(patch);
+            patch.name.push_str(" copy");
+            self.instruments.push(Instrument::Synth(Arc::new(patch)));
+            copy.instrument = self.instruments.len() - 1;
+        }
         let t = track + 1;
         self.tracks.insert(t, copy);
         let params = self.rack.track_device(track).map(|d| d.params.clone());
@@ -734,6 +742,25 @@ mod tests {
         while song.add_track("more", 0).is_some() {}
         assert_eq!(song.tracks.len(), MAX_TRACKS);
         assert_eq!(song.duplicate_track(0), None);
+    }
+
+    #[test]
+    fn a_duplicated_synth_track_gets_its_own_patch() {
+        let acid = SynthPatch::new(crate::synthvoice::SynthKind::Acid, "acid");
+        let instruments = vec![Instrument::Synth(Arc::new(acid))];
+        let mut song = Song::new(120.0, instruments, vec![Track::new("bass", 0)]);
+        assert_eq!(song.duplicate_track(0), Some(1));
+        assert_eq!(song.tracks[0].instrument, 0);
+        assert_eq!(song.tracks[1].instrument, 1);
+        assert_eq!(song.instruments[1].name(), "acid copy");
+        let Instrument::Synth(copy) = &mut song.instruments[1] else {
+            panic!("not a synth");
+        };
+        Arc::make_mut(copy).params[0] = -1.0;
+        let Instrument::Synth(original) = &song.instruments[0] else {
+            panic!("not a synth");
+        };
+        assert_ne!(original.params[0], -1.0, "the original keeps its knobs");
     }
 
     #[test]
