@@ -212,6 +212,40 @@ fn audition_plays_while_stopped() {
 }
 
 #[test]
+fn a_previewed_file_plays_to_its_end_and_can_be_stopped() {
+    let song = Song::new(120.0, Vec::new(), Vec::new());
+    let (mut engine, mut controller) = Engine::new(RATE, song);
+    // Not in the song, and played while the song is stopped.
+    let file = Sample::new("file", RATE, vec![[0.5, 0.5]; 150]);
+    assert!(
+        controller
+            .send(Command::Preview(Some(Arc::new(file))))
+            .is_ok()
+    );
+    let mut buf = vec![0.0; 2 * 200];
+    engine.process(&mut buf);
+    let sounding = buf
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .filter(|f| f[0] != 0.0)
+        .count();
+    assert_eq!(sounding, 150);
+    assert!(!controller.is_playing(), "the song stays stopped");
+    let long = Sample::new("long", RATE, vec![[0.5, 0.5]; 10_000]);
+    assert!(
+        controller
+            .send(Command::Preview(Some(Arc::new(long))))
+            .is_ok()
+    );
+    engine.process(&mut buf);
+    assert!(buf.iter().all(|&s| s != 0.0));
+    assert!(controller.send(Command::Preview(None)).is_ok());
+    engine.process(&mut buf);
+    assert!(buf.iter().all(|&s| s == 0.0));
+}
+
+#[test]
 fn play_from_starts_at_row() {
     let mut song = one_track_song(click(10), 120.0, 4, 1);
     song.tracks[0].clips[0].cells[2] = Cell::hit(0, 127);

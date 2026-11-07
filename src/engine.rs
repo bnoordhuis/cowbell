@@ -14,6 +14,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::graph::{BLOCK, Graph};
 use crate::rack::DeviceId;
+use crate::sample::Sample;
 use crate::song::{Cell, Fx, Instrument, Song, TICKS_PER_BEAT, Target, Tick, Trigger};
 use crate::synthvoice::{MAX_CHORD, SynthTrack};
 use crate::voice::Voice;
@@ -44,6 +45,10 @@ pub enum Command {
     },
     /// Release held audition notes.
     Release,
+    /// Play a sample's first slice, outside the song, as when picking a
+    /// file: a freshly loaded file is one slice, start to end. `None` stops
+    /// it.
+    Preview(Option<Arc<Sample>>),
     SetBpm(f64),
     /// Replace the song. Playback continues from the same tick, if the new
     /// song is that long. Notes keep ringing if their sample is the same in
@@ -64,6 +69,7 @@ pub enum Command {
 pub enum Garbage {
     Song(#[allow(dead_code)] Box<Song>),
     Graph(#[allow(dead_code)] Box<Graph>),
+    Sample(#[allow(dead_code)] Arc<Sample>),
 }
 
 pub struct Engine {
@@ -93,6 +99,10 @@ pub struct Engine {
     graph: Box<Graph>,
     /// The audition voice skips the graph and goes straight to the output.
     audition: Vec<[f32; 2]>,
+    /// A sample file playing outside the song, and its voice. It goes to
+    /// the output with the audition.
+    preview: Option<Arc<Sample>>,
+    preview_voice: Voice,
     commands: Consumer<Command>,
     trash: Producer<Garbage>,
     shared_pos: Arc<AtomicU64>,
@@ -163,6 +173,8 @@ impl Engine {
             synths: Default::default(),
             graph,
             audition: vec![[0.0; 2]; BLOCK],
+            preview: None,
+            preview_voice: Voice::default(),
             commands: cmd_rx,
             trash: trash_tx,
             shared_pos: shared_pos.clone(),
@@ -224,6 +236,24 @@ impl Engine {
                     self.stop_voices();
                 }
                 Command::Release => self.synths[AUDITION].note_off_in(0.0),
+                Command::Preview(sample) => {
+                    self.preview_voice.stop();
+                    if let Some(sample) = &sample {
+                        let fpr = frames_per_row(self.out_rate, self.song.bpm, 4);
+                        let first = Trigger::new(0, 127);
+                        self.preview_voice.trigger(
+                            0,
+                            sample,
+                            first,
+                            std::iter::empty(),
+                            self.out_rate,
+                            fpr,
+                        );
+                    }
+                    if let Some(old) = std::mem::replace(&mut self.preview, sample) {
+                        self.discard(Garbage::Sample(old));
+                    }
+                }
                 Command::Audition {
                     instrument,
                     slice,
@@ -601,6 +631,12 @@ impl Engine {
                 }
                 let hit = hit | voice.take_hit() | synth.take_hit();
                 if t == AUDITION {
+                    if let Some(sample) = &self.preview
+                        && self.preview_voice.is_active()
+                    {
+                        let p = self.preview_voice.next_frame(sample, false);
+                        frame = [frame[0] + p[0], frame[1] + p[1]];
+                    }
                     self.audition[i] = frame;
                 } else if audible[t] {
                     self.graph.write_track(t, i, frame, hit);

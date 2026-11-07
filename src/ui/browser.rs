@@ -2,8 +2,8 @@
 //! with, and a folder of samples.
 //!
 //! Click an instrument to add a track playing it. Click a folder to go into
-//! it; double-click a sample, or pick it and click "Add", to add a track
-//! playing it, sliced on its hits.
+//! it. Click a sample to hear it; double-click it, or pick it and click
+//! "Add", to add a track playing it, sliced on its hits.
 
 use std::path::{Path, PathBuf};
 
@@ -26,6 +26,8 @@ pub struct Browser {
     dir: PathBuf,
     entries: Vec<Entry>,
     selected: Option<PathBuf>,
+    /// A sample clicked, to play.
+    preview: Option<PathBuf>,
     error: Option<String>,
 }
 
@@ -35,6 +37,7 @@ impl Browser {
             dir: PathBuf::new(),
             entries: Vec::new(),
             selected: None,
+            preview: None,
             error: None,
         };
         b.cd(dir);
@@ -119,6 +122,11 @@ impl Browser {
                         go = Some(e.path.clone());
                     } else if !e.dir && r.clicked() {
                         self.selected = Some(e.path.clone());
+                        // The second click of a double-click adds the
+                        // sample; it shouldn't start it over.
+                        if !r.double_clicked() {
+                            self.preview = Some(e.path.clone());
+                        }
                     }
                     if !e.dir && r.double_clicked() {
                         pick = Some(Pick::Sample(e.path.clone()));
@@ -132,7 +140,7 @@ impl Browser {
             pick = self.selected.clone().map(Pick::Sample);
         }
         ui.label(
-            RichText::new("double-click a sample to add it")
+            RichText::new("click a sample to hear it, double-click to add it")
                 .size(12.0)
                 .color(color::DIM),
         );
@@ -140,6 +148,11 @@ impl Browser {
             self.cd(&dir);
         }
         pick
+    }
+
+    /// The sample clicked since the last call, to play.
+    pub fn take_preview(&mut self) -> Option<PathBuf> {
+        self.preview.take()
     }
 }
 

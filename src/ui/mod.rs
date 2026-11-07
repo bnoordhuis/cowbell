@@ -419,6 +419,21 @@ impl App {
         }
     }
 
+    /// Play a sample file, outside the song.
+    fn preview(&mut self, path: &std::path::Path) {
+        match Sample::load_wav(path) {
+            Ok(sample) => {
+                let _ = self
+                    .controller
+                    .send(Command::Preview(Some(Arc::new(sample))));
+            }
+            Err(e) => {
+                let _ = self.controller.send(Command::Preview(None));
+                self.say(format!("can't play {}: {e}", path.display()));
+            }
+        }
+    }
+
     fn pick(&mut self, pick: browser::Pick) {
         match pick {
             browser::Pick::Kit => {
@@ -1056,6 +1071,9 @@ impl eframe::App for App {
                 .frame(frame(color::PANEL).inner_margin(egui::Margin::symmetric(10, 8)))
                 .show(ui, |ui| self.browser.show(ui))
                 .inner;
+            if let Some(path) = self.browser.take_preview() {
+                self.preview(&path);
+            }
             if let Some(pick) = pick {
                 self.pick(pick);
             }
