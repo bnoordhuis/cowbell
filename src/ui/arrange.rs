@@ -2,6 +2,9 @@
 //! with a bar ruler on top and the track headers on the left.
 //!
 //! - Ruler: click to move the playhead, drag along it to set the loop.
+//!   The loop is the band along its top: clicking that doesn't move the
+//!   playhead, and double-clicking it (or right-clicking the ruler)
+//!   removes the loop.
 //! - Clips: drag to move (to another lane too), drag the right edge to
 //!   resize, right-click to duplicate or delete. Moves and resizes snap to
 //!   [`ArrangeView::snap`].
@@ -25,6 +28,8 @@ use crate::song::{Clip, ClipRef, Instrument, Song, TICKS_PER_BAR, TICKS_PER_BEAT
 
 pub const HEADER_W: f32 = 280.0;
 pub const RULER_H: f32 = 32.0;
+/// The loop's band along the top of the ruler.
+const LOOP_H: f32 = 10.0;
 pub const LANE_H: f32 = 128.0;
 const MIN_PX_PER_BEAT: f32 = 4.0;
 const MAX_PX_PER_BEAT: f32 = 400.0;
@@ -52,6 +57,8 @@ pub struct Output {
     pub locate: Option<Tick>,
     /// Set the loop range to this.
     pub loop_range: Option<Range<Tick>>,
+    /// Stop looping.
+    pub loop_off: bool,
     /// Edits to make now, each one undo step.
     pub edits: Vec<Edit>,
     /// Part of a mouse gesture (a drag): to be made on the song as it was
@@ -64,12 +71,13 @@ pub struct Output {
 }
 
 enum Drag {
-    /// On the ruler: the beat it started on, where on screen, and whether
-    /// it has turned into a drag yet.
+    /// On the ruler: the beat it started on, where on screen, whether it
+    /// has turned into a drag yet, and whether it started on the loop.
     Ruler {
         from: Tick,
         x: f32,
         moved: bool,
+        on_loop: bool,
     },
     /// Moving the view: where the press was, and the scroll offsets then.
     Pan {
@@ -112,6 +120,7 @@ impl Drag {
 enum Context {
     Clip(ClipRef),
     Track(usize),
+    Ruler,
 }
 
 /// A track name being edited.
@@ -274,6 +283,18 @@ impl Geometry {
         )
     }
 
+    /// Whether `p` is on the loop's band.
+    fn on_loop(&self, p: Pos2, song: &Song) -> bool {
+        let Some(range) = &song.loop_range else {
+            return false;
+        };
+        let band = Rect::from_min_max(
+            pos2(self.x(range.start as f64), self.ruler.top()),
+            pos2(self.x(range.end as f64), self.ruler.top() + LOOP_H),
+        );
+        self.ruler.contains(p) && band.contains(p)
+    }
+
     fn hit(&self, p: Pos2, song: &Song) -> Hit {
         if self.ruler.contains(p) {
             return Hit::Ruler(self.tick_at(p.x));
@@ -374,6 +395,7 @@ impl ArrangeView {
                     self.selected_track = t;
                     Some(Context::Track(t))
                 }
+                Hit::Ruler(_) => Some(Context::Ruler),
                 _ => None,
             };
         }
@@ -384,8 +406,13 @@ impl ArrangeView {
             && let Some(drag) = self.drag.take()
         {
             match drag {
+                // A click on the loop is probably the start of a
+                // double-click to remove it, so it leaves the playhead be.
                 Drag::Ruler {
-                    from, moved: false, ..
+                    from,
+                    moved: false,
+                    on_loop: false,
+                    ..
                 } => out.locate = Some(from),
                 d if d.edited() => out.gesture_done = true,
                 _ => {}
@@ -403,6 +430,7 @@ impl ArrangeView {
                 Hit::Header(track) if name_rect(g.header_rect(track)).contains(p) => {
                     self.start_rename(track, song);
                 }
+                Hit::Ruler(_) if g.on_loop(p, song) => out.loop_off = true,
                 _ => {}
             }
         }
@@ -462,6 +490,7 @@ impl ArrangeView {
                     from: snap(tick, TICKS_PER_BEAT),
                     x: p.x,
                     moved: false,
+                    on_loop: g.on_loop(p, song),
                 });
             }
             Hit::Clip(c) => {
@@ -515,7 +544,7 @@ impl ArrangeView {
         let snap_grid = self.snap;
         let tracks = song.tracks.len();
         match &mut self.drag {
-            Some(Drag::Ruler { from, x, moved }) => {
+            Some(Drag::Ruler { from, x, moved, .. }) => {
                 if (*x - p.x).abs() > DRAG_SLOP {
                     *moved = true;
                 }
@@ -652,6 +681,20 @@ impl ArrangeView {
                 if ui.button("Delete track").clicked() {
                     out.edits.push(Edit::DeleteTrack(t));
                 }
+            }
+            Context::Ruler => {
+                let looping = song.loop_range.is_some();
+                if ui
+                    .add_enabled(looping, egui::Button::new("Remove the loop"))
+                    .clicked()
+                {
+                    out.loop_off = true;
+                }
+                ui.label(
+                    egui::RichText::new("drag along the ruler to set a loop")
+                        .size(12.0)
+                        .color(color::DIM),
+                );
             }
         });
         if let Some(t) = rename {
@@ -798,7 +841,7 @@ impl ArrangeView {
         if let Some(range) = &song.loop_range {
             let band = Rect::from_min_max(
                 pos2(g.x(range.start as f64), g.ruler.top()),
-                pos2(g.x(range.end as f64), g.ruler.top() + 8.0),
+                pos2(g.x(range.end as f64), g.ruler.top() + LOOP_H),
             );
             ruler.rect_filled(band, 0.0, color::ACCENT);
         }
@@ -1105,6 +1148,41 @@ mod tests {
                 ..Default::default()
             }]
         );
+    }
+
+    #[test]
+    fn double_clicking_the_loop_removes_it_and_leaves_the_playhead() {
+        let double_click = |looping: bool, tick: Tick, y: f32| {
+            let mut h = Harness::new();
+            if looping {
+                h.song.loop_range = Some(TICKS_PER_BAR..2 * TICKS_PER_BAR);
+            }
+            let at = pos2(h.x(tick), y);
+            h.click(at);
+            h.click(at);
+            let off = h.out.iter().filter(|o| o.loop_off).count();
+            let locates = h.out.iter().filter(|o| o.locate.is_some()).count();
+            (off, locates)
+        };
+        let inside = TICKS_PER_BAR + TICKS_PER_BEAT;
+        assert_eq!(double_click(true, inside, 4.0), (1, 0), "on the loop");
+        assert_eq!(double_click(false, inside, 4.0), (0, 2), "no loop");
+        assert_eq!(
+            double_click(true, 3 * TICKS_PER_BAR, 4.0),
+            (0, 2),
+            "beside it"
+        );
+        assert_eq!(double_click(true, inside, 20.0), (0, 2), "below it");
+    }
+
+    #[test]
+    fn a_loop_can_be_dragged_out_from_on_the_loop() {
+        let mut h = Harness::new();
+        h.song.loop_range = Some(TICKS_PER_BAR..2 * TICKS_PER_BAR);
+        let (a, b) = (h.x(TICKS_PER_BAR + 20), h.x(4 * TICKS_PER_BAR - 30));
+        h.drag(pos2(a, 4.0), pos2(b, 4.0));
+        let last = h.out.last().unwrap();
+        assert_eq!(last.loop_range, Some(TICKS_PER_BAR..4 * TICKS_PER_BAR));
     }
 
     #[test]

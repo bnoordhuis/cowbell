@@ -636,7 +636,7 @@ impl App {
             }
             let looping = self.doc.song.loop_range.is_some();
             if icon_button(ui, Icon::Loop, looping)
-                .on_hover_text("Loop (drag along the ruler to set where)")
+                .on_hover_text("Loop (drag along the ruler to set where; click here or double-click the loop to turn it off)")
                 .clicked()
             {
                 self.set_loop(!looping);
@@ -730,6 +730,9 @@ impl App {
         if let Some(range) = out.loop_range {
             self.loop_memory = range;
             self.set_loop(true);
+        }
+        if out.loop_off {
+            self.set_loop(false);
         }
         if out.open_clip {
             self.tab = Tab::Clip;
