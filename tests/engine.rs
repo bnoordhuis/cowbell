@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use cowbell::engine::{Command, Engine};
-use cowbell::rack::Rack;
+use cowbell::rack::{MASTER_LIMIT, Rack};
 use cowbell::sample::Sample;
 use cowbell::song::{Cell, Clip, Fx, Instrument, Song, Track, Trigger};
 use cowbell::transform::Roll;
@@ -17,13 +17,18 @@ fn click(len: usize) -> Sample {
     Sample::new("click", RATE, frames)
 }
 
+/// One track playing `sample`. The master's limiter is off: these tests
+/// check voices sample for sample, some of them louder than its knee.
 fn one_track_song(sample: Sample, bpm: f64, rpb: u32, beats: u32) -> Song {
     let track = Track::new("t", 0).with_clip(Clip::beats(0, rpb, beats));
-    Song::new(
+    let mut song = Song::new(
         bpm,
         vec![Instrument::Sampler(Arc::new(sample))],
         vec![track],
-    )
+    );
+    let master = master_id(&song.rack);
+    song.rack.set_param(master, MASTER_LIMIT, 0.0);
+    song
 }
 
 fn render(song: Song, frames: usize) -> Vec<f32> {
@@ -343,7 +348,11 @@ fn cut_song(declick: bool) -> Song {
 fn declick_is_on_by_default() {
     let song = one_track_song(click(10), 120.0, 4, 1);
     let t = song.rack.track_device(0).unwrap();
-    assert_eq!(t.params, vec![1.0, 1.0], "declick on, full volume");
+    assert_eq!(
+        t.params,
+        vec![1.0, 1.0, 0.0],
+        "declick on, full volume, in the middle"
+    );
 }
 
 #[test]

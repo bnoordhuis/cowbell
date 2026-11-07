@@ -379,7 +379,7 @@ impl RackView {
             && let Some(p) = pointer
             && let Some((device, param)) = l.knob_at(p)
             // Switches step on every click instead.
-            && rack.device(device).unwrap().kind.params()[param].labels.is_empty()
+            && !rack.device(device).unwrap().kind.params()[param].is_switch()
         {
             let default = rack.device(device).unwrap().kind.params()[param].default;
             let before = rack.clone();

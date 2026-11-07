@@ -165,7 +165,8 @@ fn stop_label(c: Pos2, k: f32) -> (Pos2, Align2) {
 pub fn width(spec: &ParamSpec, char_w: f32) -> f32 {
     let text = |s: &str| s.chars().count() as f32 * char_w;
     let mut half = (text(spec.name) / 2.0).max(LED_RING + LED_RADIUS);
-    for (k, label) in stops(spec.labels.len()).zip(spec.labels) {
+    let stop_labels = if spec.is_switch() { spec.labels } else { &[] };
+    for (k, label) in stops(stop_labels.len()).zip(stop_labels) {
         let (p, align) = stop_label(Pos2::ZERO, k);
         let reach = match align {
             Align2::CENTER_BOTTOM => p.x.abs() + text(label) / 2.0,
@@ -186,7 +187,7 @@ pub fn draw(
     font: &FontId,
     automated: bool,
 ) {
-    if spec.labels.is_empty() {
+    if !spec.is_switch() {
         draw_knob(p, c, spec, value, font);
     } else {
         draw_switch(p, c, spec, value, font);

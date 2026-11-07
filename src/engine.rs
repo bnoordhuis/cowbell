@@ -158,7 +158,8 @@ impl Engine {
         let (trash_tx, trash_rx) = RingBuffer::new(64);
         let shared_pos = Arc::new(AtomicU64::new(0));
         let shared_playing = Arc::new(AtomicBool::new(false));
-        let graph = Box::new(Graph::build(&song.rack, out_rate));
+        let mut graph = Box::new(Graph::build(&song.rack, out_rate));
+        graph.set_tempo(song.bpm);
         let engine = Engine {
             out_rate: out_rate as f64,
             song: Box::new(song),
@@ -284,9 +285,13 @@ impl Engine {
                     }
                     None => {}
                 },
-                Command::SetBpm(bpm) => self.song.bpm = bpm,
+                Command::SetBpm(bpm) => {
+                    self.song.bpm = bpm;
+                    self.graph.set_tempo(bpm);
+                }
                 Command::SwapSong(song) => {
                     let old = std::mem::replace(&mut self.song, song);
+                    self.graph.set_tempo(self.song.bpm);
                     // A voice indexes into its sample's frames, so it can only
                     // keep playing if the new song has the very same sample.
                     // Synths read their patch fresh every frame, so they only
@@ -321,6 +326,7 @@ impl Engine {
                 }
                 Command::SwapGraph(mut graph) => {
                     graph.adopt_state(&mut self.graph);
+                    graph.set_tempo(self.song.bpm);
                     let old = std::mem::replace(&mut self.graph, graph);
                     self.discard(Garbage::Graph(old));
                 }

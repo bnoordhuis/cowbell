@@ -39,6 +39,10 @@ pub struct ParamSpec {
     pub unit: &'static str,
     /// Names for `Steps` params, e.g. filter modes.
     pub labels: &'static [&'static str],
+    /// Drawn as a switch, with a label at each stop, that clicks through
+    /// its choices. Otherwise a named `Steps` param is an ordinary knob
+    /// that shows the name of its value (too many names for a switch).
+    pub switch: bool,
 }
 
 impl ParamSpec {
@@ -58,7 +62,21 @@ impl ParamSpec {
             curve,
             unit,
             labels: &[],
+            switch: false,
         }
+    }
+
+    /// A knob that turns through named values, like note lengths.
+    pub const fn named(name: &'static str, default: f32, labels: &'static [&'static str]) -> Self {
+        ParamSpec {
+            switch: false,
+            ..ParamSpec::labelled(name, default, labels)
+        }
+    }
+
+    /// Whether it's drawn and clicked as a switch.
+    pub fn is_switch(&self) -> bool {
+        self.switch && !self.labels.is_empty()
     }
 
     pub const fn labelled(
@@ -75,6 +93,7 @@ impl ParamSpec {
             curve: Curve::Steps,
             unit: "",
             labels,
+            switch: true,
         }
     }
 
@@ -108,7 +127,7 @@ impl ParamSpec {
     /// For switches (params with labels): the choice after `v`, wrapping
     /// around. Clicking such a knob steps through its choices.
     pub fn next_choice(&self, v: f32) -> Option<f32> {
-        if self.labels.is_empty() {
+        if !self.is_switch() {
             return None;
         }
         Some((v.round() + 1.0) % self.labels.len() as f32)
@@ -138,6 +157,11 @@ pub enum Kind {
     Lfo,
     Mixer,
     Master,
+    Drive,
+    Eq,
+    /// With a sidechain input: something else can do the ducking.
+    Compressor,
+    Reverb,
 }
 
 const fn port(name: &'static str, signal: Signal) -> PortSpec {
@@ -150,17 +174,30 @@ pub const MIXER_CHANNELS: usize = 6;
 
 impl Kind {
     /// Devices the user can add from the rack view.
-    pub const ADDABLE: [Kind; 5] = [
-        Kind::Crusher,
+    pub const ADDABLE: [Kind; 9] = [
+        Kind::Eq,
         Kind::Filter,
+        Kind::Drive,
+        Kind::Crusher,
+        Kind::Compressor,
         Kind::Delay,
+        Kind::Reverb,
         Kind::Lfo,
         Kind::Mixer,
     ];
 
     /// Audio in, audio out: what goes in a track's effects chain.
     pub fn is_effect(self) -> bool {
-        matches!(self, Kind::Crusher | Kind::Filter | Kind::Delay)
+        matches!(
+            self,
+            Kind::Crusher
+                | Kind::Filter
+                | Kind::Delay
+                | Kind::Drive
+                | Kind::Eq
+                | Kind::Compressor
+                | Kind::Reverb
+        )
     }
 
     pub fn name(self) -> &'static str {
@@ -172,6 +209,10 @@ impl Kind {
             Kind::Lfo => "lfo",
             Kind::Mixer => "mixer",
             Kind::Master => "master",
+            Kind::Drive => "drive",
+            Kind::Eq => "eq",
+            Kind::Compressor => "compressor",
+            Kind::Reverb => "reverb",
         }
     }
 
@@ -182,6 +223,7 @@ impl Kind {
     pub fn inputs(self) -> &'static [PortSpec] {
         const FILTER: &[PortSpec] = &[port("in", Signal::Audio), port("cutoff", Signal::Cv)];
         const LFO: &[PortSpec] = &[port("clock", Signal::Cv)];
+        const COMPRESSOR: &[PortSpec] = &[port("in", Signal::Audio), port("side", Signal::Audio)];
         const MIXER: &[PortSpec] = &[
             port("1", Signal::Audio),
             port("2", Signal::Audio),
@@ -192,7 +234,10 @@ impl Kind {
         ];
         match self {
             Kind::Track(_) => &[],
-            Kind::Crusher | Kind::Delay | Kind::Master => AUDIO_IN,
+            Kind::Crusher | Kind::Delay | Kind::Master | Kind::Drive | Kind::Eq | Kind::Reverb => {
+                AUDIO_IN
+            }
+            Kind::Compressor => COMPRESSOR,
             Kind::Filter => FILTER,
             Kind::Lfo => LFO,
             Kind::Mixer => MIXER,
@@ -204,7 +249,14 @@ impl Kind {
         const LFO: &[PortSpec] = &[port("out", Signal::Cv)];
         match self {
             Kind::Track(_) => TRACK,
-            Kind::Crusher | Kind::Filter | Kind::Delay | Kind::Mixer => AUDIO_OUT,
+            Kind::Crusher
+            | Kind::Filter
+            | Kind::Delay
+            | Kind::Mixer
+            | Kind::Drive
+            | Kind::Eq
+            | Kind::Compressor
+            | Kind::Reverb => AUDIO_OUT,
             Kind::Lfo => LFO,
             Kind::Master => &[],
         }
@@ -236,18 +288,50 @@ impl Kind {
             ParamSpec::new("time", 5.0, 1500.0, 260.0, Exp, "ms"),
             ParamSpec::new("feedback", 0.0, 0.95, 0.4, Linear, ""),
             ParamSpec::new("mix", 0.0, 1.0, 0.35, Linear, ""),
+            // Off goes by `time`; a note length follows the tempo.
+            ParamSpec::named("sync", 0.0, SYNC_LABELS),
+        ];
+        const DRIVE: &[ParamSpec] = &[
+            ParamSpec::new("drive", 0.0, 36.0, 12.0, Linear, "dB"),
+            ParamSpec::new("tone", 500.0, 16000.0, 6000.0, Exp, "Hz"),
+            ParamSpec::labelled("shape", 0.0, &["soft", "hard", "fold"]),
+            ParamSpec::new("mix", 0.0, 1.0, 1.0, Linear, ""),
+        ];
+        const EQ: &[ParamSpec] = &[
+            ParamSpec::new("low", -15.0, 15.0, 0.0, Linear, "dB"),
+            ParamSpec::new("mid", -15.0, 15.0, 0.0, Linear, "dB"),
+            ParamSpec::new("mid freq", 150.0, 8000.0, 1000.0, Exp, "Hz"),
+            ParamSpec::new("high", -15.0, 15.0, 0.0, Linear, "dB"),
+        ];
+        const COMPRESSOR: &[ParamSpec] = &[
+            ParamSpec::new("thresh", -48.0, 0.0, -18.0, Linear, "dB"),
+            ParamSpec::new("ratio", 1.0, 20.0, 4.0, Exp, ":1"),
+            ParamSpec::new("attack", 0.1, 100.0, 5.0, Exp, "ms"),
+            ParamSpec::new("release", 10.0, 1000.0, 150.0, Exp, "ms"),
+            ParamSpec::new("makeup", 0.0, 24.0, 0.0, Linear, "dB"),
+        ];
+        const REVERB: &[ParamSpec] = &[
+            ParamSpec::new("size", 0.0, 1.0, 0.6, Linear, ""),
+            ParamSpec::new("damping", 0.0, 1.0, 0.5, Linear, ""),
+            ParamSpec::new("pre-delay", 0.0, 100.0, 10.0, Linear, "ms"),
+            ParamSpec::new("mix", 0.0, 1.0, 0.25, Linear, ""),
         ];
         const LFO: &[ParamSpec] = &[
             ParamSpec::new("rate", 0.05, 30.0, 2.0, Exp, "Hz"),
             ParamSpec::labelled("shape", 0.0, &["sine", "square", "s&h"]),
             ParamSpec::new("depth", 0.0, 1.0, 1.0, Linear, ""),
         ];
-        const MASTER: &[ParamSpec] = &[ParamSpec::new("volume", 0.0, 1.5, 1.0, Linear, "")];
+        const MASTER: &[ParamSpec] = &[
+            ParamSpec::new("volume", 0.0, 1.5, 1.0, Linear, ""),
+            // Rounds off peaks so the mix never passes full scale.
+            ParamSpec::labelled("limit", 1.0, &["off", "on"]),
+        ];
         // Short fades on cuts, steals and retriggers. Off gives hard edges,
         // clicks and all.
         const TRACK: &[ParamSpec] = &[
             ParamSpec::labelled("declick", 1.0, &["off", "on"]),
             ParamSpec::new("volume", 0.0, 1.5, 1.0, Linear, ""),
+            ParamSpec::new("pan", -1.0, 1.0, 0.0, Linear, ""),
         ];
         match self {
             Kind::Track(_) => TRACK,
@@ -257,9 +341,39 @@ impl Kind {
             Kind::Lfo => LFO,
             Kind::Mixer => MIXER,
             Kind::Master => MASTER,
+            Kind::Drive => DRIVE,
+            Kind::Eq => EQ,
+            Kind::Compressor => COMPRESSOR,
+            Kind::Reverb => REVERB,
         }
     }
 }
+
+/// The delay's sync choices; [`SYNC_BEATS`] has their lengths.
+pub const SYNC_LABELS: &[&str] = &[
+    "off", "1/32", "1/16T", "1/16", "1/8T", "1/16D", "1/8", "1/4T", "1/8D", "1/4", "1/4D", "1/2",
+];
+
+/// How many beats each sync choice lasts; 0 for off.
+pub const SYNC_BEATS: [f32; 12] = [
+    0.0,
+    0.125,
+    1.0 / 6.0,
+    0.25,
+    1.0 / 3.0,
+    0.375,
+    0.5,
+    2.0 / 3.0,
+    0.75,
+    1.0,
+    1.5,
+    2.0,
+];
+
+/// The track device's pan knob.
+pub const TRACK_PAN: usize = 2;
+/// The master's limiter switch.
+pub const MASTER_LIMIT: usize = 1;
 
 pub type DeviceId = u32;
 
@@ -775,8 +889,8 @@ mod tests {
         rack.repair();
         assert_eq!(
             rack.device(t).unwrap().params,
-            vec![1.0, 1.0],
-            "declick on, full volume"
+            vec![1.0, 1.0, 0.0],
+            "declick on, full volume, in the middle"
         );
         let defaults: Vec<f32> = Kind::Filter.params().iter().map(|p| p.default).collect();
         assert_eq!(rack.device(f).unwrap().params[0], 500.0);

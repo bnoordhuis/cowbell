@@ -1,10 +1,11 @@
-//! The devices panel: the selected track's sound, left to right. Its
+//! The devices panel: the selected track's sound, in reading order. Its
 //! instrument (a synth's knobs, or the sample it slices), its track device
-//! (declick and volume), then each effect in its chain, and a card to add
-//! another.
+//! (declick, volume and pan), then each effect in its chain, and a card to
+//! add another. Cards that don't fit on a row go on the next.
 //!
 //! Drag a knob up or down (shift: fine) or scroll over it; click a switch to
-//! step it; double-click a knob to reset it. Scroll elsewhere to move along.
+//! step it; double-click a knob to reset it. Scroll elsewhere to move up and
+//! down, when there are more rows than fit.
 //! Like the other views it reports edits and changes nothing itself.
 
 use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
@@ -19,14 +20,20 @@ const TITLE_H: f32 = 30.0;
 const PAD: f32 = 10.0;
 /// Knob centres, below the card's top.
 const KNOB_Y: f32 = TITLE_H + 44.0;
+/// A card's height: its title, and a row of knobs with their labels.
+const CARD_H: f32 = KNOB_Y + 64.0;
 const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x26, 0x27, 0x2b);
 const CARD_EDGE: egui::Color32 = egui::Color32::from_rgb(0x3a, 0x3b, 0x40);
 
 /// The effects that can go in a chain, with what they do.
-pub const EFFECTS: [(Kind, &str); 3] = [
+pub const EFFECTS: [(Kind, &str); 7] = [
+    (Kind::Eq, "low, mid and high, up or down"),
     (Kind::Filter, "low, band or high pass"),
+    (Kind::Drive, "saturation, clipping or folding"),
     (Kind::Crusher, "fewer bits, lower rate: grit"),
-    (Kind::Delay, "echoes"),
+    (Kind::Compressor, "evens out the level; its side jack ducks"),
+    (Kind::Delay, "echoes, in time or in milliseconds"),
+    (Kind::Reverb, "a room, a hall, a cave"),
 ];
 
 /// A knob on the panel.
@@ -105,7 +112,7 @@ impl DevicesView {
             return out;
         };
         let (cards, add) = layout(song, t.instrument, track, area, self.scroll, char_w);
-        let content = add.right() + self.scroll - area.left() + PAD;
+        let content = add.bottom() + self.scroll - area.top() + PAD;
         let knob_at = |p: Pos2| {
             cards
                 .iter()
@@ -136,7 +143,7 @@ impl DevicesView {
                     out.live = Some(k.edit(v));
                 }
             } else if delta != 0.0 {
-                self.scroll = (self.scroll - delta).clamp(0.0, (content - area.width()).max(0.0));
+                self.scroll = (self.scroll - delta).clamp(0.0, (content - area.height()).max(0.0));
             }
         }
 
@@ -181,7 +188,7 @@ impl DevicesView {
                     knob::DRAG_RANGE
                 };
                 let v = spec.from_knob(d.start_knob + (d.start_y - p.y) / range);
-                if d.moved && spec.labels.is_empty() && v != value {
+                if d.moved && !spec.is_switch() && v != value {
                     out.live = Some(d.knob.edit(v));
                 }
                 if shift {
@@ -191,7 +198,7 @@ impl DevicesView {
                 }
                 if !down {
                     let d = self.drag.take().unwrap();
-                    if d.moved && spec.labels.is_empty() {
+                    if d.moved && !spec.is_switch() {
                         out.gesture_done = true;
                     } else if !d.moved
                         && let Some(next) = spec.next_choice(value)
@@ -206,7 +213,7 @@ impl DevicesView {
         if response.double_clicked()
             && let Some(p) = pointer
             && let Some((k, spec, value, _)) = knob_at(p)
-            && spec.labels.is_empty()
+            && !spec.is_switch()
             && value != spec.default
         {
             out.edits.push(k.edit(spec.default));
@@ -288,10 +295,22 @@ fn layout(
     scroll: f32,
     char_w: f32,
 ) -> (Vec<Card>, Rect) {
-    let top = area.top() + PAD;
-    let height = (area.height() - 2.0 * PAD).max(TITLE_H + 90.0);
-    let mut x = area.left() + PAD - scroll;
+    let left = area.left() + PAD;
+    let right = area.right() - PAD;
+    let mut x = left;
+    let mut top = area.top() + PAD - scroll;
     let mut cards = Vec::new();
+    // Where a card `w` wide goes: on this row if it fits (or the row is
+    // empty), else at the start of the next.
+    let mut place = move |w: f32| {
+        if x > left && x + w > right {
+            x = left;
+            top += CARD_H + CARD_GAP;
+        }
+        let at = pos2(x, top);
+        x += w + CARD_GAP;
+        at
+    };
     let mut card = |title: String,
                     note: Option<String>,
                     knobs: Vec<(Knob, &'static ParamSpec, f32)>,
@@ -305,7 +324,7 @@ fn layout(
             .max(title_w)
             .max(note_w)
             .max(140.0);
-        let rect = Rect::from_min_size(pos2(x, top), vec2(w, height));
+        let rect = Rect::from_min_size(place(w), vec2(w, CARD_H));
         let mut kx = rect.left() + PAD;
         let knobs = knobs
             .into_iter()
@@ -330,7 +349,6 @@ fn layout(
             knobs,
             remove,
         });
-        x += w + CARD_GAP;
     };
 
     match song.instruments.get(instrument) {
@@ -368,7 +386,7 @@ fn layout(
         let name = song.rack.device(id).unwrap().kind.name().to_owned();
         card(name, None, rack_knobs(id), Some(id));
     }
-    let add = Rect::from_min_size(pos2(x, top), vec2(160.0, 44.0));
+    let add = Rect::from_min_size(place(160.0), vec2(160.0, 44.0));
     (cards, add)
 }
 

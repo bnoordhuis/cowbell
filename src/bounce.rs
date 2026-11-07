@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::engine::{Command, Engine, MAX_TRACKS, frames_per_tick};
+use crate::rack::{Kind, MASTER_LIMIT};
 use crate::sample::Sample;
 use crate::song::{Cell, Clip, Instrument, Song, TICKS_PER_BEAT, Tick, Track};
 
@@ -46,7 +47,14 @@ pub fn bounce(song: &Song, start: Tick, rows: usize, rows_per_beat: u32, name: &
     let starts: Vec<usize> = ticks.iter().step_by(tpr).copied().collect();
     let len = *starts.last().unwrap();
 
-    let (mut engine, mut controller) = Engine::new(RATE, song.clone());
+    // A bounce becomes a track that's mixed and limited again, so take it
+    // from before the master's limiter.
+    let mut song = song.clone();
+    if let Some(master) = song.rack.devices.iter().find(|d| d.kind == Kind::Master) {
+        let id = master.id;
+        song.rack.set_param(id, MASTER_LIMIT, 0.0);
+    }
+    let (mut engine, mut controller) = Engine::new(RATE, song);
     // Straight through, whatever the loop range says.
     engine.set_looping(false);
     let _ = controller.send(Command::PlayFrom(start));
