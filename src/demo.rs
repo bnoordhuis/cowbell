@@ -22,10 +22,14 @@
 //! | 29–32 | outro     | the break thinning out; strings end on D minor   |
 //!
 //! The chords: Dm7 B♭maj7 Gm7 A7, then Dm7 Am7 B♭m C♯dim, a bar each.
+//!
+//! The mix (see [`rack`]): an EQ'd break, a bass with a little drive that
+//! ducks under the drums, strings, horn and celesta sharing a hall, delays
+//! in time on the rolls and the celesta, and a limiter on the master.
 
 use std::sync::Arc;
 
-use crate::rack::{Jack, Kind, Rack};
+use crate::rack::{Jack, Kind, MASTER_LIMIT, Rack, SYNC_LABELS, TRACK_PAN};
 use crate::sample::Sample;
 use crate::song::{Cell, Clip, Fx, Instrument, Song, TICKS_PER_BAR, Track};
 use crate::synthvoice::{SynthKind, SynthPatch};
@@ -645,25 +649,53 @@ fn celesta_clip(start: u64, chords: &[usize]) -> Clip {
     clip
 }
 
-/// Every track into the mixer, the master turned down a little, with:
-/// - horn → filter, its cutoff swept by a slow LFO
-/// - snr → delay, a dotted eighth
-/// - celesta → delay, a quarter
+/// The mix. Every track goes into the mixer, and:
+/// - brk → EQ: more kick and air, less box
+/// - snr → delay, a dotted eighth in time
+/// - bass → drive, a little, so it's heard on small speakers → compressor,
+///   ducking under the break through its side jack
+/// - strings → EQ (out of the bass's way), horn → filter swept by a slow
+///   LFO, celesta → delay, a quarter in time: all three into a hall, a
+///   reverb on a mixer of their own, so they share one room
+/// - the horn a little left, the celesta a little right
+/// - the master limiting, so the loudest hits are rounded off, not clipped
 fn rack() -> Rack {
     let mut rack = Rack::simple(6);
     let jack = |device, port| Jack { device, port };
-    // Six tracks add up: leave headroom so the loudest moments stay
-    // under full scale.
-    let master = rack
-        .devices
-        .iter()
-        .find(|d| d.kind == Kind::Master)
-        .unwrap()
-        .id;
-    rack.set_param(master, 0, 0.62);
-    // A dotted eighth and a quarter, in milliseconds.
-    let dotted = (60_000.0 / BPM * 0.75) as f32;
-    let quarter = (60_000.0 / BPM) as f32;
+    let find = |rack: &Rack, kind| rack.devices.iter().find(|d| d.kind == kind).unwrap().id;
+    let master = find(&rack, Kind::Master);
+    let mixer = find(&rack, Kind::Mixer);
+    // Six tracks add up: leave headroom, and let the limiter take the
+    // odd peak.
+    rack.set_param(master, 0, 0.7);
+    rack.set_param(master, MASTER_LIMIT, 1.0);
+    let sync = |label: &str| SYNC_LABELS.iter().position(|&l| l == label).unwrap() as f32;
+
+    let drums = rack.append_effect(0, Kind::Eq).unwrap();
+    rack.set_param(drums, 0, 3.0);
+    rack.set_param(drums, 1, -3.0);
+    rack.set_param(drums, 2, 450.0);
+    rack.set_param(drums, 3, 2.5);
+
+    let delay = rack.append_effect(1, Kind::Delay).unwrap();
+    rack.set_param(delay, 1, 0.35);
+    rack.set_param(delay, 2, 0.25);
+    rack.set_param(delay, 3, sync("1/8D"));
+
+    let drive = rack.append_effect(2, Kind::Drive).unwrap();
+    rack.set_param(drive, 0, 18.0);
+    rack.set_param(drive, 1, 3000.0);
+    rack.set_param(drive, 3, 0.5);
+    let duck = rack.append_effect(2, Kind::Compressor).unwrap();
+    rack.set_param(duck, 0, -13.0);
+    rack.set_param(duck, 1, 2.5);
+    rack.set_param(duck, 2, 1.0);
+    rack.set_param(duck, 3, 140.0);
+    rack.connect(jack(drums, 0), jack(duck, 1)).unwrap();
+
+    let eq = rack.append_effect(3, Kind::Eq).unwrap();
+    rack.set_param(eq, 0, -6.0);
+    rack.set_param(eq, 3, 1.5);
 
     let filter = rack.append_effect(4, Kind::Filter).unwrap();
     rack.set_param(filter, 0, 1500.0);
@@ -673,15 +705,36 @@ fn rack() -> Rack {
     rack.set_param(lfo, 0, 0.2);
     rack.connect(jack(lfo, 0), jack(filter, 1)).unwrap();
 
-    let delay = rack.append_effect(1, Kind::Delay).unwrap();
-    rack.set_param(delay, 0, dotted);
-    rack.set_param(delay, 1, 0.35);
-    rack.set_param(delay, 2, 0.25);
-
     let delay = rack.append_effect(5, Kind::Delay).unwrap();
-    rack.set_param(delay, 0, quarter);
     rack.set_param(delay, 1, 0.45);
     rack.set_param(delay, 2, 0.35);
+    rack.set_param(delay, 3, sync("1/4"));
+
+    // The hall: strings, horn and celesta leave the mixer for a mixer of
+    // their own, into the reverb, back into the mixer where the strings
+    // were.
+    let hall_mix = rack.add(Kind::Mixer);
+    let hall = rack.add(Kind::Reverb);
+    rack.set_param(hall, 0, 0.82);
+    rack.set_param(hall, 1, 0.55);
+    rack.set_param(hall, 2, 24.0);
+    rack.set_param(hall, 3, 0.3);
+    for (channel, track) in [3, 4, 5].into_iter().enumerate() {
+        let last = rack.chain(track).last().copied();
+        let from = last.unwrap_or_else(|| rack.track_device(track).unwrap().id);
+        rack.connect(jack(from, 0), jack(hall_mix, channel))
+            .unwrap();
+        rack.disconnect(jack(mixer, track));
+    }
+    rack.connect(jack(hall_mix, 0), jack(hall, 0)).unwrap();
+    rack.connect(jack(hall, 0), jack(mixer, 3)).unwrap();
+    // Mixing in the hall turns the dry sound down; make up for it.
+    rack.set_param(mixer, 3, 1.3);
+
+    for (track, pan) in [(4, -0.3), (5, 0.35)] {
+        let id = rack.track_device(track).unwrap().id;
+        rack.set_param(id, TRACK_PAN, pan);
+    }
     rack
 }
 
@@ -767,26 +820,68 @@ mod tests {
     }
 
     #[test]
-    fn rack_has_the_filter_and_delays() {
+    fn the_mix_has_its_effects_where_they_belong() {
         let song = demo();
+        let rack = &song.rack;
         let kinds = |t: usize| -> Vec<Kind> {
-            song.rack
-                .chain(t)
+            rack.chain(t)
                 .iter()
-                .map(|&id| song.rack.device(id).unwrap().kind)
+                .map(|&id| rack.device(id).unwrap().kind)
                 .collect()
         };
-        assert_eq!(kinds(4), [Kind::Filter]);
+        assert_eq!(kinds(0), [Kind::Eq]);
         assert_eq!(kinds(1), [Kind::Delay]);
+        assert_eq!(kinds(2), [Kind::Drive, Kind::Compressor]);
+        assert_eq!(kinds(3), [Kind::Eq]);
+        assert_eq!(kinds(4), [Kind::Filter]);
         assert_eq!(kinds(5), [Kind::Delay]);
-        let filter = song.rack.chain(4)[0];
-        let cv = song
-            .rack
+        let from = |device, port| {
+            let c = rack.cable_into(Jack { device, port }).unwrap();
+            rack.device(c.from.device).unwrap().kind
+        };
+        assert_eq!(from(rack.chain(4)[0], 1), Kind::Lfo, "the horn's sweep");
+        assert_eq!(
+            from(rack.chain(2)[1], 1),
+            Kind::Eq,
+            "the bass ducks under the break"
+        );
+        for t in [1, 5] {
+            let delay = rack.device(rack.chain(t)[0]).unwrap();
+            assert_ne!(delay.params[3], 0.0, "track {t}'s delay keeps time");
+        }
+        // Strings, horn and celesta into one mixer, into the hall.
+        let hall = rack
+            .devices
+            .iter()
+            .find(|d| d.kind == Kind::Reverb)
+            .unwrap()
+            .id;
+        assert_eq!(from(hall, 0), Kind::Mixer);
+        let bus = rack
             .cable_into(Jack {
-                device: filter,
-                port: 1,
+                device: hall,
+                port: 0,
             })
+            .unwrap()
+            .from
+            .device;
+        for (channel, t) in [3, 4, 5].into_iter().enumerate() {
+            let c = rack
+                .cable_into(Jack {
+                    device: bus,
+                    port: channel,
+                })
+                .unwrap();
+            let end = rack.chain(t).last().copied().unwrap();
+            assert_eq!(c.from.device, end, "track {t}");
+        }
+        let master = rack
+            .devices
+            .iter()
+            .find(|d| d.kind == Kind::Master)
             .unwrap();
-        assert_eq!(song.rack.device(cv.from.device).unwrap().kind, Kind::Lfo);
+        assert_eq!(master.params[MASTER_LIMIT], 1.0);
+        let pan = |t| rack.track_device(t).unwrap().params[TRACK_PAN];
+        assert!(pan(4) < 0.0 && pan(5) > 0.0, "horn left, celesta right");
     }
 }
