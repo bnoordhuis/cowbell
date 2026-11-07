@@ -206,8 +206,11 @@ pub fn clip_from_text(text: &str) -> Option<Clip> {
 struct StepsFile {
     cowbell_steps: u32,
     synth: bool,
-    /// The lowest and highest lane; none for every lane.
+    /// The lowest and highest lane; none for every lane. Highest below
+    /// lowest for none (just the pedal).
     values: Option<(u16, u16)>,
+    #[serde(default)]
+    pedal: bool,
     rows: usize,
     cells: BTreeMap<usize, CellFile>,
 }
@@ -218,6 +221,7 @@ pub fn steps_to_text(steps: &crate::selection::Steps) -> String {
         cowbell_steps: FORMAT,
         synth: steps.synth,
         values: steps.values.as_ref().map(|v| (*v.start(), *v.end())),
+        pedal: steps.pedal,
         rows: steps.cells.len(),
         cells: steps
             .cells
@@ -244,7 +248,8 @@ pub fn steps_from_text(text: &str) -> Option<crate::selection::Steps> {
     }
     Some(crate::selection::Steps {
         synth: file.synth,
-        values: file.values.filter(|(a, b)| a <= b).map(|(a, b)| a..=b),
+        values: file.values.map(|(a, b)| a..=b),
+        pedal: file.pedal,
         cells,
     })
 }
@@ -627,6 +632,7 @@ mod tests {
         let steps = Steps {
             synth: true,
             values: Some(60..=64),
+            pedal: true,
             cells: vec![
                 Cell::hit(60, 90),
                 Cell::default(),
@@ -638,12 +644,22 @@ mod tests {
             values: None,
             ..steps
         };
-        assert_eq!(steps_from_text(&steps_to_text(&whole)), Some(whole));
+        assert_eq!(steps_from_text(&steps_to_text(&whole)), Some(whole.clone()));
+        let just_pedal = Steps {
+            values: Some(crate::selection::NO_VALUES),
+            cells: vec![Cell::default().with_fx(Fx::Pedal(crate::song::PEDAL_DOWN))],
+            ..whole.clone()
+        };
+        assert_eq!(
+            steps_from_text(&steps_to_text(&just_pedal)),
+            Some(just_pedal)
+        );
         assert_eq!(steps_from_text("hello"), None);
         assert_eq!(
             clip_from_text(&steps_to_text(&Steps {
                 synth: false,
                 values: None,
+                pedal: false,
                 cells: vec![Cell::default()],
             })),
             None,

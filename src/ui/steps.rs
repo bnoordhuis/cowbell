@@ -18,6 +18,7 @@
 //! Like the arrangement, it doesn't change the song itself: it reports
 //! edits in its [`Output`].
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use eframe::egui::{
@@ -30,7 +31,7 @@ use crate::rack::{Curve, ParamSpec};
 use crate::sample::Sample;
 use crate::selection::{self, Selection, Steps};
 use crate::song::{
-    Cell, ClipRef, Fx, Instrument, MAX_FX, PEDAL_CHANGE, PEDAL_DOWN, PEDAL_UP, Song, Trigger,
+    Cell, ClipRef, Fx, Instrument, MAX_FX, Song, Trigger, pedal_rows, with_pedal_rows,
 };
 use crate::tuning::{HIGHEST_NOTE, LOWEST_NOTE, note_name};
 
@@ -153,55 +154,6 @@ enum Kind {
     },
     /// The pedal down (or up) from row `from` through `to`, either way.
     Pedal { from: usize, to: usize, down: bool },
-}
-
-/// Where the pedal is down, row by row, and the rows where it's lifted and
-/// put straight back down.
-fn pedal_rows(cells: &[Cell]) -> (Vec<bool>, Vec<bool>) {
-    let mut down = vec![false; cells.len()];
-    let mut change = vec![false; cells.len()];
-    let mut now = false;
-    for (r, c) in cells.iter().enumerate() {
-        match c.pedal() {
-            Some(PEDAL_UP) => now = false,
-            Some(PEDAL_CHANGE) => {
-                change[r] = now;
-                now = true;
-            }
-            Some(_) => now = true,
-            None => {}
-        }
-        down[r] = now;
-    }
-    (down, change)
-}
-
-/// `cells` with their pedals set to match `down` and `change` (as
-/// [`pedal_rows`] gives them). A cell whose effect slots are full gives
-/// up its last one.
-fn with_pedal_rows(cells: &[Cell], down: &[bool], change: &[bool]) -> Vec<Cell> {
-    let mut out = cells.to_vec();
-    for (r, c) in out.iter_mut().enumerate() {
-        for f in &mut c.fx {
-            if matches!(f, Some(Fx::Pedal(_))) {
-                *f = None;
-            }
-        }
-        let before = r > 0 && down[r - 1];
-        let want = match (down[r], before) {
-            (true, false) => Some(PEDAL_DOWN),
-            (true, true) if change[r] => Some(PEDAL_CHANGE),
-            (false, true) => Some(PEDAL_UP),
-            _ => None,
-        };
-        if let Some(p) = want {
-            if c.fx.iter().all(Option::is_some) {
-                c.fx[MAX_FX - 1] = None;
-            }
-            *c = c.with_fx(Fx::Pedal(p));
-        }
-    }
-    out
 }
 
 /// Whether clip `at` plays a synth: its lanes are notes, not slices.
@@ -445,6 +397,37 @@ impl Geometry {
                 pos2(self.grid.right(), top + PEDAL_H),
             )
         })
+    }
+
+    /// For selecting: the lane under `p` (clamped to those shown), where
+    /// below the lanes, from halfway into the gap, is the pedal lane,
+    /// `lanes.len()`.
+    fn select_lane(&self, p: Pos2) -> usize {
+        match self.pedal_rect() {
+            Some(r) if p.y >= r.top() - PEDAL_GAP / 2.0 => self.lanes.len(),
+            _ => self.cell_at(p).0,
+        }
+    }
+
+    /// The selection of `rows` from lane `from` to lane `to` (as
+    /// [`Geometry::select_lane`] gives them). From the pedal lane up, it's
+    /// every note from there down, and the pedal.
+    fn selection(&self, rows: Range<usize>, from: usize, to: usize) -> Selection {
+        let pedal_lane = self.lanes.len();
+        let (top, bottom) = (from.min(to), from.max(to));
+        let pedal = bottom == pedal_lane;
+        let values = if top == pedal_lane {
+            // Just the pedal: no notes.
+            Some(crate::selection::NO_VALUES)
+        } else {
+            let (a, b) = (self.lanes[top], self.lanes[bottom.min(pedal_lane - 1)]);
+            Some(a.min(b)..=a.max(b))
+        };
+        Selection {
+            rows,
+            values,
+            pedal,
+        }
     }
 
     /// The row of the pedal lane under `p`, if it's over it.
@@ -808,12 +791,25 @@ impl StepView {
             let in_it: Vec<usize> = shown
                 .filter(|&l| sel.values.as_ref().is_none_or(|v| v.contains(&g.lanes[l])))
                 .collect();
-            if let (Some(&top), Some(&bottom)) = (in_it.first(), in_it.last())
+            // From its top note shown to its bottom one, or on down over
+            // the pedal.
+            let notes = in_it.first().zip(in_it.last()).map(|(&top, &bottom)| {
+                (g.lane_y(top).unwrap(), g.lane_y(bottom).unwrap() + g.lane_h)
+            });
+            let pedal = g
+                .pedal_rect()
+                .filter(|_| sel.has_pedal())
+                .map(|r| (r.top(), r.bottom()));
+            let span = match (notes, pedal) {
+                (Some((top, _)), Some((_, bottom))) => Some((top, bottom)),
+                (n, p) => n.or(p),
+            };
+            if let Some((top, bottom)) = span
                 && !rows.is_empty()
             {
                 let r = Rect::from_min_max(
-                    pos2(g.col_x(rows.start), g.lane_y(top).unwrap()),
-                    pos2(g.col_x(rows.end), g.lane_y(bottom).unwrap() + g.lane_h),
+                    pos2(g.col_x(rows.start), top),
+                    pos2(g.col_x(rows.end), bottom),
                 );
                 p.rect_filled(r, 2.0, color::ACCENT.gamma_multiply(0.12));
                 p.rect_stroke(r, 2.0, Stroke::new(1.5, color::ACCENT), StrokeKind::Inside);
@@ -958,7 +954,7 @@ impl StepView {
                     g.grid.top(),
                 ),
             );
-            if let Some(row) = g.pedal_row(p) {
+            if let Some(row) = g.pedal_row(p).filter(|_| !shift) {
                 self.selection = None;
                 let down = !pedal_rows(cells).0[row];
                 self.gesture = Some(Gesture {
@@ -975,10 +971,10 @@ impl StepView {
                 if g.lane_y(lane).is_some_and(|y| p.y < y + g.lane_h) {
                     out.audition = Some((instrument, g.lanes[lane]));
                 }
-            } else if beats.contains(p) || (shift && in_grid(p)) {
+            } else if beats.contains(p) || (shift && (in_grid(p) || g.pedal_row(p).is_some())) {
                 // Selecting, along the beat numbers or with shift.
-                let (lane, row) = g.cell_at(p);
-                self.selecting = Some((at, lane, row, beats.contains(p)));
+                let row = g.cell_at(p).1;
+                self.selecting = Some((at, g.select_lane(p), row, beats.contains(p)));
             } else if in_grid(p) {
                 self.selection = None;
                 let (lane, row) = g.cell_at(p);
@@ -1024,13 +1020,18 @@ impl StepView {
             if clip != at || !down {
                 self.selecting = None;
             } else if let Some(p) = hover {
-                let (lane, row) = g.cell_at(p);
+                let row = g.cell_at(p).1;
                 let rows = from_row.min(row)..from_row.max(row) + 1;
-                let values = (!whole).then(|| {
-                    let (a, b) = (g.lanes[from_lane], g.lanes[lane]);
-                    a.min(b)..=a.max(b)
-                });
-                self.selection = Some((at, Selection { rows, values }));
+                let sel = if whole {
+                    Selection {
+                        rows,
+                        values: None,
+                        pedal: false,
+                    }
+                } else {
+                    g.selection(rows, from_lane, g.select_lane(p))
+                };
+                self.selection = Some((at, sel));
             }
         }
 
@@ -1158,6 +1159,7 @@ impl StepView {
             let all = Selection {
                 rows: 0..clip.cells.len(),
                 values: None,
+                pedal: false,
             };
             self.selection = Some((at, all));
         }
@@ -1307,6 +1309,7 @@ fn draw_hit_marks(p: &egui::Painter, r: Rect, cell: &Cell, reverse: Option<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::song::{PEDAL_CHANGE, PEDAL_DOWN, PEDAL_UP};
 
     fn cells(n: usize) -> Vec<Cell> {
         vec![Cell::default(); n]
@@ -1708,7 +1711,8 @@ mod tests {
                 h.view.selection((0, 0)),
                 Some(&Selection {
                     rows: 2..6,
-                    values: Some(1..=2)
+                    values: Some(1..=2),
+                    pedal: false,
                 })
             );
             // A plain click paints again, and lets go of the selection.
@@ -1727,7 +1731,8 @@ mod tests {
                 h.view.selection((0, 0)),
                 Some(&Selection {
                     rows: 3..7,
-                    values: None
+                    values: None,
+                    pedal: false,
                 })
             );
         }
@@ -1744,6 +1749,7 @@ mod tests {
                 Selection {
                     rows: 0..2,
                     values: Some(1..=2),
+                    pedal: false,
                 },
             ));
             let steps = h.view.copy(&h.song, (0, 0)).unwrap();
@@ -1889,6 +1895,36 @@ mod tests {
             h.undo();
             h.undo();
             assert_eq!(pedals(&h), vec![None; 16]);
+        }
+
+        #[test]
+        fn shift_drag_selects_the_pedal_alone_or_with_notes() {
+            let mut h = Harness::new(true);
+            h.shift = true;
+            let (a, b) = (h.pedal(5), h.pedal(2));
+            h.drag(&[a, b]);
+            assert_eq!(
+                h.view.selection((0, 0)),
+                Some(&Selection {
+                    rows: 2..6,
+                    values: Some(crate::selection::NO_VALUES),
+                    pedal: true,
+                }),
+                "nothing painted, nothing put down"
+            );
+            assert!(h.cells().iter().all(|c| *c == Cell::default()));
+            // Up into the notes: those from there down, with the pedal.
+            let (a, b) = (h.pedal(1), h.at(60, 3));
+            h.drag(&[a, b]);
+            let lowest = crate::tuning::LOWEST_NOTE as u16;
+            assert_eq!(
+                h.view.selection((0, 0)),
+                Some(&Selection {
+                    rows: 1..4,
+                    values: Some(lowest..=60),
+                    pedal: true,
+                })
+            );
         }
 
         #[test]

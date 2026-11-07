@@ -76,6 +76,55 @@ pub enum Target {
     Synth { param: usize },
 }
 
+/// Where the pedal is down, row by row, and the rows where it's lifted and
+/// put straight back down.
+pub fn pedal_rows(cells: &[Cell]) -> (Vec<bool>, Vec<bool>) {
+    let mut down = vec![false; cells.len()];
+    let mut change = vec![false; cells.len()];
+    let mut now = false;
+    for (r, c) in cells.iter().enumerate() {
+        match c.pedal() {
+            Some(PEDAL_UP) => now = false,
+            Some(PEDAL_CHANGE) => {
+                change[r] = now;
+                now = true;
+            }
+            Some(_) => now = true,
+            None => {}
+        }
+        down[r] = now;
+    }
+    (down, change)
+}
+
+/// `cells` with their pedals set to match `down` and `change` (as
+/// [`pedal_rows`] gives them). A cell whose effect slots are full gives
+/// up its last one.
+pub fn with_pedal_rows(cells: &[Cell], down: &[bool], change: &[bool]) -> Vec<Cell> {
+    let mut out = cells.to_vec();
+    for (r, c) in out.iter_mut().enumerate() {
+        for f in &mut c.fx {
+            if matches!(f, Some(Fx::Pedal(_))) {
+                *f = None;
+            }
+        }
+        let before = r > 0 && down[r - 1];
+        let want = match (down[r], before) {
+            (true, false) => Some(PEDAL_DOWN),
+            (true, true) if change[r] => Some(PEDAL_CHANGE),
+            (false, true) => Some(PEDAL_UP),
+            _ => None,
+        };
+        if let Some(p) = want {
+            if c.fx.iter().all(Option::is_some) {
+                c.fx[MAX_FX - 1] = None;
+            }
+            *c = c.with_fx(Fx::Pedal(p));
+        }
+    }
+    out
+}
+
 impl Fx {
     /// The semitones a `Chord` adds above the root.
     pub fn chord_intervals(n: u8) -> impl Iterator<Item = u8> {
